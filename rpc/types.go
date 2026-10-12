@@ -6,6 +6,7 @@ type NodeID = raft.NodeID
 type Term = raft.Term
 type LogIndex = raft.LogIndex
 type LogEntry = raft.LogEntry
+type PersistentState = raft.PersistentState
 type RaftState = raft.RaftState
 
 const (

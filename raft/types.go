@@ -16,6 +16,22 @@ func (e LogEntry) String() string {
 	return fmt.Sprintf("LogEntry[Term=%d, Index=%d, Command=%v]", e.Term, e.Index, e.Command)
 }
 
+type PersistentState struct {
+	CurrentTerm Term   `json:"current_term"`
+	VotedFor    NodeID `json:"voted_for"`
+	Log         []LogEntry
+}
+
+type VolatileState struct {
+	CommitIndex LogIndex `json:"commit_index"`
+	LastApplied LogIndex `json:"last_applied"`
+}
+
+type VolatileStateLeader struct {
+	NextIndex  map[NodeID]LogIndex `json:"next_index"`
+	MatchIndex map[NodeID]LogIndex `json:"match_index"`
+}
+
 type RaftState int
 
 const (
