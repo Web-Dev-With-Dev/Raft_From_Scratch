@@ -16,13 +16,26 @@ func (e LogEntry) String() string {
 	return fmt.Sprintf("LogEntry[Term=%d, Index=%d, Command=%v]", e.Term, e.Index, e.Command)
 }
 
-type Role string
+type RaftState int
 
 const (
-	Follower  Role = "Follower"
-	Candidate Role = "Candidate"
-	Leader    Role = "Leader"
+	Follower RaftState = iota
+	Candidate
+	Leader
 )
+
+func (s RaftState) String() string {
+	switch s {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	default:
+		return "Unknown"
+	}
+}
 
 type RequestVoteArgs struct {
 	Term         Term     `json:"term"`

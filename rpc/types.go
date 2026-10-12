@@ -6,7 +6,14 @@ type NodeID = raft.NodeID
 type Term = raft.Term
 type LogIndex = raft.LogIndex
 type LogEntry = raft.LogEntry
+type RaftState = raft.RaftState
 
+const (
+	Follower  = raft.Follower
+	Candidate = raft.Candidate
+	Leader    = raft.Leader
+)
+	
 type RequestVoteArgs = raft.RequestVoteArgs
 type RequestVoteReply = raft.RequestVoteReply
 type AppendEntriesArgs = raft.AppendEntriesArgs
