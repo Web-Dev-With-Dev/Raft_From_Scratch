@@ -7,6 +7,8 @@ type Term = raft.Term
 type LogIndex = raft.LogIndex
 type LogEntry = raft.LogEntry
 type PersistentState = raft.PersistentState
+type VolatileState = raft.VolatileState
+type VolatileStateLeader = raft.VolatileStateLeader
 type RaftState = raft.RaftState
 
 const (
