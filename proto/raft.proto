@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package raft;
+
+option go_package = "raft/proto;raftpb";
+
+// RaftService defines the consensus RPCs between Raft peers.
+service RaftService {
+  // RequestVote is invoked by candidates to gather votes during an election.
+  rpc RequestVote(RequestVoteArgs) returns (RequestVoteReply);
+
+  // AppendEntries is invoked by the leader to replicate log entries and send heartbeats.
+  rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply);
+}
+
+// LogEntry represents a single replicated state machine command in the Raft log.
+message LogEntry {
+  uint64 term = 1;
+  uint64 index = 2;
+  bytes command = 3;
+}
+
+// RequestVoteArgs contains the candidate's metadata to request a vote.
+message RequestVoteArgs {
+  uint64 term = 1;
+  int64 candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+// RequestVoteReply contains the voter's decision.
+message RequestVoteReply {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+// AppendEntriesArgs contains log entries to replicate or acts as a heartbeat if entries is empty.
+message AppendEntriesArgs {
+  uint64 term = 1;
+  int64 leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
+}
+
+// AppendEntriesReply contains the follower's replication status and log conflict info for fast recovery.
+message AppendEntriesReply {
+  uint64 term = 1;
+  bool success = 2;
+  uint64 conflict_index = 3;
+  uint64 conflict_term = 4;
+}
