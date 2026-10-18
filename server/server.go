@@ -148,6 +148,31 @@ func (s *Server) ConnectPeers() error {
 	return nil
 }
 
+// ConnectPeersWithRetry dials and registers all peers into the RPC client pool with the specified retry policy.
+func (s *Server) ConnectPeersWithRetry(ctx context.Context, policy rpc.RetryPolicy) error {
+	s.mu.RLock()
+	peers := make([]Peer, len(s.Peers))
+	copy(peers, s.Peers)
+	s.mu.RUnlock()
+
+	for _, peer := range peers {
+		if peer.ID == s.ID {
+			continue // Skip dialing self
+		}
+		if _, err := s.RPCClientPool.ConnectWithRetry(ctx, peer.ID, peer.Address, policy); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SetRetryPolicy updates the dial retry policy on the server's RPCClientPool.
+func (s *Server) SetRetryPolicy(policy rpc.RetryPolicy) {
+	if s.RPCClientPool != nil {
+		s.RPCClientPool.SetRetryPolicy(policy)
+	}
+}
+
 // RegisterService registers the Server's RaftService handlers with the gRPC server.
 func (s *Server) RegisterService(grpcServer grpc.ServiceRegistrar) {
 	raftpb.RegisterRaftServiceServer(grpcServer, s)

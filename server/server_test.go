@@ -374,4 +374,31 @@ func TestServer_ClientSideRPCStubs(t *testing.T) {
 	}
 }
 
+func TestServer_ConnectPeersWithRetry(t *testing.T) {
+	// Start target peer
+	peerServer := NewServer(2, nil, nil, nil)
+	if err := peerServer.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start peer server: %v", err)
+	}
+	defer peerServer.Close()
+
+	srv := NewServer(1, []Peer{
+		{ID: 1, Address: "127.0.0.1:8001"}, // self (skipped)
+		{ID: 2, Address: peerServer.Addr().String()},
+	}, nil, nil)
+	defer srv.Close()
+
+	policy := rpc.DefaultRetryPolicy()
+	srv.SetRetryPolicy(policy)
+
+	if err := srv.ConnectPeersWithRetry(context.Background(), policy); err != nil {
+		t.Fatalf("ConnectPeersWithRetry failed: %v", err)
+	}
+
+	if !srv.RPCClientPool.IsConnected(2) {
+		t.Fatalf("expected peer 2 to be persistently connected")
+	}
+}
+
+
 
