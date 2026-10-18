@@ -81,6 +81,7 @@ type ClientPool struct {
 	peerConns   map[NodeID]*PeerConn
 	addresses   map[NodeID]string
 	retryPolicy RetryPolicy
+	rpcTimeout  time.Duration
 }
 
 // NewClientPool creates a new ClientPool with default retry policy.
@@ -96,6 +97,7 @@ func NewClientPoolWithPolicy(policy RetryPolicy) *ClientPool {
 		peerConns:   make(map[NodeID]*PeerConn),
 		addresses:   make(map[NodeID]string),
 		retryPolicy: policy,
+		rpcTimeout:  DefaultRPCTimeout,
 	}
 }
 
@@ -111,6 +113,23 @@ func (p *ClientPool) GetRetryPolicy() RetryPolicy {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.retryPolicy
+}
+
+// SetRPCTimeout configures the default RPC timeout for peer calls through this pool.
+func (p *ClientPool) SetRPCTimeout(timeout time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rpcTimeout = timeout
+}
+
+// RPCTimeout returns the current default RPC timeout for this pool.
+func (p *ClientPool) RPCTimeout() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.rpcTimeout <= 0 {
+		return DefaultRPCTimeout
+	}
+	return p.rpcTimeout
 }
 
 // Register registers an existing RaftServiceClient for a node ID.

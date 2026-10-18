@@ -2,12 +2,16 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
+	"time"
 
 	raftpb "raft/proto"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestProtoConversions_RequestVote(t *testing.T) {
@@ -188,3 +192,99 @@ func TestClientPool_SendRPC_Errors(t *testing.T) {
 		t.Fatalf("expected error for nil args")
 	}
 }
+
+// hangingRaftServer simulates a dead or unresponsive peer that never responds in time.
+type hangingRaftServer struct {
+	raftpb.UnimplementedRaftServiceServer
+	delay time.Duration
+}
+
+func (h *hangingRaftServer) RequestVote(ctx context.Context, req *raftpb.RequestVoteArgs) (*raftpb.RequestVoteReply, error) {
+	time.Sleep(h.delay)
+	return &raftpb.RequestVoteReply{Term: req.Term, VoteGranted: false}, nil
+}
+
+func (h *hangingRaftServer) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArgs) (*raftpb.AppendEntriesReply, error) {
+	time.Sleep(h.delay)
+	return &raftpb.AppendEntriesReply{Term: req.Term, Success: false}, nil
+}
+
+func TestRPCTimeout_DeadPeerDoesNotBlockIndefinitely(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcServer := grpc.NewServer()
+	// Server handler delays by 500ms
+	raftpb.RegisterRaftServiceServer(grpcServer, &hangingRaftServer{delay: 500 * time.Millisecond})
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+	defer grpcServer.Stop()
+
+	pool := NewClientPool()
+	defer pool.Close()
+
+	// Configure pool timeout to 100ms
+	pool.SetRPCTimeout(100 * time.Millisecond)
+
+	peer := Peer{ID: 2, Address: lis.Addr().String()}
+
+	// 1. SendRequestVote without an explicit deadline on context:
+	// MUST unblock within ~100-200ms rather than hanging for 500ms!
+	start := time.Now()
+	_, err = pool.SendRequestVote(context.Background(), peer, &RequestVoteArgs{Term: 1})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected timeout error for hanging peer, got nil")
+	}
+
+	if !IsTimeout(err) {
+		t.Fatalf("expected IsTimeout(err) to be true, got error: %v", err)
+	}
+
+	if elapsed >= 450*time.Millisecond {
+		t.Fatalf("call took %v, expected it to timeout around 100ms and not block indefinitely", elapsed)
+	}
+
+	// 2. sendAppendEntries convenience method:
+	start = time.Now()
+	_, err = pool.sendAppendEntries(peer, &AppendEntriesArgs{Term: 1})
+	elapsed = time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected timeout error for hanging peer on AppendEntries")
+	}
+
+	if !IsTimeout(err) {
+		t.Fatalf("expected IsTimeout(err) to be true on AppendEntries, got: %v", err)
+	}
+
+	if elapsed >= 450*time.Millisecond {
+		t.Fatalf("call took %v, expected it to timeout around 100ms and not block indefinitely", elapsed)
+	}
+}
+
+func TestIsTimeout_Helper(t *testing.T) {
+	if IsTimeout(nil) {
+		t.Fatalf("expected IsTimeout(nil) to be false")
+	}
+
+	if !IsTimeout(context.DeadlineExceeded) {
+		t.Fatalf("expected IsTimeout(context.DeadlineExceeded) to be true")
+	}
+
+	grpcTimeoutErr := status.Error(codes.DeadlineExceeded, "context deadline exceeded")
+	if !IsTimeout(grpcTimeoutErr) {
+		t.Fatalf("expected IsTimeout(grpcTimeoutErr) to be true")
+	}
+
+	otherErr := errors.New("connection reset by peer")
+	if IsTimeout(otherErr) {
+		t.Fatalf("expected IsTimeout(otherErr) to be false")
+	}
+}
+

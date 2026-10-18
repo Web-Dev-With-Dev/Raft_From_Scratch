@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	
+	"time"
+
 	raftpb "raft/proto"
 	"raft/raft"
 	"raft/rpc"
@@ -344,16 +345,31 @@ func (s *Server) SendAppendEntriesToNode(ctx context.Context, id raft.NodeID, ar
 	return s.SendAppendEntries(ctx, peer, args)
 }
 
-// sendRequestVote is a convenience stub matching the Raft paper specification, using default timeout.
+// SetRPCTimeout configures the default RPC timeout for peer calls.
+func (s *Server) SetRPCTimeout(timeout time.Duration) {
+	if s.RPCClientPool != nil {
+		s.RPCClientPool.SetRPCTimeout(timeout)
+	}
+}
+
+// RPCTimeout returns the current default RPC timeout for peer calls.
+func (s *Server) RPCTimeout() time.Duration {
+	if s.RPCClientPool != nil {
+		return s.RPCClientPool.RPCTimeout()
+	}
+	return rpc.DefaultRPCTimeout
+}
+
+// sendRequestVote is a convenience stub matching the Raft paper specification, using the server's RPCTimeout.
 func (s *Server) sendRequestVote(peer Peer, args *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), rpc.DefaultRPCTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.RPCTimeout())
 	defer cancel()
 	return s.SendRequestVote(ctx, peer, args)
 }
 
-// sendAppendEntries is a convenience stub matching the Raft paper specification, using default timeout.
+// sendAppendEntries is a convenience stub matching the Raft paper specification, using the server's RPCTimeout.
 func (s *Server) sendAppendEntries(peer Peer, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), rpc.DefaultRPCTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.RPCTimeout())
 	defer cancel()
 	return s.SendAppendEntries(ctx, peer, args)
 }

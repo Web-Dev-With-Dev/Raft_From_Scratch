@@ -8,7 +8,7 @@ import (
 	raftpb "raft/proto"
 	"raft/raft"
 	"raft/rpc"
-
+	"time"
 	"google.golang.org/grpc"
 )
 
@@ -399,6 +399,76 @@ func TestServer_ConnectPeersWithRetry(t *testing.T) {
 		t.Fatalf("expected peer 2 to be persistently connected")
 	}
 }
+
+type slowRaftServer struct {
+	raftpb.UnimplementedRaftServiceServer
+}
+
+func (s *slowRaftServer) RequestVote(ctx context.Context, req *raftpb.RequestVoteArgs) (*raftpb.RequestVoteReply, error) {
+	select {
+	case <-time.After(500 * time.Millisecond):
+		return &raftpb.RequestVoteReply{Term: req.Term, VoteGranted: false}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestServer_RPCTimeout_DeadPeerDoesNotBlock(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	grpcServer := grpc.NewServer()
+	raftpb.RegisterRaftServiceServer(grpcServer, &slowRaftServer{})
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+	defer grpcServer.Stop()
+
+	peer2 := Peer{ID: 2, Address: lis.Addr().String()}
+	srv := NewServer(1, []Peer{peer2}, nil, nil)
+	defer srv.Close()
+
+	// Configure a 100ms timeout
+	srv.SetRPCTimeout(100 * time.Millisecond)
+
+	// 1. sendRequestVote convenience method
+	start := time.Now()
+	_, err = srv.sendRequestVote(peer2, &raft.RequestVoteArgs{Term: 1})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected timeout error for dead/hanging peer")
+	}
+
+	if !rpc.IsTimeout(err) {
+		t.Fatalf("expected rpc.IsTimeout(err) to be true, got: %v", err)
+	}
+
+	if elapsed >= 450*time.Millisecond {
+		t.Fatalf("expected call to unblock around 100ms, but took %v", elapsed)
+	}
+
+	// 2. SendRequestVote with context.Background() (no explicit deadline from caller)
+	start = time.Now()
+	_, err = srv.SendRequestVote(context.Background(), peer2, &raft.RequestVoteArgs{Term: 1})
+	elapsed = time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected timeout error when caller passes context without deadline")
+	}
+
+	if !rpc.IsTimeout(err) {
+		t.Fatalf("expected rpc.IsTimeout(err) to be true, got: %v", err)
+	}
+
+	if elapsed >= 450*time.Millisecond {
+		t.Fatalf("expected call to unblock around 100ms, but took %v", elapsed)
+	}
+}
+
 
 
 
