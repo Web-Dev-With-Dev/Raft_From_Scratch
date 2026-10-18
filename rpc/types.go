@@ -6,6 +6,7 @@ type NodeID = raft.NodeID
 type Term = raft.Term
 type LogIndex = raft.LogIndex
 type LogEntry = raft.LogEntry
+type Peer = raft.Peer
 type PersistentState = raft.PersistentState
 type VolatileState = raft.VolatileState
 type VolatileStateLeader = raft.VolatileStateLeader

@@ -6,6 +6,11 @@ type NodeID int
 type Term uint64
 type LogIndex uint64
 
+type Peer struct {
+	ID      NodeID `json:"id"`
+	Address string `json:"address"`
+}
+
 type LogEntry struct {
 	Term    Term     `json:"term"`
 	Index   LogIndex `json:"index"`
