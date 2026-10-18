@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
-
+	
 	raftpb "raft/proto"
 	"raft/raft"
 	"raft/rpc"
@@ -275,6 +275,64 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArg
 	}, nil
 }
 
+// SendRequestVote sends a RequestVote RPC to a peer using the server's RPC client pool.
+func (s *Server) SendRequestVote(ctx context.Context, peer Peer, args *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
+	if s.RPCClientPool == nil {
+		return nil, fmt.Errorf("server %d RPCClientPool is nil", s.ID)
+	}
+	if peer.Address == "" {
+		if p, ok := s.GetPeer(peer.ID); ok {
+			peer = p
+		}
+	}
+	return s.RPCClientPool.SendRequestVote(ctx, peer, args)
+}
+
+// SendAppendEntries sends an AppendEntries RPC to a peer using the server's RPC client pool.
+func (s *Server) SendAppendEntries(ctx context.Context, peer Peer, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
+	if s.RPCClientPool == nil {
+		return nil, fmt.Errorf("server %d RPCClientPool is nil", s.ID)
+	}
+	if peer.Address == "" {
+		if p, ok := s.GetPeer(peer.ID); ok {
+			peer = p
+		}
+	}
+	return s.RPCClientPool.SendAppendEntries(ctx, peer, args)
+}
+
+// SendRequestVoteToNode sends a RequestVote RPC to a peer identified by NodeID.
+func (s *Server) SendRequestVoteToNode(ctx context.Context, id raft.NodeID, args *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
+	peer, ok := s.GetPeer(id)
+	if !ok {
+		return nil, fmt.Errorf("peer %d not found in server peer list", id)
+	}
+	return s.SendRequestVote(ctx, peer, args)
+}
+
+// SendAppendEntriesToNode sends an AppendEntries RPC to a peer identified by NodeID.
+func (s *Server) SendAppendEntriesToNode(ctx context.Context, id raft.NodeID, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
+	peer, ok := s.GetPeer(id)
+	if !ok {
+		return nil, fmt.Errorf("peer %d not found in server peer list", id)
+	}
+	return s.SendAppendEntries(ctx, peer, args)
+}
+
+// sendRequestVote is a convenience stub matching the Raft paper specification, using default timeout.
+func (s *Server) sendRequestVote(peer Peer, args *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), rpc.DefaultRPCTimeout)
+	defer cancel()
+	return s.SendRequestVote(ctx, peer, args)
+}
+
+// sendAppendEntries is a convenience stub matching the Raft paper specification, using default timeout.
+func (s *Server) sendAppendEntries(peer Peer, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), rpc.DefaultRPCTimeout)
+	defer cancel()
+	return s.SendAppendEntries(ctx, peer, args)
+}
+
 // Close stops the gRPC server and closes all peer RPC connections.
 func (s *Server) Close() error {
 	s.Stop()
@@ -283,4 +341,5 @@ func (s *Server) Close() error {
 	}
 	return nil
 }
+
 

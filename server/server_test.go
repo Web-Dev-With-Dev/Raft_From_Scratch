@@ -276,3 +276,102 @@ func TestServer_RaftServiceHandlers(t *testing.T) {
 	}
 }
 
+func TestServer_ClientSideRPCStubs(t *testing.T) {
+	// Start target peer server
+	targetServer := NewServer(2, nil, &raft.PersistentState{
+		CurrentTerm: 10,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+
+	if err := targetServer.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start target server: %v", err)
+	}
+	defer targetServer.Close()
+
+	// Start local server that dials targetServer
+	peer2 := Peer{ID: 2, Address: targetServer.Addr().String()}
+	localServer := NewServer(1, []Peer{peer2}, nil, nil)
+	defer localServer.Close()
+
+	// 1. SendRequestVote
+	rvReply, err := localServer.SendRequestVote(context.Background(), peer2, &raft.RequestVoteArgs{
+		Term:         10,
+		CandidateID:  1,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	})
+	if err != nil {
+		t.Fatalf("SendRequestVote failed: %v", err)
+	}
+	if rvReply.Term != 10 {
+		t.Fatalf("expected Term 10, got %d", rvReply.Term)
+	}
+
+	// 2. sendRequestVote (convenience stub)
+	rvReply2, err := localServer.sendRequestVote(peer2, &raft.RequestVoteArgs{
+		Term:         10,
+		CandidateID:  1,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	})
+	if err != nil {
+		t.Fatalf("sendRequestVote failed: %v", err)
+	}
+	if rvReply2.Term != 10 {
+		t.Fatalf("expected Term 10, got %d", rvReply2.Term)
+	}
+
+	// 3. SendAppendEntries
+	aeReply, err := localServer.SendAppendEntries(context.Background(), peer2, &raft.AppendEntriesArgs{
+		Term:         10,
+		LeaderID:     1,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries:      nil,
+		LeaderCommit: 0,
+	})
+	if err != nil {
+		t.Fatalf("SendAppendEntries failed: %v", err)
+	}
+	if aeReply.Term != 10 {
+		t.Fatalf("expected Term 10, got %d", aeReply.Term)
+	}
+
+	// 4. sendAppendEntries (convenience stub)
+	aeReply2, err := localServer.sendAppendEntries(peer2, &raft.AppendEntriesArgs{
+		Term:     10,
+		LeaderID: 1,
+	})
+	if err != nil {
+		t.Fatalf("sendAppendEntries failed: %v", err)
+	}
+	if aeReply2.Term != 10 {
+		t.Fatalf("expected Term 10, got %d", aeReply2.Term)
+	}
+
+	// 5. SendRequestVoteToNode & SendAppendEntriesToNode
+	rvReply3, err := localServer.SendRequestVoteToNode(context.Background(), 2, &raft.RequestVoteArgs{Term: 10})
+	if err != nil {
+		t.Fatalf("SendRequestVoteToNode failed: %v", err)
+	}
+	if rvReply3.Term != 10 {
+		t.Fatalf("expected Term 10, got %d", rvReply3.Term)
+	}
+
+	aeReply3, err := localServer.SendAppendEntriesToNode(context.Background(), 2, &raft.AppendEntriesArgs{Term: 10})
+	if err != nil {
+		t.Fatalf("SendAppendEntriesToNode failed: %v", err)
+	}
+	if aeReply3.Term != 10 {
+		t.Fatalf("expected Term 10, got %d", aeReply3.Term)
+	}
+
+	// Error when node does not exist
+	_, err = localServer.SendRequestVoteToNode(context.Background(), 99, &raft.RequestVoteArgs{})
+	if err == nil {
+		t.Fatalf("expected error for non-existent node ID")
+	}
+}
+
+
