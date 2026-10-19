@@ -1,0 +1,32 @@
+name: Go CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]  
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Build all packages & binaries
+        run: |
+          go build -v ./...
+          go build -v -o bin/node ./cmd/node
+
+      - name: Run unit & integration tests
+        run: go test -v -race -cover ./...
