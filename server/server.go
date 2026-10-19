@@ -16,6 +16,7 @@ import (
 	"raft/rpc"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // Type aliases for convenience
@@ -243,7 +244,20 @@ func (s *Server) Serve(lis net.Listener, opts ...grpc.ServerOption) error {
 		return fmt.Errorf("server is already running")
 	}
 
-	grpcServer := grpc.NewServer(opts...)
+	defaultOpts := []grpc.ServerOption{
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second, // Allow client keepalive pings every 5s
+			PermitWithoutStream: true,            // Allow pings even when idle with no active RPC streams
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: 15 * time.Minute,
+			Time:              15 * time.Second,
+			Timeout:           5 * time.Second,
+		}),
+	}
+	serverOpts := append(defaultOpts, opts...)
+
+	grpcServer := grpc.NewServer(serverOpts...)
 	s.RegisterService(grpcServer)
 
 	s.grpcServer = grpcServer
