@@ -530,6 +530,74 @@ func TestServer_StructuredLoggingWithNodePrefix(t *testing.T) {
 	}
 }
 
+func TestCluster_FullMeshRPCReachability(t *testing.T) {
+	// Start 3 server instances listening on dynamic local ports
+	servers := make([]*Server, 3)
+	for i := 0; i < 3; i++ {
+		id := raft.NodeID(i + 1)
+		srv := NewServer(id, nil, nil, nil)
+		if err := srv.Start("127.0.0.1:0"); err != nil {
+			t.Fatalf("failed to start server %d: %v", id, err)
+		}
+		defer srv.Close()
+		servers[i] = srv
+	}
+
+	// Register peers across all nodes
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 3; j++ {
+			if i != j {
+				servers[i].AddPeer(Peer{
+					ID:      servers[j].ID,
+					Address: servers[j].Addr().String(),
+				})
+			}
+		}
+	}
+
+	// Connect all peers
+	for _, srv := range servers {
+		if err := srv.ConnectPeers(); err != nil {
+			t.Fatalf("node %d failed to connect peers: %v", srv.ID, err)
+		}
+	}
+
+	// Verify all 6 directed pairs (every node reaches every other node)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	for _, sender := range servers {
+		for _, target := range servers {
+			if sender.ID == target.ID {
+				continue
+			}
+
+			reply, err := sender.SendRequestVoteToNode(ctx, target.ID, &raft.RequestVoteArgs{
+				Term:        1,
+				CandidateID: sender.ID,
+			})
+			if err != nil {
+				t.Fatalf("node %d failed to reach node %d via RequestVote: %v", sender.ID, target.ID, err)
+			}
+			if reply.Term != 0 {
+				t.Fatalf("unexpected reply term from node %d: %d", target.ID, reply.Term)
+			}
+
+			aeReply, err := sender.SendAppendEntriesToNode(ctx, target.ID, &raft.AppendEntriesArgs{
+				Term:     1,
+				LeaderID: sender.ID,
+			})
+			if err != nil {
+				t.Fatalf("node %d failed to reach node %d via AppendEntries: %v", sender.ID, target.ID, err)
+			}
+			if aeReply.Term != 0 {
+				t.Fatalf("unexpected reply term from node %d: %d", target.ID, aeReply.Term)
+			}
+		}
+	}
+}
+
+
 
 
 

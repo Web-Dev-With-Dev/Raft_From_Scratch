@@ -60,8 +60,32 @@ func main() {
 
 		if err := srv.ConnectPeersWithRetry(ctx, policy); err != nil {
 			srv.GetLogger().Warn("peer connection phase ended with incomplete connections", "error", err)
-		} else {
-			srv.GetLogger().Info("all cluster peers connected successfully")
+			return
+		}
+		srv.GetLogger().Info("all cluster peers connected successfully")
+
+		// Verify peer reachability by sending an RPC to each connected peer
+		time.Sleep(150 * time.Millisecond) // brief pause to let all nodes finish mutual dials
+		srv.GetLogger().Info("starting peer RPC reachability verification", "peer_count", len(peers))
+		for _, peer := range peers {
+			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), srv.RPCTimeout())
+			reply, err := srv.SendRequestVote(rpcCtx, peer, &raft.RequestVoteArgs{
+				Term:         0,
+				CandidateID:  id,
+				LastLogIndex: 0,
+				LastLogTerm:  0,
+			})
+			rpcCancel()
+			if err != nil {
+				srv.GetLogger().Warn("peer reachability RPC failed", "peer_id", int(peer.ID), "address", peer.Address, "error", err)
+			} else {
+				srv.GetLogger().Info("peer reachability verified via RPC",
+					"peer_id", int(peer.ID),
+					"address", peer.Address,
+					"reply_term", reply.Term,
+					"vote_granted", reply.VoteGranted,
+				)
+			}
 		}
 	}()
 

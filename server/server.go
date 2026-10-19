@@ -338,7 +338,7 @@ func (s *Server) RequestVote(ctx context.Context, req *raftpb.RequestVoteArgs) (
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	s.GetLogger().Debug("received RequestVote",
+	s.GetLogger().Info("received RequestVote",
 		"candidate_id", req.CandidateId,
 		"term", req.Term,
 		"last_log_index", req.LastLogIndex,
@@ -362,7 +362,7 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArg
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	s.GetLogger().Debug("received AppendEntries",
+	s.GetLogger().Info("received AppendEntries",
 		"leader_id", req.LeaderId,
 		"term", req.Term,
 		"prev_log_index", req.PrevLogIndex,
@@ -393,7 +393,7 @@ func (s *Server) SendRequestVote(ctx context.Context, peer Peer, args *raft.Requ
 		}
 	}
 
-	s.GetLogger().Debug("sending RequestVote", "peer_id", int(peer.ID), "term", uint64(args.Term))
+	s.GetLogger().Info("sending RequestVote", "peer_id", int(peer.ID), "term", uint64(args.Term))
 	reply, err := s.RPCClientPool.SendRequestVote(ctx, peer, args)
 	if err != nil {
 		s.GetLogger().Warn("failed to send RequestVote", "peer_id", int(peer.ID), "error", err, "is_timeout", rpc.IsTimeout(err))
@@ -413,7 +413,7 @@ func (s *Server) SendAppendEntries(ctx context.Context, peer Peer, args *raft.Ap
 		}
 	}
 
-	s.GetLogger().Debug("sending AppendEntries", "peer_id", int(peer.ID), "term", uint64(args.Term), "entries_count", len(args.Entries))
+	s.GetLogger().Info("sending AppendEntries", "peer_id", int(peer.ID), "term", uint64(args.Term), "entries_count", len(args.Entries))
 	reply, err := s.RPCClientPool.SendAppendEntries(ctx, peer, args)
 	if err != nil {
 		s.GetLogger().Warn("failed to send AppendEntries", "peer_id", int(peer.ID), "error", err, "is_timeout", rpc.IsTimeout(err))
