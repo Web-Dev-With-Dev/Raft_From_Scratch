@@ -3,10 +3,14 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"time"
 
+	"raft/logger"
 	raftpb "raft/proto"
 	"raft/raft"
 	"raft/rpc"
@@ -18,6 +22,12 @@ import (
 type Peer = raft.Peer
 type ClientPool = rpc.ClientPool
 type RPCClientPool = rpc.ClientPool
+type LogOptions = logger.Options
+
+// NewNodeLogger creates a structured logger with [Node <ID>] prefix on every line.
+func NewNodeLogger(id raft.NodeID, w io.Writer, opts *LogOptions) *slog.Logger {
+	return logger.NewNodeLogger(id, w, opts)
+}
 
 // Server represents a Raft cluster node hosting the consensus state machine and RPC services.
 type Server struct {
@@ -36,6 +46,9 @@ type Server struct {
 
 	// RPCClientPool manages gRPC client connections to peers.
 	RPCClientPool *rpc.ClientPool `json:"-"`
+
+	// Logger is the structured logger for this node with [Node <ID>] prefix on every line.
+	Logger *slog.Logger `json:"-"`
 
 	grpcServer *grpc.Server
 	listener   net.Listener
@@ -58,15 +71,19 @@ func NewServer(
 		}
 	}
 
+	nodeLogger := logger.NewNodeLogger(id, os.Stderr, nil)
+
 	if rpcClientPool == nil {
 		rpcClientPool = rpc.NewClientPool()
 	}
+	rpcClientPool.SetLogger(nodeLogger)
 
 	return &Server{
 		ID:              id,
 		Peers:           peers,
 		PersistentState: persistentState,
 		RPCClientPool:   rpcClientPool,
+		Logger:          nodeLogger,
 	}
 }
 
@@ -120,10 +137,31 @@ func (s *Server) AddPeer(peer Peer) {
 	for i, p := range s.Peers {
 		if p.ID == peer.ID {
 			s.Peers[i] = peer
+			s.GetLogger().Info("updated peer", "peer_id", int(peer.ID), "address", peer.Address)
 			return
 		}
 	}
 	s.Peers = append(s.Peers, peer)
+	s.GetLogger().Info("added peer", "peer_id", int(peer.ID), "address", peer.Address)
+}
+
+// SetLogger configures the structured logger for the server and its client pool.
+func (s *Server) SetLogger(l *slog.Logger) {
+	if l == nil {
+		l = logger.NewNodeLogger(s.ID, os.Stderr, nil)
+	}
+	s.Logger = l
+	if s.RPCClientPool != nil {
+		s.RPCClientPool.SetLogger(l)
+	}
+}
+
+// GetLogger returns the server's structured logger, defaulting to a node-prefixed logger if nil.
+func (s *Server) GetLogger() *slog.Logger {
+	if s == nil || s.Logger == nil {
+		return slog.Default()
+	}
+	return s.Logger
 }
 
 // ClientPool returns the server's RPC client pool.
@@ -138,11 +176,13 @@ func (s *Server) ConnectPeers() error {
 	copy(peers, s.Peers)
 	s.mu.RUnlock()
 
+	s.GetLogger().Info("connecting to cluster peers", "peer_count", len(peers))
 	for _, peer := range peers {
 		if peer.ID == s.ID {
 			continue // Skip dialing self
 		}
 		if _, err := s.RPCClientPool.Connect(peer.ID, peer.Address); err != nil {
+			s.GetLogger().Warn("failed to connect to peer", "peer_id", int(peer.ID), "address", peer.Address, "error", err)
 			return err
 		}
 	}
@@ -156,11 +196,13 @@ func (s *Server) ConnectPeersWithRetry(ctx context.Context, policy rpc.RetryPoli
 	copy(peers, s.Peers)
 	s.mu.RUnlock()
 
+	s.GetLogger().Info("connecting to cluster peers with retry", "peer_count", len(peers))
 	for _, peer := range peers {
 		if peer.ID == s.ID {
 			continue // Skip dialing self
 		}
 		if _, err := s.RPCClientPool.ConnectWithRetry(ctx, peer.ID, peer.Address, policy); err != nil {
+			s.GetLogger().Warn("failed to connect to peer with retry", "peer_id", int(peer.ID), "address", peer.Address, "error", err)
 			return err
 		}
 	}
@@ -182,8 +224,10 @@ func (s *Server) RegisterService(grpcServer grpc.ServiceRegistrar) {
 // Start starts the gRPC server listening on the specified network address in the background.
 // It registers the Raft service handlers and begins serving incoming RPC requests.
 func (s *Server) Start(address string, opts ...grpc.ServerOption) error {
+	s.GetLogger().Info("starting gRPC server", "address", address)
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
+		s.GetLogger().Error("failed to listen", "address", address, "error", err)
 		return fmt.Errorf("failed to listen on %s: %w", address, err)
 	}
 	return s.Serve(lis, opts...)
@@ -204,10 +248,15 @@ func (s *Server) Serve(lis net.Listener, opts ...grpc.ServerOption) error {
 
 	s.grpcServer = grpcServer
 	s.listener = lis
+	addrStr := lis.Addr().String()
 	s.mu.Unlock()
 
+	s.GetLogger().Info("gRPC server listening", "address", addrStr)
+
 	go func() {
-		_ = grpcServer.Serve(lis)
+		if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {
+			s.GetLogger().Error("gRPC server error during serve", "error", err)
+		}
 	}()
 
 	return nil
@@ -221,6 +270,7 @@ func (s *Server) Stop() {
 	if s.grpcServer != nil {
 		s.grpcServer.Stop()
 		s.grpcServer = nil
+		s.GetLogger().Info("stopped gRPC server")
 	}
 	if s.listener != nil {
 		_ = s.listener.Close()
@@ -236,6 +286,7 @@ func (s *Server) GracefulStop() {
 	if s.grpcServer != nil {
 		s.grpcServer.GracefulStop()
 		s.grpcServer = nil
+		s.GetLogger().Info("gracefully stopped gRPC server")
 	}
 	if s.listener != nil {
 		_ = s.listener.Close()
@@ -273,6 +324,13 @@ func (s *Server) RequestVote(ctx context.Context, req *raftpb.RequestVoteArgs) (
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	s.GetLogger().Debug("received RequestVote",
+		"candidate_id", req.CandidateId,
+		"term", req.Term,
+		"last_log_index", req.LastLogIndex,
+		"last_log_term", req.LastLogTerm,
+	)
+
 	var term uint64
 	if s.PersistentState != nil {
 		term = uint64(s.PersistentState.CurrentTerm)
@@ -289,6 +347,15 @@ func (s *Server) RequestVote(ctx context.Context, req *raftpb.RequestVoteArgs) (
 func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArgs) (*raftpb.AppendEntriesReply, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	s.GetLogger().Debug("received AppendEntries",
+		"leader_id", req.LeaderId,
+		"term", req.Term,
+		"prev_log_index", req.PrevLogIndex,
+		"prev_log_term", req.PrevLogTerm,
+		"entries_count", len(req.Entries),
+		"leader_commit", req.LeaderCommit,
+	)
 
 	var term uint64
 	if s.PersistentState != nil {
@@ -311,7 +378,14 @@ func (s *Server) SendRequestVote(ctx context.Context, peer Peer, args *raft.Requ
 			peer = p
 		}
 	}
-	return s.RPCClientPool.SendRequestVote(ctx, peer, args)
+
+	s.GetLogger().Debug("sending RequestVote", "peer_id", int(peer.ID), "term", uint64(args.Term))
+	reply, err := s.RPCClientPool.SendRequestVote(ctx, peer, args)
+	if err != nil {
+		s.GetLogger().Warn("failed to send RequestVote", "peer_id", int(peer.ID), "error", err, "is_timeout", rpc.IsTimeout(err))
+		return nil, err
+	}
+	return reply, nil
 }
 
 // SendAppendEntries sends an AppendEntries RPC to a peer using the server's RPC client pool.
@@ -324,7 +398,14 @@ func (s *Server) SendAppendEntries(ctx context.Context, peer Peer, args *raft.Ap
 			peer = p
 		}
 	}
-	return s.RPCClientPool.SendAppendEntries(ctx, peer, args)
+
+	s.GetLogger().Debug("sending AppendEntries", "peer_id", int(peer.ID), "term", uint64(args.Term), "entries_count", len(args.Entries))
+	reply, err := s.RPCClientPool.SendAppendEntries(ctx, peer, args)
+	if err != nil {
+		s.GetLogger().Warn("failed to send AppendEntries", "peer_id", int(peer.ID), "error", err, "is_timeout", rpc.IsTimeout(err))
+		return nil, err
+	}
+	return reply, nil
 }
 
 // SendRequestVoteToNode sends a RequestVote RPC to a peer identified by NodeID.
@@ -376,6 +457,7 @@ func (s *Server) sendAppendEntries(peer Peer, args *raft.AppendEntriesArgs) (*ra
 
 // Close stops the gRPC server and closes all peer RPC connections.
 func (s *Server) Close() error {
+	s.GetLogger().Info("closing server")
 	s.Stop()
 	if s.RPCClientPool != nil {
 		return s.RPCClientPool.Close()

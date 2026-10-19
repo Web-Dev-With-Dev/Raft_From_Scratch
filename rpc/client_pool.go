@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"net"
 	"sync"
@@ -82,6 +83,7 @@ type ClientPool struct {
 	addresses   map[NodeID]string
 	retryPolicy RetryPolicy
 	rpcTimeout  time.Duration
+	logger      *slog.Logger
 }
 
 // NewClientPool creates a new ClientPool with default retry policy.
@@ -100,6 +102,20 @@ func NewClientPoolWithPolicy(policy RetryPolicy) *ClientPool {
 		rpcTimeout:  DefaultRPCTimeout,
 	}
 }
+
+// SetLogger configures the structured logger for this client pool.
+func (p *ClientPool) SetLogger(l *slog.Logger) {
+	p.logger = l
+}
+
+// GetLogger returns the structured logger, defaulting to slog.Default() if nil.
+func (p *ClientPool) GetLogger() *slog.Logger {
+	if p == nil || p.logger == nil {
+		return slog.Default()
+	}
+	return p.logger
+}
+
 
 // SetRetryPolicy updates the default retry policy for subsequent dials.
 func (p *ClientPool) SetRetryPolicy(policy RetryPolicy) {
@@ -178,6 +194,14 @@ func (p *ClientPool) ConnectWithRetry(
 				lastErr = err
 				if attempt < policy.MaxRetries {
 					backoffDur := policy.BackoffForAttempt(attempt)
+					p.GetLogger().Debug("peer probe dial failed, retrying with backoff",
+						"peer_id", int(id),
+						"address", address,
+						"attempt", attempt+1,
+						"max_retries", policy.MaxRetries,
+						"backoff", backoffDur,
+						"error", err,
+					)
 					select {
 					case <-ctx.Done():
 						return nil, fmt.Errorf("context cancelled during dial retry for peer %d at %s: %w", id, address, ctx.Err())
@@ -193,12 +217,21 @@ func (p *ClientPool) ConnectWithRetry(
 		// Establish persistent gRPC connection
 		client, err := p.connectDirect(id, address, opts...)
 		if err == nil {
+			p.GetLogger().Info("connected to peer", "peer_id", int(id), "address", address)
 			return client, nil
 		}
 
 		lastErr = err
 		if attempt < policy.MaxRetries {
 			backoffDur := policy.BackoffForAttempt(attempt)
+			p.GetLogger().Debug("gRPC dial failed, retrying with backoff",
+				"peer_id", int(id),
+				"address", address,
+				"attempt", attempt+1,
+				"max_retries", policy.MaxRetries,
+				"backoff", backoffDur,
+				"error", err,
+			)
 			select {
 			case <-ctx.Done():
 				return nil, fmt.Errorf("context cancelled during dial retry for peer %d at %s: %w", id, address, ctx.Err())

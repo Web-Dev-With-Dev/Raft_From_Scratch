@@ -1,14 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"net"
+	"strings"
 	"testing"
+	"time"
 
 	raftpb "raft/proto"
 	"raft/raft"
 	"raft/rpc"
-	"time"
+
 	"google.golang.org/grpc"
 )
 
@@ -468,6 +471,65 @@ func TestServer_RPCTimeout_DeadPeerDoesNotBlock(t *testing.T) {
 		t.Fatalf("expected call to unblock around 100ms, but took %v", elapsed)
 	}
 }
+
+func TestServer_StructuredLoggingWithNodePrefix(t *testing.T) {
+	buf := &bytes.Buffer{}
+	nodeID := raft.NodeID(5)
+
+	// Create logger capturing output to buffer without timestamps
+	testLogger := NewNodeLogger(nodeID, buf, &LogOptions{
+		DisableTime: true,
+	})
+
+	srv := NewServer(nodeID, nil, nil, nil)
+	srv.SetLogger(testLogger)
+
+	if srv.GetLogger() != testLogger {
+		t.Fatalf("expected GetLogger to return configured testLogger")
+	}
+
+	// 1. Add peer (should log)
+	srv.AddPeer(Peer{ID: 2, Address: "127.0.0.1:8002"})
+
+	// 2. Start and Stop server (should log)
+	if err := srv.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+
+	srv.Stop()
+
+	output := buf.String()
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+
+	if len(lines) == 0 {
+		t.Fatalf("expected log output, got none")
+	}
+
+	expectedPrefix := "[Node 5] "
+	for i, line := range lines {
+		if !strings.HasPrefix(line, expectedPrefix) {
+			t.Fatalf("log line %d does not have expected prefix %q: %q", i, expectedPrefix, line)
+		}
+		if !strings.Contains(line, "node_id=5") {
+			t.Fatalf("log line %d missing structured node_id attribute: %q", i, line)
+		}
+	}
+
+	// Verify specific logged events exist
+	if !strings.Contains(output, "added peer") {
+		t.Fatalf("expected 'added peer' log event, output:\n%s", output)
+	}
+	if !strings.Contains(output, "starting gRPC server") {
+		t.Fatalf("expected 'starting gRPC server' log event, output:\n%s", output)
+	}
+	if !strings.Contains(output, "gRPC server listening") {
+		t.Fatalf("expected 'gRPC server listening' log event, output:\n%s", output)
+	}
+	if !strings.Contains(output, "stopped gRPC server") {
+		t.Fatalf("expected 'stopped gRPC server' log event, output:\n%s", output)
+	}
+}
+
 
 
 
