@@ -956,6 +956,159 @@ func TestServer_SingleEventLoop_NoDataRaces(t *testing.T) {
 	wg.Wait()
 }
 
+func TestServer_BecomeCandidate(t *testing.T) {
+	srv := NewServer(1, []Peer{
+		{ID: 2, Address: "localhost:8002"},
+		{ID: 3, Address: "localhost:8003"},
+	}, &raft.PersistentState{
+		CurrentTerm: 2,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+
+	if srv.State != raft.Follower {
+		t.Fatalf("expected initial state Follower, got %s", srv.State)
+	}
+
+	srv.becomeCandidate()
+
+	if srv.State != raft.Candidate {
+		t.Fatalf("expected state Candidate, got %s", srv.State)
+	}
+	if srv.PersistentState.CurrentTerm != 3 {
+		t.Fatalf("expected term 3, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != 1 {
+		t.Fatalf("expected votedFor 1, got %d", srv.PersistentState.VotedFor)
+	}
+	if !srv.votesReceived[1] {
+		t.Fatalf("expected self vote in votesReceived")
+	}
+	if len(srv.votesReceived) != 1 {
+		t.Fatalf("expected exactly 1 vote recorded, got %d", len(srv.votesReceived))
+	}
+}
+
+func TestServer_BecomeLeader(t *testing.T) {
+	peers := []Peer{
+		{ID: 2, Address: "localhost:8002"},
+		{ID: 3, Address: "localhost:8003"},
+	}
+	srv := NewServer(1, peers, &raft.PersistentState{
+		CurrentTerm: 3,
+		VotedFor:    1,
+		Log: []raft.LogEntry{
+			{Term: 1, Index: 1, Command: "cmd1"},
+			{Term: 2, Index: 2, Command: "cmd2"},
+			{Term: 3, Index: 3, Command: "cmd3"},
+		},
+	}, nil)
+
+	srv.becomeCandidate()
+	srv.becomeLeader()
+
+	if srv.State != raft.Leader {
+		t.Fatalf("expected state Leader, got %s", srv.State)
+	}
+	if srv.VolatileStateLeader == nil {
+		t.Fatalf("expected VolatileStateLeader to be initialized")
+	}
+	// For each peer, nextIndex should be lastLogIndex + 1 = 4, and matchIndex = 0
+	for _, p := range peers {
+		if next := srv.VolatileStateLeader.NextIndex[p.ID]; next != 4 {
+			t.Fatalf("expected peer %d nextIndex=4, got %d", p.ID, next)
+		}
+		if match := srv.VolatileStateLeader.MatchIndex[p.ID]; match != 0 {
+			t.Fatalf("expected peer %d matchIndex=0, got %d", p.ID, match)
+		}
+	}
+	if srv.heartbeatTimer == nil {
+		t.Fatalf("expected heartbeatTimer to be armed")
+	}
+}
+
+func TestServer_BecomeFollower(t *testing.T) {
+	srv := NewServer(1, []Peer{
+		{ID: 2, Address: "localhost:8002"},
+	}, &raft.PersistentState{
+		CurrentTerm: 2,
+		VotedFor:    1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+
+	srv.becomeCandidate() // CurrentTerm=3, VotedFor=1
+
+	// 1. Transition to Follower with higher term -> resets votedFor
+	srv.becomeFollower(5)
+
+	if srv.State != raft.Follower {
+		t.Fatalf("expected state Follower, got %s", srv.State)
+	}
+	if srv.PersistentState.CurrentTerm != 5 {
+		t.Fatalf("expected currentTerm 5, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != -1 {
+		t.Fatalf("expected votedFor -1 after higher term, got %d", srv.PersistentState.VotedFor)
+	}
+	if len(srv.votesReceived) != 0 {
+		t.Fatalf("expected votesReceived cleared, got %v", srv.votesReceived)
+	}
+
+	// 2. Transition to Follower with same term -> preserves votedFor
+	srv.PersistentState.VotedFor = 2
+	srv.becomeFollower(5)
+	if srv.PersistentState.VotedFor != 2 {
+		t.Fatalf("expected votedFor 2 preserved when term not increased, got %d", srv.PersistentState.VotedFor)
+	}
+}
+
+func TestServer_Transitions_FullLifecycle(t *testing.T) {
+	peers := []Peer{
+		{ID: 2, Address: "localhost:8002"},
+		{ID: 3, Address: "localhost:8003"},
+	}
+	srv := NewServer(1, peers, &raft.PersistentState{
+		CurrentTerm: 0,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+
+	// Step 1: Starts as Follower
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected Follower, got %s", srv.GetState())
+	}
+
+	// Step 2: Election timeout -> becomeCandidate
+	srv.becomeCandidate()
+	if srv.GetState() != raft.Candidate {
+		t.Fatalf("expected Candidate, got %s", srv.GetState())
+	}
+	if srv.PersistentState.CurrentTerm != 1 || srv.PersistentState.VotedFor != 1 {
+		t.Fatalf("expected term 1 votedFor 1, got term %d votedFor %d", srv.PersistentState.CurrentTerm, srv.PersistentState.VotedFor)
+	}
+
+	// Step 3: Candidate achieves majority -> becomeLeader
+	srv.becomeLeader()
+	if srv.GetState() != raft.Leader {
+		t.Fatalf("expected Leader, got %s", srv.GetState())
+	}
+	if srv.heartbeatTimer == nil {
+		t.Fatalf("expected armed heartbeatTimer")
+	}
+
+	// Step 4: Discovers higher term in RPC -> becomeFollower
+	srv.becomeFollower(4)
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected Follower, got %s", srv.GetState())
+	}
+	if srv.PersistentState.CurrentTerm != 4 {
+		t.Fatalf("expected term 4, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != -1 {
+		t.Fatalf("expected votedFor -1, got %d", srv.PersistentState.VotedFor)
+	}
+}
+
 
 
 

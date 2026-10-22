@@ -6,10 +6,11 @@ import (
 	"time"
 )
 
-// Default election timeout range recommended by the Raft paper (Section 5.2): 150-300ms.
+// Default election timeout range and heartbeat interval (Raft paper Section 5.2):
 const (
 	DefaultMinElectionTimeout = 150 * time.Millisecond
 	DefaultMaxElectionTimeout = 300 * time.Millisecond
+	DefaultHeartbeatInterval  = 50 * time.Millisecond
 )
 
 // RandomElectionTimeout generates a pseudo-random duration uniformly distributed

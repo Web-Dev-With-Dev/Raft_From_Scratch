@@ -67,8 +67,19 @@ type Server struct {
 	// State represents the current consensus role (Follower, Candidate, Leader).
 	State raft.RaftState `json:"state"`
 
+	// Volatile consensus state
+	VolatileState       *raft.VolatileState       `json:"volatile_state"`
+	VolatileStateLeader *raft.VolatileStateLeader `json:"volatile_state_leader,omitempty"`
+
 	// ElectionTimer manages the randomized election timeout backed by time.Timer.
 	ElectionTimer *raft.ElectionTimer `json:"-"`
+
+	// Leader heartbeat timer
+	heartbeatTimer    *time.Timer
+	heartbeatInterval time.Duration
+
+	// Candidate vote tracking
+	votesReceived map[raft.NodeID]bool
 
 	// RPCClientPool manages gRPC client connections to peers.
 	RPCClientPool *rpc.ClientPool `json:"-"`
@@ -122,19 +133,22 @@ func NewServer(
 	loopDone := make(chan struct{})
 
 	return &Server{
-		ID:              id,
-		Peers:           peers,
-		PersistentState: persistentState,
-		State:           raft.Follower,
-		ElectionTimer:   raft.NewElectionTimer(raft.DefaultMinElectionTimeout, raft.DefaultMaxElectionTimeout),
-		RPCClientPool:   rpcClientPool,
-		Logger:          nodeLogger,
-		lastHeartbeat:   time.Now(),
-		stopCh:          stopCh,
-		requestVoteCh:   requestVoteCh,
-		appendEntriesCh: appendEntriesCh,
-		stateActionCh:   stateActionCh,
-		loopDone:        loopDone,
+		ID:                id,
+		Peers:             peers,
+		PersistentState:   persistentState,
+		State:             raft.Follower,
+		VolatileState:     &raft.VolatileState{CommitIndex: 0, LastApplied: 0},
+		ElectionTimer:     raft.NewElectionTimer(raft.DefaultMinElectionTimeout, raft.DefaultMaxElectionTimeout),
+		RPCClientPool:     rpcClientPool,
+		Logger:            nodeLogger,
+		lastHeartbeat:     time.Now(),
+		heartbeatInterval: raft.DefaultHeartbeatInterval,
+		votesReceived:     make(map[raft.NodeID]bool),
+		stopCh:            stopCh,
+		requestVoteCh:     requestVoteCh,
+		appendEntriesCh:   appendEntriesCh,
+		stateActionCh:     stateActionCh,
+		loopDone:          loopDone,
 	}
 }
 
@@ -506,6 +520,9 @@ func (s *Server) Stop() {
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
 	}
+	if s.heartbeatTimer != nil {
+		s.heartbeatTimer.Stop()
+	}
 
 	if s.grpcServer != nil {
 		s.grpcServer.Stop()
@@ -536,6 +553,9 @@ func (s *Server) GracefulStop() {
 
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
+	}
+	if s.heartbeatTimer != nil {
+		s.heartbeatTimer.Stop()
 	}
 
 	if s.grpcServer != nil {
@@ -708,30 +728,157 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 	}
 
 	// 2. Valid heartbeat/RPC from current or new leader:
-	// If candidate or leader with stale term, step down to follower (§5.2)
+	// If candidate receives AppendEntries from leader, revert to follower (§5.2)
 	if s.State == raft.Candidate {
-		s.State = raft.Follower
-		s.GetLogger().Info("reverted from Candidate to Follower upon valid AppendEntries",
-			"leader_id", req.LeaderId,
-			"term", req.Term,
-		)
-	}
-
-	// 3. Reset election timer triggered by valid heartbeat/RPC received (§5.2)
-	s.lastHeartbeat = time.Now()
-	if s.ElectionTimer != nil {
-		newTimeout := s.ElectionTimer.Reset()
-		s.GetLogger().Info("reset election timer on valid heartbeat/AppendEntries",
-			"leader_id", req.LeaderId,
-			"term", req.Term,
-			"timeout_ms", newTimeout.Milliseconds(),
-		)
+		s.becomeFollower(raft.Term(req.Term))
+	} else {
+		// 3. Reset election timer triggered by valid heartbeat/RPC received (§5.2)
+		s.lastHeartbeat = time.Now()
+		if s.ElectionTimer != nil {
+			newTimeout := s.ElectionTimer.Reset()
+			s.GetLogger().Info("reset election timer on valid heartbeat/AppendEntries",
+				"leader_id", req.LeaderId,
+				"term", req.Term,
+				"timeout_ms", newTimeout.Milliseconds(),
+			)
+		}
 	}
 
 	return &raftpb.AppendEntriesReply{
 		Term:    currentTerm,
 		Success: false, // Stub until log replication logic is added
 	}
+}
+
+// becomeFollower transitions the node to the Follower role for the specified term.
+// In Raft (§5.1 & §5.2):
+// - Updates state to Follower
+// - If term > currentTerm, updates currentTerm and resets votedFor to -1
+// - Stops heartbeat timer if running (was Leader)
+// - Resets the election timer with a new randomized timeout
+// - Clears votesReceived candidate tracking
+func (s *Server) becomeFollower(term raft.Term) {
+	oldRole := s.State
+	s.State = raft.Follower
+
+	if s.PersistentState != nil && term > s.PersistentState.CurrentTerm {
+		s.PersistentState.CurrentTerm = term
+		s.PersistentState.VotedFor = -1
+	}
+
+	if s.heartbeatTimer != nil {
+		s.heartbeatTimer.Stop()
+	}
+
+	s.lastHeartbeat = time.Now()
+	if s.ElectionTimer != nil {
+		s.ElectionTimer.Reset()
+	}
+
+	s.votesReceived = make(map[raft.NodeID]bool)
+
+	var curTerm uint64
+	if s.PersistentState != nil {
+		curTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	s.GetLogger().Info("transitioned to Follower",
+		"node_id", int(s.ID),
+		"previous_state", oldRole.String(),
+		"term", curTerm,
+	)
+}
+
+// becomeCandidate transitions the node to the Candidate role to initiate a new election.
+// In Raft (§5.2):
+// - Updates state to Candidate
+// - Increments currentTerm
+// - Votes for self (votedFor = s.ID)
+// - Stops heartbeat timer if running
+// - Resets the election timer with a new randomized timeout
+// - Initializes vote tracking with self-vote
+func (s *Server) becomeCandidate() {
+	oldRole := s.State
+	s.State = raft.Candidate
+
+	if s.PersistentState != nil {
+		s.PersistentState.CurrentTerm++
+		s.PersistentState.VotedFor = s.ID
+	}
+
+	if s.heartbeatTimer != nil {
+		s.heartbeatTimer.Stop()
+	}
+
+	if s.ElectionTimer != nil {
+		s.ElectionTimer.Reset()
+	}
+
+	s.votesReceived = make(map[raft.NodeID]bool)
+	s.votesReceived[s.ID] = true
+
+	var curTerm uint64
+	if s.PersistentState != nil {
+		curTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	s.GetLogger().Info("transitioned to Candidate",
+		"node_id", int(s.ID),
+		"previous_state", oldRole.String(),
+		"term", curTerm,
+		"voted_for", int(s.ID),
+		"votes_count", 1,
+	)
+}
+
+// becomeLeader transitions the node from Candidate to Leader upon achieving majority votes.
+// In Raft (§5.2 & §5.3):
+// - Updates state to Leader
+// - Stops election timer (leaders do not time out on elections)
+// - Initializes VolatileStateLeader (nextIndex and matchIndex for all peers)
+// - Initializes and arms the heartbeat timer (50ms interval)
+func (s *Server) becomeLeader() {
+	oldRole := s.State
+	s.State = raft.Leader
+
+	if s.ElectionTimer != nil {
+		s.ElectionTimer.Stop()
+	}
+
+	var lastLogIndex raft.LogIndex = 0
+	if s.PersistentState != nil && len(s.PersistentState.Log) > 0 {
+		lastLogIndex = s.PersistentState.Log[len(s.PersistentState.Log)-1].Index
+	}
+
+	s.VolatileStateLeader = &raft.VolatileStateLeader{
+		NextIndex:  make(map[raft.NodeID]raft.LogIndex),
+		MatchIndex: make(map[raft.NodeID]raft.LogIndex),
+	}
+	for _, p := range s.Peers {
+		s.VolatileStateLeader.NextIndex[p.ID] = lastLogIndex + 1
+		s.VolatileStateLeader.MatchIndex[p.ID] = 0
+	}
+
+	if s.heartbeatInterval <= 0 {
+		s.heartbeatInterval = raft.DefaultHeartbeatInterval
+	}
+	if s.heartbeatTimer == nil {
+		s.heartbeatTimer = time.NewTimer(s.heartbeatInterval)
+	} else {
+		s.heartbeatTimer.Reset(s.heartbeatInterval)
+	}
+
+	var curTerm uint64
+	if s.PersistentState != nil {
+		curTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	s.GetLogger().Info("transitioned to Leader",
+		"node_id", int(s.ID),
+		"previous_state", oldRole.String(),
+		"term", curTerm,
+		"peers_count", len(s.Peers),
+	)
 }
 
 // handleElectionTimeout is called when the election timer fires.
@@ -745,31 +892,27 @@ func (s *Server) handleElectionTimeout(t time.Time) {
 		return
 	}
 
-	// Transition to Candidate (§5.2)
-	s.State = raft.Candidate
+	s.becomeCandidate()
+}
 
-	// Increment currentTerm and vote for self (§5.2)
-	if s.PersistentState != nil {
-		s.PersistentState.CurrentTerm++
-		s.PersistentState.VotedFor = s.ID
+// handleHeartbeatTimeout is called when the leader's heartbeat timer fires.
+func (s *Server) handleHeartbeatTimeout() {
+	if s.State != raft.Leader {
+		return
 	}
-
-	// Reset election timer for this election cycle
-	if s.ElectionTimer != nil {
-		newTimeout := s.ElectionTimer.Reset()
-		s.GetLogger().Info("started election, incremented term and reset timer",
-			"node_id", int(s.ID),
-			"new_term", uint64(s.PersistentState.CurrentTerm),
-			"new_timeout_ms", newTimeout.Milliseconds(),
-		)
+	s.GetLogger().Info("leader heartbeat timer fired", "node_id", int(s.ID), "term", uint64(s.PersistentState.CurrentTerm))
+	if s.heartbeatTimer != nil {
+		s.heartbeatTimer.Reset(s.heartbeatInterval)
 	}
 }
 
 // run is the central event loop of the Raft node.
 // It uses a select statement to multiplex between:
-// 1. Timer channel (election timeout)
-// 2. Incoming RPC channels (requestVoteCh and appendEntriesCh)
-// 3. Stop channel (stopCh)
+// 1. Timer channel (election timeout when follower/candidate)
+// 2. Heartbeat channel (when leader)
+// 3. Incoming RPC channels (requestVoteCh and appendEntriesCh)
+// 4. State mutation actions (stateActionCh)
+// 5. Stop channel (stopCh)
 func (s *Server) run() {
 	s.loopRunning.Store(true)
 	s.GetLogger().Info("started main Raft event loop", "node_id", int(s.ID))
@@ -782,8 +925,13 @@ func (s *Server) run() {
 
 	for {
 		var timerCh <-chan time.Time
-		if s.ElectionTimer != nil {
+		if s.State != raft.Leader && s.ElectionTimer != nil {
 			timerCh = s.ElectionTimer.C()
+		}
+
+		var heartbeatCh <-chan time.Time
+		if s.State == raft.Leader && s.heartbeatTimer != nil {
+			heartbeatCh = s.heartbeatTimer.C
 		}
 
 		select {
@@ -796,6 +944,11 @@ func (s *Server) run() {
 			}
 			s.mu.Lock()
 			s.handleElectionTimeout(t)
+			s.mu.Unlock()
+
+		case <-heartbeatCh:
+			s.mu.Lock()
+			s.handleHeartbeatTimeout()
 			s.mu.Unlock()
 
 		case ev := <-s.requestVoteCh:

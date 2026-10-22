@@ -20,6 +20,7 @@ const (
 
 	DefaultMinElectionTimeout = raft.DefaultMinElectionTimeout
 	DefaultMaxElectionTimeout = raft.DefaultMaxElectionTimeout
+	DefaultHeartbeatInterval  = raft.DefaultHeartbeatInterval
 )
 
 var (
