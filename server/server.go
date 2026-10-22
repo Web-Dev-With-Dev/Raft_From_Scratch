@@ -39,6 +39,11 @@ type AppendEntriesEvent struct {
 	ResCh chan<- *raftpb.AppendEntriesReply
 }
 
+type stateAction struct {
+	fn    func()
+	resCh chan struct{}
+}
+
 // NewNodeLogger creates a structured logger with [Node <ID>] prefix on every line.
 func NewNodeLogger(id raft.NodeID, w io.Writer, opts *LogOptions) *slog.Logger {
 	return logger.NewNodeLogger(id, w, opts)
@@ -78,6 +83,7 @@ type Server struct {
 	stopOnce        sync.Once
 	requestVoteCh   chan RequestVoteEvent
 	appendEntriesCh chan AppendEntriesEvent
+	stateActionCh   chan stateAction
 	loopDone        chan struct{}
 	loopRunning     atomic.Bool
 
@@ -112,6 +118,7 @@ func NewServer(
 	stopCh := make(chan struct{})
 	requestVoteCh := make(chan RequestVoteEvent, 64)
 	appendEntriesCh := make(chan AppendEntriesEvent, 64)
+	stateActionCh := make(chan stateAction, 64)
 	loopDone := make(chan struct{})
 
 	return &Server{
@@ -126,6 +133,7 @@ func NewServer(
 		stopCh:          stopCh,
 		requestVoteCh:   requestVoteCh,
 		appendEntriesCh: appendEntriesCh,
+		stateActionCh:   stateActionCh,
 		loopDone:        loopDone,
 	}
 }
@@ -145,7 +153,29 @@ func (s *Server) GetState() raft.RaftState {
 }
 
 // SetState updates the server's consensus state.
+// When the event loop is active, the mutation is executed on the single event-loop goroutine.
 func (s *Server) SetState(state raft.RaftState) {
+	if s.loopRunning.Load() {
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				old := s.State
+				s.State = state
+				s.GetLogger().Info("transitioned consensus state", "from", old.String(), "to", state.String())
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return
+		}
+		select {
+		case <-resCh:
+		case <-s.stopCh:
+		}
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old := s.State
@@ -162,26 +192,71 @@ func (s *Server) GetElectionTimer() *raft.ElectionTimer {
 
 // ResetElectionTimeout resets the election timer with a newly selected
 // randomized duration in [150ms, 300ms]. Returns the new timeout duration.
+// When the event loop is active, the mutation is executed on the single event-loop goroutine.
 func (s *Server) ResetElectionTimeout() time.Duration {
-	s.mu.RLock()
-	timer := s.ElectionTimer
-	s.mu.RUnlock()
+	if s.loopRunning.Load() {
+		resCh := make(chan time.Duration, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				if s.ElectionTimer != nil {
+					d := s.ElectionTimer.Reset()
+					s.GetLogger().Info("reset election timeout", "timeout_ms", d.Milliseconds())
+					resCh <- d
+				} else {
+					resCh <- 0
+				}
+			},
+		}:
+		case <-s.stopCh:
+			return 0
+		}
+		select {
+		case d := <-resCh:
+			return d
+		case <-s.stopCh:
+			return 0
+		}
+	}
 
-	if timer == nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ElectionTimer == nil {
 		return 0
 	}
-	d := timer.Reset()
+	d := s.ElectionTimer.Reset()
 	s.GetLogger().Info("reset election timeout", "timeout_ms", d.Milliseconds())
 	return d
 }
 
 // HandleHeartbeat processes a heartbeat event from a leader.
-// If the heartbeat is valid (term >= currentTerm), it resets the election timer,
-// updates the last heartbeat timestamp, reverts Candidates to Followers,
-// and returns true along with the newly assigned election timeout.
-// If the heartbeat term is stale (term < currentTerm), the heartbeat is rejected
-// without resetting the timer, returning false and 0.
+// When the event loop is active, the heartbeat is routed through the single event loop.
 func (s *Server) HandleHeartbeat(leaderID raft.NodeID, term raft.Term) (bool, time.Duration) {
+	if s.loopRunning.Load() {
+		resCh := make(chan *raftpb.AppendEntriesReply, 1)
+		args := &raftpb.AppendEntriesArgs{
+			LeaderId: int64(leaderID),
+			Term:     uint64(term),
+		}
+		select {
+		case s.appendEntriesCh <- AppendEntriesEvent{Args: args, ResCh: resCh}:
+		case <-s.stopCh:
+			return false, 0
+		}
+
+		select {
+		case reply := <-resCh:
+			valid := (uint64(term) >= reply.Term)
+			var timeout time.Duration
+			if s.ElectionTimer != nil {
+				timeout = s.ElectionTimer.Duration()
+			}
+			return valid, timeout
+		case <-s.stopCh:
+			return false, 0
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -737,6 +812,14 @@ func (s *Server) run() {
 			s.mu.Unlock()
 			if ev.ResCh != nil {
 				ev.ResCh <- reply
+			}
+
+		case act := <-s.stateActionCh:
+			s.mu.Lock()
+			act.fn()
+			s.mu.Unlock()
+			if act.resCh != nil {
+				act.resCh <- struct{}{}
 			}
 		}
 	}

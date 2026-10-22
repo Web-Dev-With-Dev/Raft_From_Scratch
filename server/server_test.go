@@ -5,6 +5,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -917,6 +918,44 @@ func TestServer_RunLoop_RPCChannels(t *testing.T) {
 		t.Fatal("timed out waiting for AppendEntries reply from event loop")
 	}
 }
+
+func TestServer_SingleEventLoop_NoDataRaces(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 1,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+
+	srv.StartEventLoop()
+	defer srv.Stop()
+
+	// Launch 20 goroutines performing concurrent operations (mutations and reads)
+	// to verify that all state mutations flow cleanly through the single event loop.
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < 25; j++ {
+				switch (workerID + j) % 5 {
+				case 0:
+					srv.SetState(raft.Candidate)
+				case 1:
+					srv.SetState(raft.Follower)
+				case 2:
+					_ = srv.ResetElectionTimeout()
+				case 3:
+					_, _ = srv.HandleHeartbeat(2, 1)
+				case 4:
+					_ = srv.GetState()
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
 
 
 
