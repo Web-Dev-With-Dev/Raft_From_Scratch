@@ -1109,6 +1109,110 @@ func TestServer_Transitions_FullLifecycle(t *testing.T) {
 	}
 }
 
+func TestStateTransition_FollowerCandidateLeaderFollower(t *testing.T) {
+	peers := []Peer{
+		{ID: 2, Address: "127.0.0.1:8002"},
+		{ID: 3, Address: "127.0.0.1:8003"},
+	}
+	ps := &raft.PersistentState{
+		CurrentTerm: 1,
+		VotedFor:    -1,
+		Log: []raft.LogEntry{
+			{Term: 1, Index: 1, Command: "cmd1"},
+		},
+	}
+	srv := NewServer(1, peers, ps, nil)
+
+	// ==========================================
+	// 1. Initial State: Follower
+	// ==========================================
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected initial role Follower, got %s", srv.GetState())
+	}
+	if srv.PersistentState.CurrentTerm != 1 {
+		t.Fatalf("expected initial term 1, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != -1 {
+		t.Fatalf("expected initial votedFor -1, got %d", srv.PersistentState.VotedFor)
+	}
+	if srv.heartbeatTimer != nil {
+		t.Fatalf("follower must not have an active heartbeatTimer")
+	}
+	if srv.VolatileStateLeader != nil {
+		t.Fatalf("follower must have nil VolatileStateLeader")
+	}
+
+	// ==========================================
+	// 2. Transition: Follower -> Candidate
+	// ==========================================
+	srv.becomeCandidate()
+
+	if srv.GetState() != raft.Candidate {
+		t.Fatalf("expected role Candidate, got %s", srv.GetState())
+	}
+	if srv.PersistentState.CurrentTerm != 2 {
+		t.Fatalf("expected incremented term 2, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != 1 {
+		t.Fatalf("expected votedFor self (1), got %d", srv.PersistentState.VotedFor)
+	}
+	if !srv.votesReceived[1] {
+		t.Fatalf("expected candidate self-vote recorded in votesReceived")
+	}
+	if len(srv.votesReceived) != 1 {
+		t.Fatalf("expected exactly 1 vote recorded initially, got %d", len(srv.votesReceived))
+	}
+	if srv.heartbeatTimer != nil {
+		t.Fatalf("candidate must not have an active heartbeatTimer")
+	}
+
+	// ==========================================
+	// 3. Transition: Candidate -> Leader
+	// ==========================================
+	srv.becomeLeader()
+
+	if srv.GetState() != raft.Leader {
+		t.Fatalf("expected role Leader, got %s", srv.GetState())
+	}
+	if srv.PersistentState.CurrentTerm != 2 {
+		t.Fatalf("expected term 2 unchanged when becoming leader, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.heartbeatTimer == nil {
+		t.Fatalf("leader must have an armed heartbeatTimer")
+	}
+	if srv.VolatileStateLeader == nil {
+		t.Fatalf("leader must initialize VolatileStateLeader")
+	}
+	// Verify nextIndex initialized to lastLogIndex + 1 = 2, and matchIndex = 0 for all peers
+	for _, p := range peers {
+		if next := srv.VolatileStateLeader.NextIndex[p.ID]; next != 2 {
+			t.Fatalf("expected peer %d nextIndex=2, got %d", p.ID, next)
+		}
+		if match := srv.VolatileStateLeader.MatchIndex[p.ID]; match != 0 {
+			t.Fatalf("expected peer %d matchIndex=0, got %d", p.ID, match)
+		}
+	}
+
+	// ==========================================
+	// 4. Transition: Leader -> Follower (higher term discovered)
+	// ==========================================
+	srv.becomeFollower(5)
+
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected role Follower, got %s", srv.GetState())
+	}
+	if srv.PersistentState.CurrentTerm != 5 {
+		t.Fatalf("expected stepped up term 5, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != -1 {
+		t.Fatalf("expected votedFor reset to -1 after higher term discovered, got %d", srv.PersistentState.VotedFor)
+	}
+	if len(srv.votesReceived) != 0 {
+		t.Fatalf("expected votesReceived cleared after becoming follower, got %v", srv.votesReceived)
+	}
+}
+
+
 
 
 
