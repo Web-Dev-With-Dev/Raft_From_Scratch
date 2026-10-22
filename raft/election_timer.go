@@ -37,6 +37,7 @@ type ElectionTimer struct {
 	minTimeout time.Duration
 	maxTimeout time.Duration
 	duration   time.Duration
+	lastReset  time.Time
 	stopped    bool
 }
 
@@ -58,6 +59,7 @@ func NewElectionTimer(min, max time.Duration) *ElectionTimer {
 		minTimeout: min,
 		maxTimeout: max,
 		duration:   d,
+		lastReset:  time.Now(),
 	}
 }
 
@@ -98,6 +100,7 @@ func (et *ElectionTimer) Reset() time.Duration {
 
 	d := RandomElectionTimeout(et.minTimeout, et.maxTimeout)
 	et.duration = d
+	et.lastReset = time.Now()
 	et.timer.Reset(d)
 	et.stopped = false
 	return d
@@ -111,6 +114,7 @@ func (et *ElectionTimer) ResetWithTimeout(d time.Duration) time.Duration {
 
 	if et.timer == nil {
 		et.duration = d
+		et.lastReset = time.Now()
 		et.timer = time.NewTimer(d)
 		et.stopped = false
 		return d
@@ -124,9 +128,17 @@ func (et *ElectionTimer) ResetWithTimeout(d time.Duration) time.Duration {
 	}
 
 	et.duration = d
+	et.lastReset = time.Now()
 	et.timer.Reset(d)
 	et.stopped = false
 	return d
+}
+
+// LastReset returns the time when the election timer was last initialized or reset.
+func (et *ElectionTimer) LastReset() time.Time {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+	return et.lastReset
 }
 
 // Stop stops the election timer, preventing it from firing.

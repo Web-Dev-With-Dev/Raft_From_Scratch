@@ -58,6 +58,8 @@ type Server struct {
 	// Logger is the structured logger for this node with [Node <ID>] prefix on every line.
 	Logger *slog.Logger `json:"-"`
 
+	lastHeartbeat time.Time
+
 	grpcServer *grpc.Server
 	listener   net.Listener
 }
@@ -94,6 +96,7 @@ func NewServer(
 		ElectionTimer:   raft.NewElectionTimer(raft.DefaultMinElectionTimeout, raft.DefaultMaxElectionTimeout),
 		RPCClientPool:   rpcClientPool,
 		Logger:          nodeLogger,
+		lastHeartbeat:   time.Now(),
 	}
 }
 
@@ -140,6 +143,59 @@ func (s *Server) ResetElectionTimeout() time.Duration {
 	d := timer.Reset()
 	s.GetLogger().Info("reset election timeout", "timeout_ms", d.Milliseconds())
 	return d
+}
+
+// HandleHeartbeat processes a heartbeat event from a leader.
+// If the heartbeat is valid (term >= currentTerm), it resets the election timer,
+// updates the last heartbeat timestamp, reverts Candidates to Followers,
+// and returns true along with the newly assigned election timeout.
+// If the heartbeat term is stale (term < currentTerm), the heartbeat is rejected
+// without resetting the timer, returning false and 0.
+func (s *Server) HandleHeartbeat(leaderID raft.NodeID, term raft.Term) (bool, time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var currentTerm raft.Term
+	if s.PersistentState != nil {
+		currentTerm = s.PersistentState.CurrentTerm
+	}
+
+	if term < currentTerm {
+		s.GetLogger().Warn("rejected heartbeat from stale leader",
+			"leader_id", int(leaderID),
+			"leader_term", uint64(term),
+			"current_term", uint64(currentTerm),
+		)
+		return false, 0
+	}
+
+	if s.State == raft.Candidate {
+		s.State = raft.Follower
+		s.GetLogger().Info("reverted from Candidate to Follower upon valid heartbeat",
+			"leader_id", int(leaderID),
+			"term", uint64(term),
+		)
+	}
+
+	s.lastHeartbeat = time.Now()
+	var newTimeout time.Duration
+	if s.ElectionTimer != nil {
+		newTimeout = s.ElectionTimer.Reset()
+		s.GetLogger().Info("reset election timer on valid heartbeat",
+			"leader_id", int(leaderID),
+			"term", uint64(term),
+			"timeout_ms", newTimeout.Milliseconds(),
+		)
+	}
+
+	return true, newTimeout
+}
+
+// LastHeartbeatTime returns the timestamp of the last valid heartbeat received by the server.
+func (s *Server) LastHeartbeatTime() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastHeartbeat
 }
 
 // GetPeers returns a copy of the peer list.
@@ -388,10 +444,10 @@ func (s *Server) GRPCServer() *grpc.Server {
 }
 
 // RequestVote handles incoming RequestVote RPCs.
-// This is currently an empty/stub handler returning the node's current term.
+// When a vote is granted to a candidate, it resets the server's election timer (§5.2).
 func (s *Server) RequestVote(ctx context.Context, req *raftpb.RequestVoteArgs) (*raftpb.RequestVoteReply, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.GetLogger().Info("received RequestVote",
 		"candidate_id", req.CandidateId,
@@ -400,22 +456,49 @@ func (s *Server) RequestVote(ctx context.Context, req *raftpb.RequestVoteArgs) (
 		"last_log_term", req.LastLogTerm,
 	)
 
-	var term uint64
+	var currentTerm uint64
 	if s.PersistentState != nil {
-		term = uint64(s.PersistentState.CurrentTerm)
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	// 1. Reply false if term < currentTerm (§5.1)
+	if req.Term < currentTerm {
+		s.GetLogger().Warn("rejected RequestVote from candidate with stale term",
+			"candidate_id", req.CandidateId,
+			"req_term", req.Term,
+			"current_term", currentTerm,
+		)
+		return &raftpb.RequestVoteReply{
+			Term:        currentTerm,
+			VoteGranted: false,
+		}, nil
+	}
+
+	voteGranted := false
+
+	// In Raft (§5.2):
+	// A server resets its election timer when it grants a vote to a candidate.
+	if voteGranted && s.ElectionTimer != nil {
+		s.lastHeartbeat = time.Now()
+		newTimeout := s.ElectionTimer.Reset()
+		s.GetLogger().Info("reset election timer on granting vote",
+			"candidate_id", req.CandidateId,
+			"term", req.Term,
+			"timeout_ms", newTimeout.Milliseconds(),
+		)
 	}
 
 	return &raftpb.RequestVoteReply{
-		Term:        term,
-		VoteGranted: false,
+		Term:        currentTerm,
+		VoteGranted: voteGranted,
 	}, nil
 }
 
 // AppendEntries handles incoming AppendEntries RPCs (heartbeats and log replication).
-// This is currently an empty/stub handler returning the node's current term.
+// A valid heartbeat (req.Term >= currentTerm) resets the node's election timer (§5.2).
 func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArgs) (*raftpb.AppendEntriesReply, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.GetLogger().Info("received AppendEntries",
 		"leader_id", req.LeaderId,
@@ -426,14 +509,48 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArg
 		"leader_commit", req.LeaderCommit,
 	)
 
-	var term uint64
+	var currentTerm uint64
 	if s.PersistentState != nil {
-		term = uint64(s.PersistentState.CurrentTerm)
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	// 1. Reply false if term < currentTerm (§5.1)
+	if req.Term < currentTerm {
+		s.GetLogger().Warn("rejected AppendEntries from stale leader",
+			"leader_id", req.LeaderId,
+			"req_term", req.Term,
+			"current_term", currentTerm,
+		)
+		return &raftpb.AppendEntriesReply{
+			Term:    currentTerm,
+			Success: false,
+		}, nil
+	}
+
+	// 2. Valid heartbeat/RPC from current or new leader:
+	// If candidate or leader with stale term, step down to follower (§5.2)
+	if s.State == raft.Candidate {
+		s.State = raft.Follower
+		s.GetLogger().Info("reverted from Candidate to Follower upon valid AppendEntries",
+			"leader_id", req.LeaderId,
+			"term", req.Term,
+		)
+	}
+
+	// 3. Reset election timer triggered by valid heartbeat/RPC received (§5.2)
+	s.lastHeartbeat = time.Now()
+	if s.ElectionTimer != nil {
+		newTimeout := s.ElectionTimer.Reset()
+		s.GetLogger().Info("reset election timer on valid heartbeat/AppendEntries",
+			"leader_id", req.LeaderId,
+			"term", req.Term,
+			"timeout_ms", newTimeout.Milliseconds(),
+		)
 	}
 
 	return &raftpb.AppendEntriesReply{
-		Term:    term,
-		Success: false,
+		Term:    currentTerm,
+		Success: false, // Stub until log replication logic is added
 	}, nil
 }
 

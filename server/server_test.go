@@ -631,6 +631,194 @@ func TestServer_ElectionTimerAndState(t *testing.T) {
 	}
 }
 
+func TestServer_TimerResetOnValidHeartbeat(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 5,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+	defer srv.Close()
+
+	et := srv.GetElectionTimer()
+	initialReset := et.LastReset()
+
+	time.Sleep(10 * time.Millisecond)
+
+	// 1. Send valid heartbeat matching current term
+	ok, newTimeout := srv.HandleHeartbeat(2, 5)
+	if !ok {
+		t.Fatalf("expected valid heartbeat to be accepted")
+	}
+	if newTimeout < raft.DefaultMinElectionTimeout || newTimeout > raft.DefaultMaxElectionTimeout {
+		t.Fatalf("new timeout %v outside range", newTimeout)
+	}
+	if !et.LastReset().After(initialReset) {
+		t.Fatalf("expected election timer LastReset to be updated after valid heartbeat")
+	}
+	if srv.LastHeartbeatTime().IsZero() {
+		t.Fatalf("expected LastHeartbeatTime to be recorded")
+	}
+
+	// 2. Candidate reverts to follower on valid heartbeat
+	srv.SetState(raft.Candidate)
+	ok, _ = srv.HandleHeartbeat(2, 5)
+	if !ok {
+		t.Fatalf("expected heartbeat to be accepted")
+	}
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected Candidate to revert to Follower on valid heartbeat, got %v", srv.GetState())
+	}
+}
+
+func TestServer_NoTimerResetOnStaleHeartbeat(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 10,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+	defer srv.Close()
+
+	et := srv.GetElectionTimer()
+	lastResetBefore := et.LastReset()
+	lastHbBefore := srv.LastHeartbeatTime()
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Heartbeat with stale term (3 < 10) must be rejected without resetting timer
+	ok, newTimeout := srv.HandleHeartbeat(2, 3)
+	if ok {
+		t.Fatalf("expected stale heartbeat to be rejected")
+	}
+	if newTimeout != 0 {
+		t.Fatalf("expected 0 timeout for rejected heartbeat, got %v", newTimeout)
+	}
+	if et.LastReset() != lastResetBefore {
+		t.Fatalf("election timer must NOT be reset on stale heartbeat")
+	}
+	if srv.LastHeartbeatTime() != lastHbBefore {
+		t.Fatalf("lastHeartbeat must NOT be updated on stale heartbeat")
+	}
+}
+
+func TestServer_PeriodicHeartbeatsSuppressElectionTimeout(t *testing.T) {
+	srv := NewServer(1, nil, nil, nil)
+	defer srv.Close()
+
+	et := srv.GetElectionTimer()
+	// Set a fast range for testing: 50-80ms
+	et.SetRange(50*time.Millisecond, 80*time.Millisecond)
+	et.Reset()
+
+	// Send periodic heartbeats every 15ms for 100ms (longer than the 50-80ms election timeout)
+	stopHeartbeats := make(chan struct{})
+	doneHeartbeats := make(chan struct{})
+
+	go func() {
+		defer close(doneHeartbeats)
+		ticker := time.NewTicker(15 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopHeartbeats:
+				return
+			case <-ticker.C:
+				srv.HandleHeartbeat(2, 0)
+			}
+		}
+	}()
+
+	// During periodic heartbeats, timer must NOT fire
+	select {
+	case <-et.C():
+		close(stopHeartbeats)
+		t.Fatalf("election timer fired unexpectedly during active heartbeats")
+	case <-time.After(100 * time.Millisecond):
+		// Periodic heartbeats successfully suppressed timeout!
+	}
+
+	// Stop heartbeats now
+	close(stopHeartbeats)
+	<-doneHeartbeats
+
+	// Now that heartbeats have stopped, timer MUST fire within 150ms
+	select {
+	case fireTime := <-et.C():
+		if fireTime.IsZero() {
+			t.Fatal("expected valid fireTime")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("election timer failed to fire after heartbeats ceased")
+	}
+}
+
+func TestServer_AppendEntriesRPC_TriggersTimerReset(t *testing.T) {
+	ps := &raft.PersistentState{
+		CurrentTerm: 5,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}
+	srv := NewServer(1, nil, ps, nil)
+	if err := srv.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer srv.Close()
+
+	pool := rpc.NewClientPool()
+	defer pool.Close()
+
+	client, err := pool.Connect(1, srv.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to connect to server: %v", err)
+	}
+
+	et := srv.GetElectionTimer()
+	initialReset := et.LastReset()
+
+	time.Sleep(10 * time.Millisecond)
+
+	// 1. Send valid AppendEntries RPC via gRPC
+	aeReply, err := client.AppendEntries(context.Background(), &raftpb.AppendEntriesArgs{
+		Term:         5,
+		LeaderId:     2,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+	})
+	if err != nil {
+		t.Fatalf("AppendEntries RPC failed: %v", err)
+	}
+	if aeReply.Term != 5 {
+		t.Fatalf("expected reply term 5, got %d", aeReply.Term)
+	}
+	if !et.LastReset().After(initialReset) {
+		t.Fatalf("expected timer LastReset to be updated after valid AppendEntries RPC")
+	}
+
+	// 2. Send stale AppendEntries RPC via gRPC (term 2 < 5)
+	lastResetAfterValid := et.LastReset()
+	time.Sleep(10 * time.Millisecond)
+
+	staleReply, err := client.AppendEntries(context.Background(), &raftpb.AppendEntriesArgs{
+		Term:         2,
+		LeaderId:     2,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+	})
+	if err != nil {
+		t.Fatalf("stale AppendEntries RPC failed: %v", err)
+	}
+	if staleReply.Success {
+		t.Fatalf("expected stale AppendEntries to return Success=false")
+	}
+	if staleReply.Term != 5 {
+		t.Fatalf("expected stale reply to return current term 5, got %d", staleReply.Term)
+	}
+	if et.LastReset() != lastResetAfterValid {
+		t.Fatalf("timer must NOT be reset after stale AppendEntries RPC")
+	}
+}
+
+
 
 
 
