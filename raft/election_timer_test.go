@@ -103,6 +103,85 @@ func TestElectionTimer_Reset(t *testing.T) {
 	}
 }
 
+// TestElectionTimer_FiresWithinRandomizedBounds tests that the timer fires
+// strictly within the specified randomized interval bounds.
+func TestElectionTimer_FiresWithinRandomizedBounds(t *testing.T) {
+	min := 50 * time.Millisecond
+	max := 100 * time.Millisecond
+	tolerance := 25 * time.Millisecond // Account for OS scheduling jitter
+
+	const runs = 5
+	durations := make([]time.Duration, 0, runs)
+
+	for i := 0; i < runs; i++ {
+		et := NewElectionTimer(min, max)
+		targetDuration := et.Duration()
+
+		if targetDuration < min || targetDuration > max {
+			et.Stop()
+			t.Fatalf("run %d: target duration %v outside bounds [%v, %v]", i, targetDuration, min, max)
+		}
+
+		start := time.Now()
+		select {
+		case fireTime := <-et.C():
+			elapsed := time.Since(start)
+			durations = append(durations, elapsed)
+
+			if fireTime.Before(start) {
+				et.Stop()
+				t.Fatalf("run %d: fireTime %v is before start %v", i, fireTime, start)
+			}
+
+			// Ensure timer did not fire before the minimum bound
+			if elapsed < min-tolerance {
+				et.Stop()
+				t.Fatalf("run %d: timer fired earlier than min bound: elapsed=%v, min=%v", i, elapsed, min)
+			}
+
+			// Ensure timer did not fire later than the maximum bound
+			if elapsed > max+tolerance {
+				et.Stop()
+				t.Fatalf("run %d: timer fired later than max bound: elapsed=%v, max=%v", i, elapsed, max)
+			}
+
+			t.Logf("run %d: target=%v, actual elapsed=%v (within bounds [%v, %v])", i, targetDuration, elapsed, min, max)
+
+		case <-time.After(max + 300*time.Millisecond):
+			et.Stop()
+			t.Fatalf("run %d: timer failed to fire within timeout deadline", i)
+		}
+
+		et.Stop()
+	}
+
+	// Verify that the default Raft typical range (150-300ms) also fires within bounds
+	t.Run("DefaultTypicalRange_150_300ms", func(t *testing.T) {
+		et := NewElectionTimer(DefaultMinElectionTimeout, DefaultMaxElectionTimeout)
+		defer et.Stop()
+
+		targetDur := et.Duration()
+		if targetDur < DefaultMinElectionTimeout || targetDur > DefaultMaxElectionTimeout {
+			t.Fatalf("target duration %v outside default range [%v, %v]", targetDur, DefaultMinElectionTimeout, DefaultMaxElectionTimeout)
+		}
+
+		start := time.Now()
+		select {
+		case <-et.C():
+			elapsed := time.Since(start)
+			if elapsed < DefaultMinElectionTimeout-tolerance {
+				t.Fatalf("timer fired earlier than 150ms: %v", elapsed)
+			}
+			if elapsed > DefaultMaxElectionTimeout+tolerance {
+				t.Fatalf("timer fired later than 300ms: %v", elapsed)
+			}
+			t.Logf("default range: target=%v, actual elapsed=%v", targetDur, elapsed)
+		case <-time.After(DefaultMaxElectionTimeout + 500*time.Millisecond):
+			t.Fatal("timer in default 150-300ms range failed to fire")
+		}
+	})
+}
+
 func TestElectionTimer_Fires(t *testing.T) {
 	// Use small duration for fast test
 	min := 20 * time.Millisecond
