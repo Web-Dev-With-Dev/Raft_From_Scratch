@@ -11,11 +11,20 @@ type PersistentState = raft.PersistentState
 type VolatileState = raft.VolatileState
 type VolatileStateLeader = raft.VolatileStateLeader
 type RaftState = raft.RaftState
+type ElectionTimer = raft.ElectionTimer
 
 const (
 	Follower  = raft.Follower
 	Candidate = raft.Candidate
 	Leader    = raft.Leader
+
+	DefaultMinElectionTimeout = raft.DefaultMinElectionTimeout
+	DefaultMaxElectionTimeout = raft.DefaultMaxElectionTimeout
+)
+
+var (
+	RandomElectionTimeout = raft.RandomElectionTimeout
+	NewElectionTimer      = raft.NewElectionTimer
 )
 	
 type RequestVoteArgs = raft.RequestVoteArgs

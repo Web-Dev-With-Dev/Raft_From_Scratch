@@ -24,6 +24,7 @@ type Peer = raft.Peer
 type ClientPool = rpc.ClientPool
 type RPCClientPool = rpc.ClientPool
 type LogOptions = logger.Options
+type ElectionTimer = raft.ElectionTimer
 
 // NewNodeLogger creates a structured logger with [Node <ID>] prefix on every line.
 func NewNodeLogger(id raft.NodeID, w io.Writer, opts *LogOptions) *slog.Logger {
@@ -44,6 +45,12 @@ type Server struct {
 
 	// PersistentState holds the persistent consensus state (currentTerm, votedFor, log entries).
 	PersistentState *raft.PersistentState `json:"persistent_state"`
+
+	// State represents the current consensus role (Follower, Candidate, Leader).
+	State raft.RaftState `json:"state"`
+
+	// ElectionTimer manages the randomized election timeout backed by time.Timer.
+	ElectionTimer *raft.ElectionTimer `json:"-"`
 
 	// RPCClientPool manages gRPC client connections to peers.
 	RPCClientPool *rpc.ClientPool `json:"-"`
@@ -83,6 +90,8 @@ func NewServer(
 		ID:              id,
 		Peers:           peers,
 		PersistentState: persistentState,
+		State:           raft.Follower,
+		ElectionTimer:   raft.NewElectionTimer(raft.DefaultMinElectionTimeout, raft.DefaultMaxElectionTimeout),
 		RPCClientPool:   rpcClientPool,
 		Logger:          nodeLogger,
 	}
@@ -93,6 +102,44 @@ func (s *Server) GetID() raft.NodeID {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.ID
+}
+
+// GetState returns the current consensus state (Follower, Candidate, Leader).
+func (s *Server) GetState() raft.RaftState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.State
+}
+
+// SetState updates the server's consensus state.
+func (s *Server) SetState(state raft.RaftState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old := s.State
+	s.State = state
+	s.GetLogger().Info("transitioned consensus state", "from", old.String(), "to", state.String())
+}
+
+// GetElectionTimer returns the server's election timer.
+func (s *Server) GetElectionTimer() *raft.ElectionTimer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ElectionTimer
+}
+
+// ResetElectionTimeout resets the election timer with a newly selected
+// randomized duration in [150ms, 300ms]. Returns the new timeout duration.
+func (s *Server) ResetElectionTimeout() time.Duration {
+	s.mu.RLock()
+	timer := s.ElectionTimer
+	s.mu.RUnlock()
+
+	if timer == nil {
+		return 0
+	}
+	d := timer.Reset()
+	s.GetLogger().Info("reset election timeout", "timeout_ms", d.Milliseconds())
+	return d
 }
 
 // GetPeers returns a copy of the peer list.
@@ -281,6 +328,10 @@ func (s *Server) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.ElectionTimer != nil {
+		s.ElectionTimer.Stop()
+	}
+
 	if s.grpcServer != nil {
 		s.grpcServer.Stop()
 		s.grpcServer = nil
@@ -296,6 +347,10 @@ func (s *Server) Stop() {
 func (s *Server) GracefulStop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.ElectionTimer != nil {
+		s.ElectionTimer.Stop()
+	}
 
 	if s.grpcServer != nil {
 		s.grpcServer.GracefulStop()

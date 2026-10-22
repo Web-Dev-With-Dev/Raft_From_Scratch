@@ -597,6 +597,40 @@ func TestCluster_FullMeshRPCReachability(t *testing.T) {
 	}
 }
 
+func TestServer_ElectionTimerAndState(t *testing.T) {
+	srv := NewServer(1, nil, nil, nil)
+	defer srv.Close()
+
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected initial state Follower, got %v", srv.GetState())
+	}
+
+	srv.SetState(raft.Candidate)
+	if srv.GetState() != raft.Candidate {
+		t.Fatalf("expected state Candidate, got %v", srv.GetState())
+	}
+
+	srv.SetState(raft.Leader)
+	if srv.GetState() != raft.Leader {
+		t.Fatalf("expected state Leader, got %v", srv.GetState())
+	}
+
+	et := srv.GetElectionTimer()
+	if et == nil {
+		t.Fatal("expected non-nil ElectionTimer on server")
+	}
+
+	dur := et.Duration()
+	if dur < raft.DefaultMinElectionTimeout || dur > raft.DefaultMaxElectionTimeout {
+		t.Fatalf("server election timeout %v outside [%v, %v]", dur, raft.DefaultMinElectionTimeout, raft.DefaultMaxElectionTimeout)
+	}
+
+	newDur := srv.ResetElectionTimeout()
+	if newDur < raft.DefaultMinElectionTimeout || newDur > raft.DefaultMaxElectionTimeout {
+		t.Fatalf("reset election timeout %v outside [%v, %v]", newDur, raft.DefaultMinElectionTimeout, raft.DefaultMaxElectionTimeout)
+	}
+}
+
 
 
 
