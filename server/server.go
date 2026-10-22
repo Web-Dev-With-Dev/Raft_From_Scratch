@@ -748,6 +748,7 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 		Term:    currentTerm,
 		Success: false, // Stub until log replication logic is added
 	}
+	
 }
 
 // becomeFollower transitions the node to the Follower role for the specified term.
@@ -822,7 +823,7 @@ func (s *Server) becomeCandidate() {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
 	}
 
-	s.GetLogger().Info("transitioned to Candidate",
+	s.GetLogger().Info("transitioned to Candidate (started election; RequestVote RPC broadcast stubbed)",
 		"node_id", int(s.ID),
 		"previous_state", oldRole.String(),
 		"term", curTerm,
@@ -873,7 +874,7 @@ func (s *Server) becomeLeader() {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
 	}
 
-	s.GetLogger().Info("transitioned to Leader",
+	s.GetLogger().Info("transitioned to Leader (started leadership; AppendEntries heartbeat broadcast stubbed)",
 		"node_id", int(s.ID),
 		"previous_state", oldRole.String(),
 		"term", curTerm,
@@ -900,7 +901,14 @@ func (s *Server) handleHeartbeatTimeout() {
 	if s.State != raft.Leader {
 		return
 	}
-	s.GetLogger().Info("leader heartbeat timer fired", "node_id", int(s.ID), "term", uint64(s.PersistentState.CurrentTerm))
+	var curTerm uint64
+	if s.PersistentState != nil {
+		curTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+	s.GetLogger().Info("leader heartbeat timer fired (AppendEntries heartbeat broadcast stubbed)",
+		"node_id", int(s.ID),
+		"term", curTerm,
+	)
 	if s.heartbeatTimer != nil {
 		s.heartbeatTimer.Reset(s.heartbeatInterval)
 	}
