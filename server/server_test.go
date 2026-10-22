@@ -818,7 +818,105 @@ func TestServer_AppendEntriesRPC_TriggersTimerReset(t *testing.T) {
 	}
 }
 
+func TestServer_RunLoop_Lifecycle(t *testing.T) {
+	srv := NewServer(1, nil, nil, nil)
+	if srv.IsLoopRunning() {
+		t.Fatalf("expected loop to not be running initially")
+	}
 
+	srv.StartEventLoop()
+	if !srv.IsLoopRunning() {
+		t.Fatalf("expected loop to be running after StartEventLoop")
+	}
+
+	srv.Stop()
+	if srv.IsLoopRunning() {
+		t.Fatalf("expected loop to stop after Stop")
+	}
+}
+
+func TestServer_RunLoop_ElectionTimeoutFires(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 0,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+
+	// Set very short election timeout for fast testing
+	srv.GetElectionTimer().SetRange(25*time.Millisecond, 40*time.Millisecond)
+	srv.GetElectionTimer().Reset()
+
+	srv.StartEventLoop()
+	defer srv.Stop()
+
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected initial Follower state, got %v", srv.GetState())
+	}
+
+	// Wait for election timeout to trigger transition in run() loop
+	time.Sleep(50 * time.Millisecond)
+
+	if srv.GetState() != raft.Candidate {
+		t.Fatalf("expected transition to Candidate after timeout, got %v", srv.GetState())
+	}
+
+	if srv.PersistentState.CurrentTerm < 1 {
+		t.Fatalf("expected CurrentTerm at least 1, got %d", srv.PersistentState.CurrentTerm)
+	}
+
+	if srv.PersistentState.VotedFor != 1 {
+		t.Fatalf("expected VotedFor self (1), got %d", srv.PersistentState.VotedFor)
+	}
+}
+
+func TestServer_RunLoop_RPCChannels(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 2,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+
+	srv.StartEventLoop()
+	defer srv.Stop()
+
+	// 1. Send RequestVote via RequestVoteChannel
+	rvResCh := make(chan *raftpb.RequestVoteReply, 1)
+	srv.RequestVoteChannel() <- RequestVoteEvent{
+		Args: &raftpb.RequestVoteArgs{
+			Term:        2,
+			CandidateId: 2,
+		},
+		ResCh: rvResCh,
+	}
+
+	select {
+	case reply := <-rvResCh:
+		if reply.Term != 2 {
+			t.Fatalf("expected reply term 2, got %d", reply.Term)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for RequestVote reply from event loop")
+	}
+
+	// 2. Send AppendEntries via AppendEntriesChannel
+	aeResCh := make(chan *raftpb.AppendEntriesReply, 1)
+	srv.AppendEntriesChannel() <- AppendEntriesEvent{
+		Args: &raftpb.AppendEntriesArgs{
+			Term:     2,
+			LeaderId: 2,
+		},
+		ResCh: aeResCh,
+	}
+
+	select {
+	case reply := <-aeResCh:
+		if reply.Term != 2 {
+			t.Fatalf("expected reply term 2, got %d", reply.Term)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for AppendEntries reply from event loop")
+	}
+}
 
 
 

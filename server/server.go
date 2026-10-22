@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"raft/logger"
@@ -25,6 +26,18 @@ type ClientPool = rpc.ClientPool
 type RPCClientPool = rpc.ClientPool
 type LogOptions = logger.Options
 type ElectionTimer = raft.ElectionTimer
+
+// RequestVoteEvent packages an incoming RequestVote RPC with a response channel.
+type RequestVoteEvent struct {
+	Args  *raftpb.RequestVoteArgs
+	ResCh chan<- *raftpb.RequestVoteReply
+}
+
+// AppendEntriesEvent packages an incoming AppendEntries RPC with a response channel.
+type AppendEntriesEvent struct {
+	Args  *raftpb.AppendEntriesArgs
+	ResCh chan<- *raftpb.AppendEntriesReply
+}
 
 // NewNodeLogger creates a structured logger with [Node <ID>] prefix on every line.
 func NewNodeLogger(id raft.NodeID, w io.Writer, opts *LogOptions) *slog.Logger {
@@ -60,6 +73,14 @@ type Server struct {
 
 	lastHeartbeat time.Time
 
+	// Concurrency channels for the single event loop goroutine:
+	stopCh          chan struct{}
+	stopOnce        sync.Once
+	requestVoteCh   chan RequestVoteEvent
+	appendEntriesCh chan AppendEntriesEvent
+	loopDone        chan struct{}
+	loopRunning     atomic.Bool
+
 	grpcServer *grpc.Server
 	listener   net.Listener
 }
@@ -88,6 +109,11 @@ func NewServer(
 	}
 	rpcClientPool.SetLogger(nodeLogger)
 
+	stopCh := make(chan struct{})
+	requestVoteCh := make(chan RequestVoteEvent, 64)
+	appendEntriesCh := make(chan AppendEntriesEvent, 64)
+	loopDone := make(chan struct{})
+
 	return &Server{
 		ID:              id,
 		Peers:           peers,
@@ -97,6 +123,10 @@ func NewServer(
 		RPCClientPool:   rpcClientPool,
 		Logger:          nodeLogger,
 		lastHeartbeat:   time.Now(),
+		stopCh:          stopCh,
+		requestVoteCh:   requestVoteCh,
+		appendEntriesCh: appendEntriesCh,
+		loopDone:        loopDone,
 	}
 }
 
@@ -370,6 +400,9 @@ func (s *Server) Serve(lis net.Listener, opts ...grpc.ServerOption) error {
 
 	s.GetLogger().Info("gRPC server listening", "address", addrStr)
 
+	// Launch the single event-loop goroutine
+	s.StartEventLoop()
+
 	go func() {
 		if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {
 			s.GetLogger().Error("gRPC server error during serve", "error", err)
@@ -383,6 +416,17 @@ func (s *Server) Serve(lis net.Listener, opts ...grpc.ServerOption) error {
 func (s *Server) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
+
+	if s.loopRunning.Load() {
+		select {
+		case <-s.loopDone:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
@@ -403,6 +447,17 @@ func (s *Server) Stop() {
 func (s *Server) GracefulStop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
+
+	if s.loopRunning.Load() {
+		select {
+		case <-s.loopDone:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
@@ -444,11 +499,65 @@ func (s *Server) GRPCServer() *grpc.Server {
 }
 
 // RequestVote handles incoming RequestVote RPCs.
+// When the event loop is active, the request is dispatched over requestVoteCh.
 // When a vote is granted to a candidate, it resets the server's election timer (§5.2).
 func (s *Server) RequestVote(ctx context.Context, req *raftpb.RequestVoteArgs) (*raftpb.RequestVoteReply, error) {
+	if s.loopRunning.Load() {
+		resCh := make(chan *raftpb.RequestVoteReply, 1)
+		select {
+		case s.requestVoteCh <- RequestVoteEvent{Args: req, ResCh: resCh}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.stopCh:
+			return nil, fmt.Errorf("server %d stopped", s.ID)
+		}
+
+		select {
+		case reply := <-resCh:
+			return reply, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.stopCh:
+			return nil, fmt.Errorf("server %d stopped", s.ID)
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.processRequestVote(req), nil
+}
 
+// AppendEntries handles incoming AppendEntries RPCs (heartbeats and log replication).
+// When the event loop is active, the request is dispatched over appendEntriesCh.
+// A valid heartbeat (req.Term >= currentTerm) resets the node's election timer (§5.2).
+func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArgs) (*raftpb.AppendEntriesReply, error) {
+	if s.loopRunning.Load() {
+		resCh := make(chan *raftpb.AppendEntriesReply, 1)
+		select {
+		case s.appendEntriesCh <- AppendEntriesEvent{Args: req, ResCh: resCh}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.stopCh:
+			return nil, fmt.Errorf("server %d stopped", s.ID)
+		}
+
+		select {
+		case reply := <-resCh:
+			return reply, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.stopCh:
+			return nil, fmt.Errorf("server %d stopped", s.ID)
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.processAppendEntries(req), nil
+}
+
+// processRequestVote evaluates an incoming RequestVote RPC.
+func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.RequestVoteReply {
 	s.GetLogger().Info("received RequestVote",
 		"candidate_id", req.CandidateId,
 		"term", req.Term,
@@ -471,7 +580,7 @@ func (s *Server) RequestVote(ctx context.Context, req *raftpb.RequestVoteArgs) (
 		return &raftpb.RequestVoteReply{
 			Term:        currentTerm,
 			VoteGranted: false,
-		}, nil
+		}
 	}
 
 	voteGranted := false
@@ -491,15 +600,11 @@ func (s *Server) RequestVote(ctx context.Context, req *raftpb.RequestVoteArgs) (
 	return &raftpb.RequestVoteReply{
 		Term:        currentTerm,
 		VoteGranted: voteGranted,
-	}, nil
+	}
 }
 
-// AppendEntries handles incoming AppendEntries RPCs (heartbeats and log replication).
-// A valid heartbeat (req.Term >= currentTerm) resets the node's election timer (§5.2).
-func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArgs) (*raftpb.AppendEntriesReply, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+// processAppendEntries evaluates an incoming AppendEntries RPC.
+func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.AppendEntriesReply {
 	s.GetLogger().Info("received AppendEntries",
 		"leader_id", req.LeaderId,
 		"term", req.Term,
@@ -524,7 +629,7 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArg
 		return &raftpb.AppendEntriesReply{
 			Term:    currentTerm,
 			Success: false,
-		}, nil
+		}
 	}
 
 	// 2. Valid heartbeat/RPC from current or new leader:
@@ -551,7 +656,123 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArg
 	return &raftpb.AppendEntriesReply{
 		Term:    currentTerm,
 		Success: false, // Stub until log replication logic is added
-	}, nil
+	}
+}
+
+// handleElectionTimeout is called when the election timer fires.
+// In Raft (§5.2):
+// The node transitions to Candidate, increments currentTerm, votes for itself,
+// and resets the election timer to start a new election cycle.
+func (s *Server) handleElectionTimeout(t time.Time) {
+	s.GetLogger().Info("election timeout fired", "node_id", int(s.ID), "state", s.State.String(), "time", t)
+
+	if s.State == raft.Leader {
+		return
+	}
+
+	// Transition to Candidate (§5.2)
+	s.State = raft.Candidate
+
+	// Increment currentTerm and vote for self (§5.2)
+	if s.PersistentState != nil {
+		s.PersistentState.CurrentTerm++
+		s.PersistentState.VotedFor = s.ID
+	}
+
+	// Reset election timer for this election cycle
+	if s.ElectionTimer != nil {
+		newTimeout := s.ElectionTimer.Reset()
+		s.GetLogger().Info("started election, incremented term and reset timer",
+			"node_id", int(s.ID),
+			"new_term", uint64(s.PersistentState.CurrentTerm),
+			"new_timeout_ms", newTimeout.Milliseconds(),
+		)
+	}
+}
+
+// run is the central event loop of the Raft node.
+// It uses a select statement to multiplex between:
+// 1. Timer channel (election timeout)
+// 2. Incoming RPC channels (requestVoteCh and appendEntriesCh)
+// 3. Stop channel (stopCh)
+func (s *Server) run() {
+	s.loopRunning.Store(true)
+	s.GetLogger().Info("started main Raft event loop", "node_id", int(s.ID))
+
+	defer func() {
+		s.loopRunning.Store(false)
+		s.GetLogger().Info("stopped main Raft event loop", "node_id", int(s.ID))
+		close(s.loopDone)
+	}()
+
+	for {
+		var timerCh <-chan time.Time
+		if s.ElectionTimer != nil {
+			timerCh = s.ElectionTimer.C()
+		}
+
+		select {
+		case <-s.stopCh:
+			return
+
+		case t, ok := <-timerCh:
+			if !ok {
+				return
+			}
+			s.mu.Lock()
+			s.handleElectionTimeout(t)
+			s.mu.Unlock()
+
+		case ev := <-s.requestVoteCh:
+			s.mu.Lock()
+			reply := s.processRequestVote(ev.Args)
+			s.mu.Unlock()
+			if ev.ResCh != nil {
+				ev.ResCh <- reply
+			}
+
+		case ev := <-s.appendEntriesCh:
+			s.mu.Lock()
+			reply := s.processAppendEntries(ev.Args)
+			s.mu.Unlock()
+			if ev.ResCh != nil {
+				ev.ResCh <- reply
+			}
+		}
+	}
+}
+
+// Run executes the main run() loop synchronously, blocking until stopCh is closed.
+func (s *Server) Run() {
+	s.run()
+}
+
+// StartEventLoop launches the main run() event-loop in a separate goroutine.
+func (s *Server) StartEventLoop() {
+	if !s.loopRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go s.run()
+}
+
+// IsLoopRunning returns true if the main run() event loop is actively running.
+func (s *Server) IsLoopRunning() bool {
+	return s.loopRunning.Load()
+}
+
+// StopChannel returns the read-only stop channel.
+func (s *Server) StopChannel() <-chan struct{} {
+	return s.stopCh
+}
+
+// RequestVoteChannel returns the channel for incoming RequestVote events.
+func (s *Server) RequestVoteChannel() chan<- RequestVoteEvent {
+	return s.requestVoteCh
+}
+
+// AppendEntriesChannel returns the channel for incoming AppendEntries events.
+func (s *Server) AppendEntriesChannel() chan<- AppendEntriesEvent {
+	return s.appendEntriesCh
 }
 
 // SendRequestVote sends a RequestVote RPC to a peer using the server's RPC client pool.
