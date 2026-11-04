@@ -1212,6 +1212,117 @@ func TestStateTransition_FollowerCandidateLeaderFollower(t *testing.T) {
 	}
 }
 
+func TestLeaderHeartbeatTicker_Lifecycle(t *testing.T) {
+	peers := []Peer{
+		{ID: 2, Address: "127.0.0.1:8002"},
+		{ID: 3, Address: "127.0.0.1:8003"},
+	}
+	srv := NewServer(1, peers, nil, nil)
+
+	// 1. Follower state: ticker must not be active
+	if ticker := srv.GetHeartbeatTicker(); ticker != nil {
+		t.Fatalf("follower must not have an active heartbeat ticker")
+	}
+	if interval := srv.HeartbeatInterval(); interval != raft.DefaultHeartbeatInterval {
+		t.Fatalf("expected default heartbeat interval %v, got %v", raft.DefaultHeartbeatInterval, interval)
+	}
+
+	// 2. Candidate state: ticker must not be active
+	srv.becomeCandidate()
+	if ticker := srv.GetHeartbeatTicker(); ticker != nil {
+		t.Fatalf("candidate must not have an active heartbeat ticker")
+	}
+
+	// 3. Leader state: ticker must be created and armed
+	srv.becomeLeader()
+	if ticker := srv.GetHeartbeatTicker(); ticker == nil {
+		t.Fatalf("leader must have an active heartbeat ticker")
+	}
+
+	// 4. Stepping down to Follower: ticker must be stopped and cleared
+	srv.becomeFollower(10)
+	if ticker := srv.GetHeartbeatTicker(); ticker != nil {
+		t.Fatalf("follower after step-down must not have an active heartbeat ticker")
+	}
+
+	// 5. Becoming Leader again and then Candidate: ticker must be stopped and cleared
+	srv.becomeLeader()
+	if ticker := srv.GetHeartbeatTicker(); ticker == nil {
+		t.Fatalf("leader must have an active heartbeat ticker")
+	}
+	srv.becomeCandidate()
+	if ticker := srv.GetHeartbeatTicker(); ticker != nil {
+		t.Fatalf("candidate after election timeout must not have an active heartbeat ticker")
+	}
+}
+
+func TestLeaderHeartbeatTicker_PeriodicFiringInEventLoop(t *testing.T) {
+	peers := []Peer{
+		{ID: 2, Address: "127.0.0.1:8002"},
+	}
+	srv := NewServer(1, peers, &raft.PersistentState{
+		CurrentTerm: 1,
+		VotedFor:    1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+
+	// Use a short interval for responsive test execution
+	shortInterval := 20 * time.Millisecond
+	srv.SetHeartbeatInterval(shortInterval)
+
+	srv.StartEventLoop()
+	defer srv.Stop()
+
+	// Initial Follower state: should not fire leader heartbeats
+	time.Sleep(45 * time.Millisecond)
+	if count := srv.HeartbeatsSent(); count != 0 {
+		t.Fatalf("follower must not dispatch leader heartbeats, got count=%d", count)
+	}
+
+	// Transition to Leader on the event loop
+	srv.SetState(raft.Leader)
+	srv.becomeLeader()
+
+	// Wait enough time for at least 3 ticker firings (20ms interval, waiting ~70ms)
+	time.Sleep(75 * time.Millisecond)
+	sentCount := srv.HeartbeatsSent()
+	if sentCount < 2 {
+		t.Fatalf("expected at least 2 heartbeat ticks while leader, got %d", sentCount)
+	}
+
+	// Step down to Follower
+	srv.becomeFollower(2)
+	stoppedCount := srv.HeartbeatsSent()
+
+	// Wait another 50ms and verify no more heartbeats fire
+	time.Sleep(50 * time.Millisecond)
+	finalCount := srv.HeartbeatsSent()
+	if finalCount != stoppedCount {
+		t.Fatalf("heartbeats fired after stepping down: expected %d, got %d", stoppedCount, finalCount)
+	}
+}
+
+func TestLeaderHeartbeatTicker_CustomInterval(t *testing.T) {
+	srv := NewServer(1, nil, nil, nil)
+
+	customInterval := 30 * time.Millisecond
+	srv.SetHeartbeatInterval(customInterval)
+	if srv.HeartbeatInterval() != customInterval {
+		t.Fatalf("expected heartbeat interval %v, got %v", customInterval, srv.HeartbeatInterval())
+	}
+
+	srv.becomeLeader()
+	if srv.GetHeartbeatTicker() == nil {
+		t.Fatalf("expected leader heartbeat ticker to be active")
+	}
+
+	// Reset with zero/negative should fall back to default
+	srv.SetHeartbeatInterval(0)
+	if srv.HeartbeatInterval() != raft.DefaultHeartbeatInterval {
+		t.Fatalf("expected fallback to default interval %v, got %v", raft.DefaultHeartbeatInterval, srv.HeartbeatInterval())
+	}
+}
+
 
 
 

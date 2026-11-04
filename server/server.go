@@ -27,6 +27,12 @@ type RPCClientPool = rpc.ClientPool
 type LogOptions = logger.Options
 type ElectionTimer = raft.ElectionTimer
 
+const (
+	DefaultMinElectionTimeout = raft.DefaultMinElectionTimeout
+	DefaultMaxElectionTimeout = raft.DefaultMaxElectionTimeout
+	DefaultHeartbeatInterval  = raft.DefaultHeartbeatInterval
+)
+
 // RequestVoteEvent packages an incoming RequestVote RPC with a response channel.
 type RequestVoteEvent struct {
 	Args  *raftpb.RequestVoteArgs
@@ -74,9 +80,11 @@ type Server struct {
 	// ElectionTimer manages the randomized election timeout backed by time.Timer.
 	ElectionTimer *raft.ElectionTimer `json:"-"`
 
-	// Leader heartbeat timer
+	// Leader-only heartbeat ticker (fires every heartbeatInterval, e.g. 50ms)
+	heartbeatTicker   *time.Ticker
 	heartbeatTimer    *time.Timer
 	heartbeatInterval time.Duration
+	heartbeatsSent    atomic.Uint64
 
 	// Candidate vote tracking
 	votesReceived map[raft.NodeID]bool
@@ -202,6 +210,44 @@ func (s *Server) GetElectionTimer() *raft.ElectionTimer {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.ElectionTimer
+}
+
+// GetHeartbeatTicker returns the leader's heartbeat ticker, or nil if not running.
+func (s *Server) GetHeartbeatTicker() *time.Ticker {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.heartbeatTicker
+}
+
+// HeartbeatInterval returns the configured interval between leader heartbeats (default 50ms).
+func (s *Server) HeartbeatInterval() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.heartbeatInterval <= 0 {
+		return raft.DefaultHeartbeatInterval
+	}
+	return s.heartbeatInterval
+}
+
+// SetHeartbeatInterval configures the heartbeat ticker interval.
+func (s *Server) SetHeartbeatInterval(interval time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if interval <= 0 {
+		interval = raft.DefaultHeartbeatInterval
+	}
+	s.heartbeatInterval = interval
+	if s.State == raft.Leader && s.heartbeatTicker != nil {
+		s.heartbeatTicker.Reset(interval)
+	}
+	if s.State == raft.Leader && s.heartbeatTimer != nil {
+		s.heartbeatTimer.Reset(interval)
+	}
+}
+
+// HeartbeatsSent returns the total number of leader heartbeat ticks dispatched.
+func (s *Server) HeartbeatsSent() uint64 {
+	return s.heartbeatsSent.Load()
 }
 
 // ResetElectionTimeout resets the election timer with a newly selected
@@ -520,8 +566,13 @@ func (s *Server) Stop() {
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
 	}
+	if s.heartbeatTicker != nil {
+		s.heartbeatTicker.Stop()
+		s.heartbeatTicker = nil
+	}
 	if s.heartbeatTimer != nil {
 		s.heartbeatTimer.Stop()
+		s.heartbeatTimer = nil
 	}
 
 	if s.grpcServer != nil {
@@ -554,8 +605,13 @@ func (s *Server) GracefulStop() {
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
 	}
+	if s.heartbeatTicker != nil {
+		s.heartbeatTicker.Stop()
+		s.heartbeatTicker = nil
+	}
 	if s.heartbeatTimer != nil {
 		s.heartbeatTimer.Stop()
+		s.heartbeatTimer = nil
 	}
 
 	if s.grpcServer != nil {
@@ -730,7 +786,7 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 	// 2. Valid heartbeat/RPC from current or new leader:
 	// If candidate receives AppendEntries from leader, revert to follower (§5.2)
 	if s.State == raft.Candidate {
-		s.becomeFollower(raft.Term(req.Term))
+		s.becomeFollowerLocked(raft.Term(req.Term))
 	} else {
 		// 3. Reset election timer triggered by valid heartbeat/RPC received (§5.2)
 		s.lastHeartbeat = time.Now()
@@ -752,13 +808,41 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 }
 
 // becomeFollower transitions the node to the Follower role for the specified term.
+// When the event loop is running, the mutation is executed on the single event loop.
+func (s *Server) becomeFollower(term raft.Term) {
+	if s.loopRunning.Load() {
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				s.becomeFollowerLocked(term)
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return
+		}
+		select {
+		case <-resCh:
+		case <-s.stopCh:
+		}
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.becomeFollowerLocked(term)
+}
+
+// becomeFollowerLocked executes the follower state transition.
+// Must be called with s.mu held (or inside the event loop).
 // In Raft (§5.1 & §5.2):
 // - Updates state to Follower
 // - If term > currentTerm, updates currentTerm and resets votedFor to -1
-// - Stops heartbeat timer if running (was Leader)
+// - Stops leader heartbeat ticker if running (was Leader)
 // - Resets the election timer with a new randomized timeout
 // - Clears votesReceived candidate tracking
-func (s *Server) becomeFollower(term raft.Term) {
+func (s *Server) becomeFollowerLocked(term raft.Term) {
 	oldRole := s.State
 	s.State = raft.Follower
 
@@ -767,8 +851,13 @@ func (s *Server) becomeFollower(term raft.Term) {
 		s.PersistentState.VotedFor = -1
 	}
 
+	if s.heartbeatTicker != nil {
+		s.heartbeatTicker.Stop()
+		s.heartbeatTicker = nil
+	}
 	if s.heartbeatTimer != nil {
 		s.heartbeatTimer.Stop()
+		s.heartbeatTimer = nil
 	}
 
 	s.lastHeartbeat = time.Now()
@@ -791,14 +880,42 @@ func (s *Server) becomeFollower(term raft.Term) {
 }
 
 // becomeCandidate transitions the node to the Candidate role to initiate a new election.
+// When the event loop is running, the mutation is executed on the single event loop.
+func (s *Server) becomeCandidate() {
+	if s.loopRunning.Load() {
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				s.becomeCandidateLocked()
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return
+		}
+		select {
+		case <-resCh:
+		case <-s.stopCh:
+		}
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.becomeCandidateLocked()
+}
+
+// becomeCandidateLocked executes the candidate transition.
+// Must be called with s.mu held (or inside the event loop).
 // In Raft (§5.2):
 // - Updates state to Candidate
 // - Increments currentTerm
 // - Votes for self (votedFor = s.ID)
-// - Stops heartbeat timer if running
+// - Stops leader heartbeat ticker if running
 // - Resets the election timer with a new randomized timeout
 // - Initializes vote tracking with self-vote
-func (s *Server) becomeCandidate() {
+func (s *Server) becomeCandidateLocked() {
 	oldRole := s.State
 	s.State = raft.Candidate
 
@@ -807,8 +924,13 @@ func (s *Server) becomeCandidate() {
 		s.PersistentState.VotedFor = s.ID
 	}
 
+	if s.heartbeatTicker != nil {
+		s.heartbeatTicker.Stop()
+		s.heartbeatTicker = nil
+	}
 	if s.heartbeatTimer != nil {
 		s.heartbeatTimer.Stop()
+		s.heartbeatTimer = nil
 	}
 
 	if s.ElectionTimer != nil {
@@ -833,12 +955,40 @@ func (s *Server) becomeCandidate() {
 }
 
 // becomeLeader transitions the node from Candidate to Leader upon achieving majority votes.
+// When the event loop is running, the mutation is executed on the single event loop.
+func (s *Server) becomeLeader() {
+	if s.loopRunning.Load() {
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				s.becomeLeaderLocked()
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return
+		}
+		select {
+		case <-resCh:
+		case <-s.stopCh:
+		}
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.becomeLeaderLocked()
+}
+
+// becomeLeaderLocked executes the leader transition.
+// Must be called with s.mu held (or inside the event loop).
 // In Raft (§5.2 & §5.3):
 // - Updates state to Leader
 // - Stops election timer (leaders do not time out on elections)
 // - Initializes VolatileStateLeader (nextIndex and matchIndex for all peers)
-// - Initializes and arms the heartbeat timer (50ms interval)
-func (s *Server) becomeLeader() {
+// - Initializes and arms the leader-only heartbeat ticker (50ms interval)
+func (s *Server) becomeLeaderLocked() {
 	oldRole := s.State
 	s.State = raft.Leader
 
@@ -863,22 +1013,29 @@ func (s *Server) becomeLeader() {
 	if s.heartbeatInterval <= 0 {
 		s.heartbeatInterval = raft.DefaultHeartbeatInterval
 	}
-	if s.heartbeatTimer == nil {
-		s.heartbeatTimer = time.NewTimer(s.heartbeatInterval)
-	} else {
-		s.heartbeatTimer.Reset(s.heartbeatInterval)
+
+	// Arm leader-only heartbeat ticker (every 50ms)
+	if s.heartbeatTicker != nil {
+		s.heartbeatTicker.Stop()
 	}
+	s.heartbeatTicker = time.NewTicker(s.heartbeatInterval)
+
+	if s.heartbeatTimer != nil {
+		s.heartbeatTimer.Stop()
+	}
+	s.heartbeatTimer = time.NewTimer(s.heartbeatInterval)
 
 	var curTerm uint64
 	if s.PersistentState != nil {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
 	}
 
-	s.GetLogger().Info("transitioned to Leader (started leadership; AppendEntries heartbeat broadcast stubbed)",
+	s.GetLogger().Info("transitioned to Leader (started leadership; heartbeat ticker armed; will call AppendEntries)",
 		"node_id", int(s.ID),
 		"previous_state", oldRole.String(),
 		"term", curTerm,
 		"peers_count", len(s.Peers),
+		"heartbeat_interval_ms", s.heartbeatInterval.Milliseconds(),
 	)
 }
 
@@ -893,25 +1050,59 @@ func (s *Server) handleElectionTimeout(t time.Time) {
 		return
 	}
 
-	s.becomeCandidate()
+	s.becomeCandidateLocked()
 }
 
-// handleHeartbeatTimeout is called when the leader's heartbeat timer fires.
-func (s *Server) handleHeartbeatTimeout() {
+// handleHeartbeatTick is called on each tick of the leader-only heartbeat ticker (every 50ms).
+// In Raft (§5.2), leaders periodically send heartbeats (AppendEntries with no log entries)
+// to all peers to maintain authority and prevent election timeouts.
+func (s *Server) handleHeartbeatTick() {
 	if s.State != raft.Leader {
 		return
 	}
+	s.heartbeatsSent.Add(1)
+
 	var curTerm uint64
 	if s.PersistentState != nil {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
 	}
-	s.GetLogger().Info("leader heartbeat timer fired (AppendEntries heartbeat broadcast stubbed)",
+	s.GetLogger().Info("leader heartbeat ticker fired (will call AppendEntries)",
 		"node_id", int(s.ID),
 		"term", curTerm,
+		"peers_count", len(s.Peers),
+		"heartbeat_interval_ms", s.heartbeatInterval.Milliseconds(),
+		"heartbeats_sent", s.heartbeatsSent.Load(),
 	)
+
 	if s.heartbeatTimer != nil {
 		s.heartbeatTimer.Reset(s.heartbeatInterval)
 	}
+
+	// Stub: will dispatch AppendEntries RPC to all cluster peers
+	s.broadcastHeartbeats()
+}
+
+// broadcastHeartbeats sends AppendEntries heartbeats to all cluster peers.
+// Currently stubbed with structured logging until log replication and peer RPC dispatch are wired.
+func (s *Server) broadcastHeartbeats() {
+	if s.State != raft.Leader {
+		return
+	}
+	for _, peer := range s.Peers {
+		if peer.ID == s.ID {
+			continue
+		}
+		s.GetLogger().Debug("leader scheduled heartbeat AppendEntries to peer",
+			"leader_id", int(s.ID),
+			"peer_id", int(peer.ID),
+			"peer_addr", peer.Address,
+		)
+	}
+}
+
+// handleHeartbeatTimeout is an alias for handleHeartbeatTick for backward compatibility.
+func (s *Server) handleHeartbeatTimeout() {
+	s.handleHeartbeatTick()
 }
 
 // run is the central event loop of the Raft node.
@@ -938,8 +1129,12 @@ func (s *Server) run() {
 		}
 
 		var heartbeatCh <-chan time.Time
-		if s.State == raft.Leader && s.heartbeatTimer != nil {
-			heartbeatCh = s.heartbeatTimer.C
+		if s.State == raft.Leader {
+			if s.heartbeatTicker != nil {
+				heartbeatCh = s.heartbeatTicker.C
+			} else if s.heartbeatTimer != nil {
+				heartbeatCh = s.heartbeatTimer.C
+			}
 		}
 
 		select {
@@ -956,7 +1151,7 @@ func (s *Server) run() {
 
 		case <-heartbeatCh:
 			s.mu.Lock()
-			s.handleHeartbeatTimeout()
+			s.handleHeartbeatTick()
 			s.mu.Unlock()
 
 		case ev := <-s.requestVoteCh:
