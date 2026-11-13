@@ -15,6 +15,7 @@ import (
 	raftpb "raft/proto"
 	"raft/raft"
 	"raft/rpc"
+	"raft/store"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
@@ -26,6 +27,8 @@ type ClientPool = rpc.ClientPool
 type RPCClientPool = rpc.ClientPool
 type LogOptions = logger.Options
 type ElectionTimer = raft.ElectionTimer
+type Storage = store.Storage
+type MemoryStorage = store.MemoryStorage
 
 const (
 	DefaultMinElectionTimeout = raft.DefaultMinElectionTimeout
@@ -69,6 +72,10 @@ type Server struct {
 
 	// PersistentState holds the persistent consensus state (currentTerm, votedFor, log entries).
 	PersistentState *raft.PersistentState `json:"persistent_state"`
+
+	// Storage provides persistence for Raft state (currentTerm, votedFor, log).
+	// Currently initialized with an in-memory Storage implementation, to be replaced in Month 4.
+	Storage store.Storage `json:"-"`
 
 	// State represents the current consensus role (Follower, Candidate, Leader).
 	State raft.RaftState `json:"state"`
@@ -140,10 +147,16 @@ func NewServer(
 	stateActionCh := make(chan stateAction, 64)
 	loopDone := make(chan struct{})
 
+	memStorage := store.NewMemoryStorage()
+	if persistentState != nil {
+		_ = memStorage.Persist(persistentState)
+	}
+
 	return &Server{
 		ID:                id,
 		Peers:             peers,
 		PersistentState:   persistentState,
+		Storage:           memStorage,
 		State:             raft.Follower,
 		VolatileState:     &raft.VolatileState{CommitIndex: 0, LastApplied: 0},
 		ElectionTimer:     raft.NewElectionTimer(raft.DefaultMinElectionTimeout, raft.DefaultMaxElectionTimeout),
@@ -172,6 +185,118 @@ func (s *Server) GetState() raft.RaftState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.State
+}
+
+// GetStorage returns the current storage engine.
+func (s *Server) GetStorage() store.Storage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Storage
+}
+
+// SetStorage configures a custom storage engine for the server.
+func (s *Server) SetStorage(storage store.Storage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Storage = storage
+}
+
+// Persist writes the current PersistentState to the storage engine.
+// In Raft (§5.2, §5.6), persistent state (currentTerm, votedFor, log) must be persisted
+// before responding to RPCs or changing roles.
+// When the event loop is active, persistence is serialized onto the single event loop.
+func (s *Server) Persist() error {
+	if s.loopRunning.Load() {
+		var err error
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				err = s.persistLocked()
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return fmt.Errorf("server %d stopped", s.ID)
+		}
+		select {
+		case <-resCh:
+			return err
+		case <-s.stopCh:
+			return fmt.Errorf("server %d stopped", s.ID)
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.persistLocked()
+}
+
+// persistLocked persists the current persistent state while holding s.mu (or inside event loop).
+func (s *Server) persistLocked() error {
+	if s.Storage == nil || s.PersistentState == nil {
+		return nil
+	}
+	if err := s.Storage.Persist(s.PersistentState); err != nil {
+		s.GetLogger().Error("failed to persist Raft state", "error", err)
+		return err
+	}
+	s.GetLogger().Debug("persisted Raft state",
+		"term", uint64(s.PersistentState.CurrentTerm),
+		"voted_for", int(s.PersistentState.VotedFor),
+		"log_len", len(s.PersistentState.Log),
+	)
+	return nil
+}
+
+// Load restores the PersistentState from the storage engine.
+// When the event loop is active, loading is serialized onto the single event loop.
+func (s *Server) Load() error {
+	if s.loopRunning.Load() {
+		var err error
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				err = s.loadLocked()
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return fmt.Errorf("server %d stopped", s.ID)
+		}
+		select {
+		case <-resCh:
+			return err
+		case <-s.stopCh:
+			return fmt.Errorf("server %d stopped", s.ID)
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadLocked()
+}
+
+// loadLocked restores persistent state while holding s.mu (or inside event loop).
+func (s *Server) loadLocked() error {
+	if s.Storage == nil {
+		return nil
+	}
+	state, err := s.Storage.Load()
+	if err != nil {
+		s.GetLogger().Error("failed to load Raft state from storage", "error", err)
+		return err
+	}
+	if state != nil {
+		s.PersistentState = state
+		s.GetLogger().Info("loaded Raft state from storage",
+			"term", uint64(state.CurrentTerm),
+			"voted_for", int(state.VotedFor),
+			"log_len", len(state.Log),
+		)
+	}
+	return nil
 }
 
 // SetState updates the server's consensus state.
@@ -865,6 +990,7 @@ func (s *Server) becomeFollowerLocked(term raft.Term) {
 	if s.PersistentState != nil && term > s.PersistentState.CurrentTerm {
 		s.PersistentState.CurrentTerm = term
 		s.PersistentState.VotedFor = -1
+		_ = s.persistLocked()
 	}
 
 	s.stopHeartbeatTickerLocked()
@@ -931,6 +1057,7 @@ func (s *Server) becomeCandidateLocked() {
 	if s.PersistentState != nil {
 		s.PersistentState.CurrentTerm++
 		s.PersistentState.VotedFor = s.ID
+		_ = s.persistLocked()
 	}
 
 	s.stopHeartbeatTickerLocked()

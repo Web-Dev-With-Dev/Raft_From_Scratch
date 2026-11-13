@@ -12,6 +12,7 @@ import (
 	raftpb "raft/proto"
 	"raft/raft"
 	"raft/rpc"
+	"raft/store"
 
 	"google.golang.org/grpc"
 )
@@ -1472,6 +1473,169 @@ func TestLeaderHeartbeatTicker_StopsCleanlyOnHigherTermRPC(t *testing.T) {
 		t.Fatalf("expected heartbeat ticker to be nil after higher term AppendEntries step down")
 	}
 }
+
+func TestServer_Persistence_PersistAndLoad(t *testing.T) {
+	initialState := &raft.PersistentState{
+		CurrentTerm: 3,
+		VotedFor:    2,
+		Log: []raft.LogEntry{
+			{Index: 1, Term: 1, Command: []byte("set a=1")},
+			{Index: 2, Term: 2, Command: []byte("set b=2")},
+		},
+	}
+
+	srv := NewServer(1, nil, initialState, nil)
+	defer srv.Close()
+
+	st := srv.GetStorage()
+	if st == nil {
+		t.Fatal("expected non-nil storage by default")
+	}
+
+	// Verify initialState was persisted during NewServer
+	loaded, err := st.Load()
+	if err != nil {
+		t.Fatalf("storage.Load failed: %v", err)
+	}
+	if loaded.CurrentTerm != 3 || loaded.VotedFor != 2 || len(loaded.Log) != 2 {
+		t.Fatalf("unexpected persisted initial state: %+v", loaded)
+	}
+
+	// Update PersistentState and call Persist()
+	srv.PersistentState.CurrentTerm = 4
+	srv.PersistentState.VotedFor = 1
+	srv.PersistentState.Log = append(srv.PersistentState.Log, raft.LogEntry{
+		Index: 3, Term: 4, Command: []byte("set c=3"),
+	})
+
+	if err := srv.Persist(); err != nil {
+		t.Fatalf("srv.Persist failed: %v", err)
+	}
+
+	// Overwrite server's in-memory state with blank struct
+	srv.PersistentState = &raft.PersistentState{
+		CurrentTerm: 0,
+		VotedFor:    -1,
+		Log:         nil,
+	}
+
+	// Call Load() and verify restored state
+	if err := srv.Load(); err != nil {
+		t.Fatalf("srv.Load failed: %v", err)
+	}
+
+	if srv.PersistentState.CurrentTerm != 4 {
+		t.Errorf("expected CurrentTerm 4, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != 1 {
+		t.Errorf("expected VotedFor 1, got %d", srv.PersistentState.VotedFor)
+	}
+	if len(srv.PersistentState.Log) != 3 {
+		t.Fatalf("expected Log length 3, got %d", len(srv.PersistentState.Log))
+	}
+	if srv.PersistentState.Log[2].Index != 3 || srv.PersistentState.Log[2].Term != 4 {
+		t.Errorf("unexpected Log[2]: %+v", srv.PersistentState.Log[2])
+	}
+}
+
+func TestServer_Persistence_StateTransitionsAutoPersist(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 1,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+	defer srv.Close()
+
+	// 1. Transition to Candidate increments term and votes for self; must auto-persist
+	srv.becomeCandidate()
+
+	st := srv.GetStorage()
+	loaded, err := st.Load()
+	if err != nil {
+		t.Fatalf("st.Load failed: %v", err)
+	}
+	if loaded.CurrentTerm != 2 {
+		t.Fatalf("expected persisted CurrentTerm 2 after becomeCandidate, got %d", loaded.CurrentTerm)
+	}
+	if loaded.VotedFor != 1 {
+		t.Fatalf("expected persisted VotedFor 1 after becomeCandidate, got %d", loaded.VotedFor)
+	}
+
+	// 2. Transition to Follower on higher term must auto-persist
+	srv.becomeFollower(10)
+
+	loaded2, err := st.Load()
+	if err != nil {
+		t.Fatalf("st.Load failed: %v", err)
+	}
+	if loaded2.CurrentTerm != 10 {
+		t.Fatalf("expected persisted CurrentTerm 10 after becomeFollower(10), got %d", loaded2.CurrentTerm)
+	}
+	if loaded2.VotedFor != -1 {
+		t.Fatalf("expected persisted VotedFor -1 after higher term follower transition, got %d", loaded2.VotedFor)
+	}
+}
+
+func TestServer_SetStorage(t *testing.T) {
+	srv := NewServer(1, nil, nil, nil)
+	defer srv.Close()
+
+	customStore := store.NewMemoryStorage()
+	srv.SetStorage(customStore)
+
+	if srv.GetStorage() != customStore {
+		t.Fatal("expected GetStorage() to return custom storage")
+	}
+
+	srv.PersistentState.CurrentTerm = 9
+	if err := srv.Persist(); err != nil {
+		t.Fatalf("Persist with custom store failed: %v", err)
+	}
+
+	loaded, err := customStore.Load()
+	if err != nil {
+		t.Fatalf("customStore.Load failed: %v", err)
+	}
+	if loaded.CurrentTerm != 9 {
+		t.Fatalf("expected loaded CurrentTerm 9 from custom store, got %d", loaded.CurrentTerm)
+	}
+}
+
+func TestServer_Persistence_EventLoopSerialization(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 1,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+	defer srv.Close()
+
+	srv.StartEventLoop()
+
+	// Update term and persist through active event loop
+	srv.PersistentState.CurrentTerm = 7
+	srv.PersistentState.VotedFor = 1
+	if err := srv.Persist(); err != nil {
+		t.Fatalf("Persist through active event loop failed: %v", err)
+	}
+
+	loaded, err := srv.GetStorage().Load()
+	if err != nil {
+		t.Fatalf("GetStorage().Load failed: %v", err)
+	}
+	if loaded.CurrentTerm != 7 || loaded.VotedFor != 1 {
+		t.Fatalf("unexpected state after event loop Persist: %+v", loaded)
+	}
+
+	// Load through active event loop
+	srv.PersistentState.CurrentTerm = 0
+	if err := srv.Load(); err != nil {
+		t.Fatalf("Load through active event loop failed: %v", err)
+	}
+	if srv.PersistentState.CurrentTerm != 7 {
+		t.Fatalf("expected CurrentTerm 7 after event loop Load, got %d", srv.PersistentState.CurrentTerm)
+	}
+}
+
 
 
 
