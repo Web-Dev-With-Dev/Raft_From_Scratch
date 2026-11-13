@@ -184,6 +184,9 @@ func (s *Server) SetState(state raft.RaftState) {
 			fn: func() {
 				old := s.State
 				s.State = state
+				if old == raft.Leader && state != raft.Leader {
+					s.stopHeartbeatTickerLocked()
+				}
 				s.GetLogger().Info("transitioned consensus state", "from", old.String(), "to", state.String())
 			},
 			resCh: resCh,
@@ -202,6 +205,9 @@ func (s *Server) SetState(state raft.RaftState) {
 	defer s.mu.Unlock()
 	old := s.State
 	s.State = state
+	if old == raft.Leader && state != raft.Leader {
+		s.stopHeartbeatTickerLocked()
+	}
 	s.GetLogger().Info("transitioned consensus state", "from", old.String(), "to", state.String())
 }
 
@@ -547,6 +553,19 @@ func (s *Server) Serve(lis net.Listener, opts ...grpc.ServerOption) error {
 	return nil
 }
 
+// stopHeartbeatTickerLocked stops and cleans up the leader's heartbeat ticker and timer.
+// Must be called with s.mu held (or inside the event loop).
+func (s *Server) stopHeartbeatTickerLocked() {
+	if s.heartbeatTicker != nil {
+		s.heartbeatTicker.Stop()
+		s.heartbeatTicker = nil
+	}
+	if s.heartbeatTimer != nil {
+		s.heartbeatTimer.Stop()
+		s.heartbeatTimer = nil
+	}
+}
+
 // Stop immediately stops the gRPC server and closes the active listener.
 func (s *Server) Stop() {
 	s.mu.Lock()
@@ -566,14 +585,7 @@ func (s *Server) Stop() {
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
 	}
-	if s.heartbeatTicker != nil {
-		s.heartbeatTicker.Stop()
-		s.heartbeatTicker = nil
-	}
-	if s.heartbeatTimer != nil {
-		s.heartbeatTimer.Stop()
-		s.heartbeatTimer = nil
-	}
+	s.stopHeartbeatTickerLocked()
 
 	if s.grpcServer != nil {
 		s.grpcServer.Stop()
@@ -605,14 +617,7 @@ func (s *Server) GracefulStop() {
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
 	}
-	if s.heartbeatTicker != nil {
-		s.heartbeatTicker.Stop()
-		s.heartbeatTicker = nil
-	}
-	if s.heartbeatTimer != nil {
-		s.heartbeatTimer.Stop()
-		s.heartbeatTimer = nil
-	}
+	s.stopHeartbeatTickerLocked()
 
 	if s.grpcServer != nil {
 		s.grpcServer.GracefulStop()
@@ -734,6 +739,12 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 		}
 	}
 
+	// If leader or candidate discovers a higher term, step down to follower (§5.1)
+	if (s.State == raft.Leader || s.State == raft.Candidate) && req.Term > currentTerm {
+		s.becomeFollowerLocked(raft.Term(req.Term))
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
 	voteGranted := false
 
 	// In Raft (§5.2):
@@ -785,7 +796,8 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 
 	// 2. Valid heartbeat/RPC from current or new leader:
 	// If candidate receives AppendEntries from leader, revert to follower (§5.2)
-	if s.State == raft.Candidate {
+	// If leader receives AppendEntries from new leader with >= currentTerm, revert to follower (§5.1, §5.2)
+	if s.State == raft.Candidate || (s.State == raft.Leader && req.Term >= currentTerm) {
 		s.becomeFollowerLocked(raft.Term(req.Term))
 	} else {
 		// 3. Reset election timer triggered by valid heartbeat/RPC received (§5.2)
@@ -798,6 +810,10 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 				"timeout_ms", newTimeout.Milliseconds(),
 			)
 		}
+	}
+
+	if s.PersistentState != nil {
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
 	}
 
 	return &raftpb.AppendEntriesReply{
@@ -851,14 +867,7 @@ func (s *Server) becomeFollowerLocked(term raft.Term) {
 		s.PersistentState.VotedFor = -1
 	}
 
-	if s.heartbeatTicker != nil {
-		s.heartbeatTicker.Stop()
-		s.heartbeatTicker = nil
-	}
-	if s.heartbeatTimer != nil {
-		s.heartbeatTimer.Stop()
-		s.heartbeatTimer = nil
-	}
+	s.stopHeartbeatTickerLocked()
 
 	s.lastHeartbeat = time.Now()
 	if s.ElectionTimer != nil {
@@ -924,14 +933,7 @@ func (s *Server) becomeCandidateLocked() {
 		s.PersistentState.VotedFor = s.ID
 	}
 
-	if s.heartbeatTicker != nil {
-		s.heartbeatTicker.Stop()
-		s.heartbeatTicker = nil
-	}
-	if s.heartbeatTimer != nil {
-		s.heartbeatTimer.Stop()
-		s.heartbeatTimer = nil
-	}
+	s.stopHeartbeatTickerLocked()
 
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Reset()

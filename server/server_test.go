@@ -1180,6 +1180,9 @@ func TestStateTransition_FollowerCandidateLeaderFollower(t *testing.T) {
 	if srv.heartbeatTimer == nil {
 		t.Fatalf("leader must have an armed heartbeatTimer")
 	}
+	if srv.GetHeartbeatTicker() == nil {
+		t.Fatalf("leader must have an active heartbeat ticker")
+	}
 	if srv.VolatileStateLeader == nil {
 		t.Fatalf("leader must initialize VolatileStateLeader")
 	}
@@ -1200,6 +1203,12 @@ func TestStateTransition_FollowerCandidateLeaderFollower(t *testing.T) {
 
 	if srv.GetState() != raft.Follower {
 		t.Fatalf("expected role Follower, got %s", srv.GetState())
+	}
+	if srv.GetHeartbeatTicker() != nil {
+		t.Fatalf("heartbeatTicker must be stopped and nil when stepping down to follower")
+	}
+	if srv.heartbeatTimer != nil {
+		t.Fatalf("heartbeatTimer must be stopped and nil when stepping down to follower")
 	}
 	if srv.PersistentState.CurrentTerm != 5 {
 		t.Fatalf("expected stepped up term 5, got %d", srv.PersistentState.CurrentTerm)
@@ -1362,6 +1371,105 @@ func TestLeaderHeartbeat_LogsWouldSendHeartbeatToPeer(t *testing.T) {
 	}
 	if strings.Contains(output, "would send heartbeat to peer 1") {
 		t.Fatalf("leader must not send heartbeat to itself (peer 1)")
+	}
+}
+
+func TestLeaderHeartbeatTicker_StopsCleanlyOnStepDown(t *testing.T) {
+	peers := []Peer{
+		{ID: 2, Address: "127.0.0.1:8002"},
+	}
+	srv := NewServer(1, peers, &raft.PersistentState{
+		CurrentTerm: 1,
+		VotedFor:    1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+
+	srv.SetHeartbeatInterval(20 * time.Millisecond)
+	srv.StartEventLoop()
+	defer srv.Stop()
+
+	// 1. Transition to leader and verify ticker is active
+	srv.becomeLeader()
+	if srv.GetHeartbeatTicker() == nil {
+		t.Fatalf("expected leader heartbeat ticker to be active")
+	}
+
+	// Wait for heartbeats to tick
+	time.Sleep(50 * time.Millisecond)
+	countAtStepDown := srv.HeartbeatsSent()
+	if countAtStepDown == 0 {
+		t.Fatalf("expected heartbeats to have fired while leader")
+	}
+
+	// 2. Step down to follower
+	srv.becomeFollower(3)
+
+	// Verify ticker is stopped and nil
+	if ticker := srv.GetHeartbeatTicker(); ticker != nil {
+		t.Fatalf("heartbeat ticker must be nil after stepping down, got %v", ticker)
+	}
+
+	// Wait 60ms (several heartbeat intervals) and verify no additional heartbeats fired
+	time.Sleep(60 * time.Millisecond)
+	if finalCount := srv.HeartbeatsSent(); finalCount != countAtStepDown {
+		t.Fatalf("heartbeat ticker continued firing after step down: sent %d before, %d after", countAtStepDown, finalCount)
+	}
+}
+
+func TestLeaderHeartbeatTicker_StopsCleanlyOnSetState(t *testing.T) {
+	srv := NewServer(1, nil, nil, nil)
+
+	srv.becomeLeader()
+	if srv.GetHeartbeatTicker() == nil {
+		t.Fatalf("expected heartbeat ticker to be active for leader")
+	}
+
+	// SetState to Follower should cleanly stop and nil out ticker
+	srv.SetState(raft.Follower)
+	if srv.GetHeartbeatTicker() != nil {
+		t.Fatalf("heartbeat ticker must be nil after SetState(Follower)")
+	}
+
+	// Re-arm as leader and SetState to Candidate
+	srv.becomeLeader()
+	if srv.GetHeartbeatTicker() == nil {
+		t.Fatalf("expected heartbeat ticker to be re-armed")
+	}
+
+	srv.SetState(raft.Candidate)
+	if srv.GetHeartbeatTicker() != nil {
+		t.Fatalf("heartbeat ticker must be nil after SetState(Candidate)")
+	}
+}
+
+func TestLeaderHeartbeatTicker_StopsCleanlyOnHigherTermRPC(t *testing.T) {
+	srv := NewServer(1, []Peer{
+		{ID: 2, Address: "127.0.0.1:8002"},
+	}, &raft.PersistentState{
+		CurrentTerm: 2,
+		VotedFor:    1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+
+	srv.becomeLeader()
+	if srv.GetHeartbeatTicker() == nil {
+		t.Fatalf("expected leader heartbeat ticker to be active")
+	}
+
+	// Leader receives AppendEntries from a new leader with higher term (term 4)
+	reply := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+		Term:     4,
+		LeaderId: 2,
+	})
+
+	if reply.Term != 4 {
+		t.Fatalf("expected reply term 4, got %d", reply.Term)
+	}
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected leader to step down to Follower on higher term AppendEntries, got %s", srv.GetState())
+	}
+	if srv.GetHeartbeatTicker() != nil {
+		t.Fatalf("expected heartbeat ticker to be nil after higher term AppendEntries step down")
 	}
 }
 
