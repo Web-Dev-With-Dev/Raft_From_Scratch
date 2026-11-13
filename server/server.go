@@ -299,6 +299,100 @@ func (s *Server) loadLocked() error {
 	return nil
 }
 
+// SetCurrentTerm sets the current term and persists state (§5.1).
+// If term is higher than currentTerm, votedFor is reset to -1 and state is persisted.
+// When the event loop is active, the mutation is serialized on the event loop.
+func (s *Server) SetCurrentTerm(term raft.Term) error {
+	if s.loopRunning.Load() {
+		var err error
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				err = s.setCurrentTermLocked(term)
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return fmt.Errorf("server %d stopped", s.ID)
+		}
+		select {
+		case <-resCh:
+			return err
+		case <-s.stopCh:
+			return fmt.Errorf("server %d stopped", s.ID)
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setCurrentTermLocked(term)
+}
+
+func (s *Server) setCurrentTermLocked(term raft.Term) error {
+	if s.PersistentState == nil {
+		s.PersistentState = &raft.PersistentState{
+			CurrentTerm: term,
+			VotedFor:    -1,
+		}
+		return s.persistLocked()
+	}
+
+	if term != s.PersistentState.CurrentTerm {
+		if term > s.PersistentState.CurrentTerm {
+			s.PersistentState.VotedFor = -1
+		}
+		s.PersistentState.CurrentTerm = term
+		return s.persistLocked()
+	}
+	return nil
+}
+
+// SetVotedFor sets the candidate ID voted for in the current term and persists state (§5.2).
+// When the event loop is active, the mutation is serialized on the event loop.
+func (s *Server) SetVotedFor(votedFor raft.NodeID) error {
+	if s.loopRunning.Load() {
+		var err error
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				err = s.setVotedForLocked(votedFor)
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return fmt.Errorf("server %d stopped", s.ID)
+		}
+		select {
+		case <-resCh:
+			return err
+		case <-s.stopCh:
+			return fmt.Errorf("server %d stopped", s.ID)
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setVotedForLocked(votedFor)
+}
+
+func (s *Server) setVotedForLocked(votedFor raft.NodeID) error {
+	if s.PersistentState == nil {
+		s.PersistentState = &raft.PersistentState{
+			CurrentTerm: 0,
+			VotedFor:    votedFor,
+		}
+		return s.persistLocked()
+	}
+
+	if s.PersistentState.VotedFor != votedFor {
+		s.PersistentState.VotedFor = votedFor
+		return s.persistLocked()
+	}
+	return nil
+}
+
 // SetState updates the server's consensus state.
 // When the event loop is active, the mutation is executed on the single event-loop goroutine.
 func (s *Server) SetState(state raft.RaftState) {
@@ -872,16 +966,22 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 
 	voteGranted := false
 
-	// In Raft (§5.2):
-	// A server resets its election timer when it grants a vote to a candidate.
-	if voteGranted && s.ElectionTimer != nil {
-		s.lastHeartbeat = time.Now()
-		newTimeout := s.ElectionTimer.Reset()
-		s.GetLogger().Info("reset election timer on granting vote",
-			"candidate_id", req.CandidateId,
-			"term", req.Term,
-			"timeout_ms", newTimeout.Milliseconds(),
-		)
+	// In Raft (§5.2, §5.4):
+	// If votedFor is null or candidateId, and candidate's log is at least as up-to-date as receiver's log, grant vote
+	if voteGranted {
+		if s.PersistentState != nil {
+			s.PersistentState.VotedFor = raft.NodeID(req.CandidateId)
+			_ = s.persistLocked()
+		}
+		if s.ElectionTimer != nil {
+			s.lastHeartbeat = time.Now()
+			newTimeout := s.ElectionTimer.Reset()
+			s.GetLogger().Info("reset election timer on granting vote",
+				"candidate_id", req.CandidateId,
+				"term", req.Term,
+				"timeout_ms", newTimeout.Milliseconds(),
+			)
+		}
 	}
 
 	return &raftpb.RequestVoteReply{
@@ -1381,6 +1481,21 @@ func (s *Server) SendAppendEntries(ctx context.Context, peer Peer, args *raft.Ap
 		return nil, err
 	}
 	return reply, nil
+}
+
+// checkReplyTerm checks if an RPC response contains term T > currentTerm.
+// In Raft (§5.1, All Servers): set currentTerm = T, convert to follower, reset votedFor to -1, and persist.
+func (s *Server) checkReplyTerm(replyTerm raft.Term) {
+	var curTerm raft.Term
+	s.mu.RLock()
+	if s.PersistentState != nil {
+		curTerm = s.PersistentState.CurrentTerm
+	}
+	s.mu.RUnlock()
+
+	if replyTerm > curTerm {
+		s.becomeFollower(replyTerm)
+	}
 }
 
 // SendRequestVoteToNode sends a RequestVote RPC to a peer identified by NodeID.

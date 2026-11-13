@@ -1636,6 +1636,166 @@ func TestServer_Persistence_EventLoopSerialization(t *testing.T) {
 	}
 }
 
+func TestPersistence_RaftPaper_Points(t *testing.T) {
+	// Point 1: Candidate state transition increments currentTerm, votes for self, and persists
+	t.Run("CandidateStateTransition_PersistsTermAndSelfVote", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    -1,
+			Log:         make([]raft.LogEntry, 0),
+		}, nil)
+		defer srv.Close()
+
+		srv.becomeCandidate()
+
+		loaded, err := srv.GetStorage().Load()
+		if err != nil {
+			t.Fatalf("failed to load storage: %v", err)
+		}
+		if loaded.CurrentTerm != 3 {
+			t.Errorf("expected stored currentTerm 3, got %d", loaded.CurrentTerm)
+		}
+		if loaded.VotedFor != 1 {
+			t.Errorf("expected stored votedFor 1 (self), got %d", loaded.VotedFor)
+		}
+	})
+
+	// Point 2: Discovering higher term in RequestVote RPC updates term, resets votedFor, and persists
+	t.Run("RequestVote_HigherTerm_PersistsAndResetsVote", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 1,
+			VotedFor:    1,
+			Log:         make([]raft.LogEntry, 0),
+		}, nil)
+		defer srv.Close()
+		srv.SetState(raft.Candidate)
+
+		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+			Term:        5,
+			CandidateId: 2,
+		})
+
+		if reply.Term != 5 {
+			t.Errorf("expected reply term 5, got %d", reply.Term)
+		}
+
+		loaded, err := srv.GetStorage().Load()
+		if err != nil {
+			t.Fatalf("failed to load storage: %v", err)
+		}
+		if loaded.CurrentTerm != 5 {
+			t.Errorf("expected stored currentTerm 5, got %d", loaded.CurrentTerm)
+		}
+		if loaded.VotedFor != -1 {
+			t.Errorf("expected stored votedFor reset to -1, got %d", loaded.VotedFor)
+		}
+	})
+
+	// Point 3: Discovering higher term in AppendEntries RPC updates term, resets votedFor, and persists
+	t.Run("AppendEntries_HigherTerm_PersistsAndResetsVote", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    1,
+			Log:         make([]raft.LogEntry, 0),
+		}, nil)
+		defer srv.Close()
+		srv.SetState(raft.Leader)
+
+		reply := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+			Term:     8,
+			LeaderId: 3,
+		})
+
+		if reply.Term != 8 {
+			t.Errorf("expected reply term 8, got %d", reply.Term)
+		}
+
+		loaded, err := srv.GetStorage().Load()
+		if err != nil {
+			t.Fatalf("failed to load storage: %v", err)
+		}
+		if loaded.CurrentTerm != 8 {
+			t.Errorf("expected stored currentTerm 8, got %d", loaded.CurrentTerm)
+		}
+		if loaded.VotedFor != -1 {
+			t.Errorf("expected stored votedFor reset to -1, got %d", loaded.VotedFor)
+		}
+	})
+
+	// Point 4: Discovering higher term in RPC response updates term, resets votedFor, and persists
+	t.Run("RPCResponse_HigherTerm_PersistsAndResetsVote", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 3,
+			VotedFor:    1,
+			Log:         make([]raft.LogEntry, 0),
+		}, nil)
+		defer srv.Close()
+
+		srv.checkReplyTerm(12)
+
+		loaded, err := srv.GetStorage().Load()
+		if err != nil {
+			t.Fatalf("failed to load storage: %v", err)
+		}
+		if loaded.CurrentTerm != 12 {
+			t.Errorf("expected stored currentTerm 12, got %d", loaded.CurrentTerm)
+		}
+		if loaded.VotedFor != -1 {
+			t.Errorf("expected stored votedFor reset to -1, got %d", loaded.VotedFor)
+		}
+	})
+
+	// Point 5: Explicit SetCurrentTerm persists state and resets votedFor when advancing term
+	t.Run("SetCurrentTerm_PersistsAndResetsVote", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    1,
+			Log:         make([]raft.LogEntry, 0),
+		}, nil)
+		defer srv.Close()
+
+		if err := srv.SetCurrentTerm(6); err != nil {
+			t.Fatalf("SetCurrentTerm failed: %v", err)
+		}
+
+		loaded, err := srv.GetStorage().Load()
+		if err != nil {
+			t.Fatalf("failed to load storage: %v", err)
+		}
+		if loaded.CurrentTerm != 6 {
+			t.Errorf("expected stored currentTerm 6, got %d", loaded.CurrentTerm)
+		}
+		if loaded.VotedFor != -1 {
+			t.Errorf("expected stored votedFor reset to -1, got %d", loaded.VotedFor)
+		}
+	})
+
+	// Point 6: Explicit SetVotedFor persists candidate ID
+	t.Run("SetVotedFor_PersistsCandidateID", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 4,
+			VotedFor:    -1,
+			Log:         make([]raft.LogEntry, 0),
+		}, nil)
+		defer srv.Close()
+
+		if err := srv.SetVotedFor(2); err != nil {
+			t.Fatalf("SetVotedFor failed: %v", err)
+		}
+
+		loaded, err := srv.GetStorage().Load()
+		if err != nil {
+			t.Fatalf("failed to load storage: %v", err)
+		}
+		if loaded.CurrentTerm != 4 {
+			t.Errorf("expected stored currentTerm 4, got %d", loaded.CurrentTerm)
+		}
+		if loaded.VotedFor != 2 {
+			t.Errorf("expected stored votedFor 2, got %d", loaded.VotedFor)
+		}
+	})
+}
+
 
 
 
