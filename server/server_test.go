@@ -1323,6 +1323,48 @@ func TestLeaderHeartbeatTicker_CustomInterval(t *testing.T) {
 	}
 }
 
+func TestLeaderHeartbeat_LogsWouldSendHeartbeatToPeer(t *testing.T) {
+	buf := &bytes.Buffer{}
+	nodeID := raft.NodeID(1)
+
+	testLogger := NewNodeLogger(nodeID, buf, &LogOptions{
+		DisableTime: true,
+	})
+
+	peers := []Peer{
+		{ID: 1, Address: "127.0.0.1:8001"}, // self
+		{ID: 2, Address: "127.0.0.1:8002"},
+		{ID: 3, Address: "127.0.0.1:8003"},
+	}
+
+	srv := NewServer(nodeID, peers, nil, nil)
+	srv.SetLogger(testLogger)
+
+	// In Follower state, broadcastHeartbeats should not send/log heartbeats
+	srv.broadcastHeartbeats()
+	if strings.Contains(buf.String(), "would send heartbeat to peer") {
+		t.Fatalf("follower should not log 'would send heartbeat to peer'")
+	}
+
+	// Become leader
+	srv.becomeLeader()
+	buf.Reset()
+
+	// Trigger heartbeat tick
+	srv.handleHeartbeatTick()
+
+	output := buf.String()
+	if !strings.Contains(output, "would send heartbeat to peer 2") {
+		t.Fatalf("expected log to contain 'would send heartbeat to peer 2', got:\n%s", output)
+	}
+	if !strings.Contains(output, "would send heartbeat to peer 3") {
+		t.Fatalf("expected log to contain 'would send heartbeat to peer 3', got:\n%s", output)
+	}
+	if strings.Contains(output, "would send heartbeat to peer 1") {
+		t.Fatalf("leader must not send heartbeat to itself (peer 1)")
+	}
+}
+
 
 
 

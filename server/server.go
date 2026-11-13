@@ -1083,7 +1083,7 @@ func (s *Server) handleHeartbeatTick() {
 }
 
 // broadcastHeartbeats sends AppendEntries heartbeats to all cluster peers.
-// Currently stubbed with structured logging until log replication and peer RPC dispatch are wired.
+// Currently stubbed to log 'would send heartbeat to peer X' until log replication and peer RPC dispatch are wired.
 func (s *Server) broadcastHeartbeats() {
 	if s.State != raft.Leader {
 		return
@@ -1092,7 +1092,7 @@ func (s *Server) broadcastHeartbeats() {
 		if peer.ID == s.ID {
 			continue
 		}
-		s.GetLogger().Debug("leader scheduled heartbeat AppendEntries to peer",
+		s.GetLogger().Info(fmt.Sprintf("would send heartbeat to peer %d", peer.ID),
 			"leader_id", int(s.ID),
 			"peer_id", int(peer.ID),
 			"peer_addr", peer.Address,
