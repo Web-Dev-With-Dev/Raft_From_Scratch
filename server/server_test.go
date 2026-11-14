@@ -1796,6 +1796,321 @@ func TestPersistence_RaftPaper_Points(t *testing.T) {
 	})
 }
 
+// spyStorage is a mock/spy implementation of store.Storage used to track and assert Persist() calls.
+type spyStorage struct {
+	mu           sync.Mutex
+	persistCount int
+	loadCount    int
+	lastState    *raft.PersistentState
+	history      []raft.PersistentState
+	injectErr    error
+}
+
+func newSpyStorage() *spyStorage {
+	return &spyStorage{
+		history: make([]raft.PersistentState, 0),
+	}
+}
+
+func (s *spyStorage) Persist(state *raft.PersistentState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.persistCount++
+	if state != nil {
+		copied := raft.PersistentState{
+			CurrentTerm: state.CurrentTerm,
+			VotedFor:    state.VotedFor,
+			Log:         make([]raft.LogEntry, len(state.Log)),
+		}
+		copy(copied.Log, state.Log)
+		s.lastState = &copied
+		s.history = append(s.history, copied)
+	} else {
+		s.lastState = nil
+	}
+	return s.injectErr
+}
+
+func (s *spyStorage) Load() (*raft.PersistentState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadCount++
+	if s.lastState == nil {
+		return nil, s.injectErr
+	}
+	copied := &raft.PersistentState{
+		CurrentTerm: s.lastState.CurrentTerm,
+		VotedFor:    s.lastState.VotedFor,
+		Log:         make([]raft.LogEntry, len(s.lastState.Log)),
+	}
+	copy(copied.Log, s.lastState.Log)
+	return copied, s.injectErr
+}
+
+func (s *spyStorage) SaveSnapshot(snapshot []byte) error { return nil }
+func (s *spyStorage) LoadSnapshot() ([]byte, error)      { return nil, nil }
+func (s *spyStorage) Close() error                      { return nil }
+
+func (s *spyStorage) PersistCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.persistCount
+}
+
+func (s *spyStorage) LastState() *raft.PersistentState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastState == nil {
+		return nil
+	}
+	copied := *s.lastState
+	return &copied
+}
+
+func (s *spyStorage) ResetCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.persistCount = 0
+}
+
+func TestServer_Persistence_SpyMockAssertions(t *testing.T) {
+	t.Run("BecomeCandidate_InvokesPersistOnceWithIncrementedTermAndSelfVote", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 1,
+			VotedFor:    -1,
+		}, nil)
+		defer srv.Close()
+
+		spy := newSpyStorage()
+		srv.SetStorage(spy)
+
+		srv.becomeCandidate()
+
+		if count := spy.PersistCount(); count != 1 {
+			t.Fatalf("expected Persist() to be called exactly 1 time on becomeCandidate, called %d times", count)
+		}
+		last := spy.LastState()
+		if last == nil {
+			t.Fatal("expected LastState to be captured")
+		}
+		if last.CurrentTerm != 2 {
+			t.Errorf("expected persisted currentTerm 2, got %d", last.CurrentTerm)
+		}
+		if last.VotedFor != 1 {
+			t.Errorf("expected persisted votedFor self (1), got %d", last.VotedFor)
+		}
+	})
+
+	t.Run("BecomeFollower_HigherTerm_InvokesPersistOnceAndResetsVote", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    1,
+		}, nil)
+		defer srv.Close()
+
+		spy := newSpyStorage()
+		srv.SetStorage(spy)
+
+		srv.becomeFollower(5)
+
+		if count := spy.PersistCount(); count != 1 {
+			t.Fatalf("expected Persist() to be called exactly 1 time on higher term becomeFollower, called %d times", count)
+		}
+		last := spy.LastState()
+		if last.CurrentTerm != 5 {
+			t.Errorf("expected persisted currentTerm 5, got %d", last.CurrentTerm)
+		}
+		if last.VotedFor != -1 {
+			t.Errorf("expected persisted votedFor -1 (reset), got %d", last.VotedFor)
+		}
+	})
+
+	t.Run("BecomeFollower_SameOrLowerTerm_DoesNotInvokePersist", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 5,
+			VotedFor:    2,
+		}, nil)
+		defer srv.Close()
+
+		spy := newSpyStorage()
+		srv.SetStorage(spy)
+
+		// Same term
+		srv.becomeFollower(5)
+		if count := spy.PersistCount(); count != 0 {
+			t.Fatalf("Persist() should not be invoked when term is not increased, got count %d", count)
+		}
+
+		// Lower term
+		srv.becomeFollower(3)
+		if count := spy.PersistCount(); count != 0 {
+			t.Fatalf("Persist() should not be invoked on lower term, got count %d", count)
+		}
+	})
+
+	t.Run("BecomeLeader_DoesNotInvokePersist", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 3,
+			VotedFor:    1,
+		}, nil)
+		defer srv.Close()
+
+		spy := newSpyStorage()
+		srv.SetStorage(spy)
+
+		// Transition to Leader (candidate already persisted term and vote before election)
+		srv.becomeLeader()
+
+		if count := spy.PersistCount(); count != 0 {
+			t.Fatalf("becomeLeader() should not invoke Persist(), got count %d", count)
+		}
+	})
+
+	t.Run("SetCurrentTerm_HigherTerm_InvokesPersistOnce", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    1,
+		}, nil)
+		defer srv.Close()
+
+		spy := newSpyStorage()
+		srv.SetStorage(spy)
+
+		if err := srv.SetCurrentTerm(4); err != nil {
+			t.Fatalf("SetCurrentTerm failed: %v", err)
+		}
+		if count := spy.PersistCount(); count != 1 {
+			t.Fatalf("expected Persist() to be called 1 time on SetCurrentTerm(4), called %d times", count)
+		}
+		last := spy.LastState()
+		if last.CurrentTerm != 4 || last.VotedFor != -1 {
+			t.Errorf("unexpected state: term %d, votedFor %d", last.CurrentTerm, last.VotedFor)
+		}
+
+		// Calling again with same term does not persist
+		if err := srv.SetCurrentTerm(4); err != nil {
+			t.Fatalf("SetCurrentTerm(4) repeat failed: %v", err)
+		}
+		if count := spy.PersistCount(); count != 1 {
+			t.Fatalf("Persist() must not be called when term is unchanged, got count %d", count)
+		}
+	})
+
+	t.Run("SetVotedFor_NewVote_InvokesPersistOnce", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 3,
+			VotedFor:    -1,
+		}, nil)
+		defer srv.Close()
+
+		spy := newSpyStorage()
+		srv.SetStorage(spy)
+
+		if err := srv.SetVotedFor(2); err != nil {
+			t.Fatalf("SetVotedFor failed: %v", err)
+		}
+		if count := spy.PersistCount(); count != 1 {
+			t.Fatalf("expected Persist() called 1 time on SetVotedFor, called %d times", count)
+		}
+		if last := spy.LastState(); last.VotedFor != 2 {
+			t.Errorf("expected persisted votedFor 2, got %d", last.VotedFor)
+		}
+
+		// Repeat with same votedFor does not persist
+		if err := srv.SetVotedFor(2); err != nil {
+			t.Fatalf("SetVotedFor repeat failed: %v", err)
+		}
+		if count := spy.PersistCount(); count != 1 {
+			t.Fatalf("Persist() must not be called when votedFor is unchanged, got count %d", count)
+		}
+	})
+
+	t.Run("ProcessRequestVote_HigherTerm_InvokesPersistOnce", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 1,
+			VotedFor:    1,
+		}, nil)
+		defer srv.Close()
+		srv.SetState(raft.Candidate)
+
+		spy := newSpyStorage()
+		srv.SetStorage(spy)
+
+		srv.processRequestVote(&raftpb.RequestVoteArgs{
+			Term:        6,
+			CandidateId: 2,
+		})
+
+		if count := spy.PersistCount(); count != 1 {
+			t.Fatalf("expected Persist() called 1 time on higher term RequestVote, called %d times", count)
+		}
+		if last := spy.LastState(); last.CurrentTerm != 6 || last.VotedFor != -1 {
+			t.Errorf("unexpected persisted state: term %d, votedFor %d", last.CurrentTerm, last.VotedFor)
+		}
+	})
+
+	t.Run("ProcessAppendEntries_HigherTerm_InvokesPersistOnce", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    1,
+		}, nil)
+		defer srv.Close()
+		srv.SetState(raft.Leader)
+
+		spy := newSpyStorage()
+		srv.SetStorage(spy)
+
+		srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+			Term:     7,
+			LeaderId: 3,
+		})
+
+		if count := spy.PersistCount(); count != 1 {
+			t.Fatalf("expected Persist() called 1 time on higher term AppendEntries, called %d times", count)
+		}
+		if last := spy.LastState(); last.CurrentTerm != 7 || last.VotedFor != -1 {
+			t.Errorf("unexpected persisted state: term %d, votedFor %d", last.CurrentTerm, last.VotedFor)
+		}
+	})
+
+	t.Run("ActiveEventLoop_MultipleMutations_StrictInvocationCounts", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 1,
+			VotedFor:    -1,
+		}, nil)
+		defer srv.Close()
+
+		spy := newSpyStorage()
+		srv.SetStorage(spy)
+
+		srv.StartEventLoop()
+
+		// 1. Candidate transition (count -> 1)
+		srv.becomeCandidate()
+		if count := spy.PersistCount(); count != 1 {
+			t.Fatalf("expected Persist() count 1 after becomeCandidate on event loop, got %d", count)
+		}
+
+		// 2. Leader step up (count stays 1)
+		srv.becomeLeader()
+		if count := spy.PersistCount(); count != 1 {
+			t.Fatalf("expected Persist() count unchanged (1) on becomeLeader, got %d", count)
+		}
+
+		// 3. Step down on higher term (count -> 2)
+		srv.becomeFollower(10)
+		if count := spy.PersistCount(); count != 2 {
+			t.Fatalf("expected Persist() count 2 after becomeFollower(10), got %d", count)
+		}
+
+		// 4. Same term step down (count stays 2)
+		srv.becomeFollower(10)
+		if count := spy.PersistCount(); count != 2 {
+			t.Fatalf("expected Persist() count unchanged (2) on repeat follower term, got %d", count)
+		}
+	})
+}
+
 
 
 
