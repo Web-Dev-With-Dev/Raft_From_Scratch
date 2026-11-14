@@ -6,6 +6,9 @@ type NodeID int
 type Term uint64
 type LogIndex uint64
 
+// NoneNodeID represents a null or absent node ID (e.g. initial votedFor state).
+const NoneNodeID NodeID = -1
+
 type Peer struct {
 	ID      NodeID `json:"id"`
 	Address string `json:"address"`

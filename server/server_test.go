@@ -263,8 +263,8 @@ func TestServer_RaftServiceHandlers(t *testing.T) {
 	if rvReply.Term != 42 {
 		t.Fatalf("expected Term 42, got %d", rvReply.Term)
 	}
-	if rvReply.VoteGranted {
-		t.Fatalf("expected VoteGranted false for empty stub handler")
+	if !rvReply.VoteGranted {
+		t.Fatalf("expected VoteGranted true per Figure 2 rules 1-2")
 	}
 
 	// Test AppendEntries handler
@@ -280,8 +280,8 @@ func TestServer_RaftServiceHandlers(t *testing.T) {
 	if aeReply.Term != 42 {
 		t.Fatalf("expected Term 42, got %d", aeReply.Term)
 	}
-	if aeReply.Success {
-		t.Fatalf("expected Success false for empty stub handler")
+	if !aeReply.Success {
+		t.Fatalf("expected Success true per Figure 2 rules 1-2")
 	}
 }
 
@@ -579,7 +579,7 @@ func TestCluster_FullMeshRPCReachability(t *testing.T) {
 			}
 
 			reply, err := sender.SendRequestVoteToNode(ctx, target.ID, &raft.RequestVoteArgs{
-				Term:        1,
+				Term:        0,
 				CandidateID: sender.ID,
 			})
 			if err != nil {
@@ -590,7 +590,7 @@ func TestCluster_FullMeshRPCReachability(t *testing.T) {
 			}
 
 			aeReply, err := sender.SendAppendEntriesToNode(ctx, target.ID, &raft.AppendEntriesArgs{
-				Term:     1,
+				Term:     0,
 				LeaderID: sender.ID,
 			})
 			if err != nil {
@@ -1664,8 +1664,8 @@ func TestPersistence_RaftPaper_Points(t *testing.T) {
 		}
 	})
 
-	// Point 2: Discovering higher term in RequestVote RPC updates term, resets votedFor, and persists
-	t.Run("RequestVote_HigherTerm_PersistsAndResetsVote", func(t *testing.T) {
+	// Point 2: Discovering higher term in RequestVote RPC updates term, persists, and grants vote per Figure 2
+	t.Run("RequestVote_HigherTerm_PersistsAndGrantsVote", func(t *testing.T) {
 		srv := NewServer(1, nil, &raft.PersistentState{
 			CurrentTerm: 1,
 			VotedFor:    1,
@@ -1682,6 +1682,9 @@ func TestPersistence_RaftPaper_Points(t *testing.T) {
 		if reply.Term != 5 {
 			t.Errorf("expected reply term 5, got %d", reply.Term)
 		}
+		if !reply.VoteGranted {
+			t.Errorf("expected vote to be granted to candidate 2")
+		}
 
 		loaded, err := srv.GetStorage().Load()
 		if err != nil {
@@ -1690,8 +1693,8 @@ func TestPersistence_RaftPaper_Points(t *testing.T) {
 		if loaded.CurrentTerm != 5 {
 			t.Errorf("expected stored currentTerm 5, got %d", loaded.CurrentTerm)
 		}
-		if loaded.VotedFor != -1 {
-			t.Errorf("expected stored votedFor reset to -1, got %d", loaded.VotedFor)
+		if loaded.VotedFor != 2 {
+			t.Errorf("expected stored votedFor 2, got %d", loaded.VotedFor)
 		}
 	})
 
@@ -2040,15 +2043,18 @@ func TestServer_Persistence_SpyMockAssertions(t *testing.T) {
 		spy := newSpyStorage()
 		srv.SetStorage(spy)
 
-		srv.processRequestVote(&raftpb.RequestVoteArgs{
+		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
 			Term:        6,
 			CandidateId: 2,
 		})
 
+		if !reply.VoteGranted {
+			t.Fatalf("expected vote to be granted to candidate 2")
+		}
 		if count := spy.PersistCount(); count != 1 {
 			t.Fatalf("expected Persist() called 1 time on higher term RequestVote, called %d times", count)
 		}
-		if last := spy.LastState(); last.CurrentTerm != 6 || last.VotedFor != -1 {
+		if last := spy.LastState(); last.CurrentTerm != 6 || last.VotedFor != 2 {
 			t.Errorf("unexpected persisted state: term %d, votedFor %d", last.CurrentTerm, last.VotedFor)
 		}
 	})
@@ -2328,6 +2334,383 @@ func TestServer_NoGoroutineLeak(t *testing.T) {
 		t.Fatalf("goroutine leak detected: baseline=%d, current=%d", baseline, current)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Raft Paper Figure 2 Rules 1-2 Tests (RequestVote & AppendEntries)
+// ---------------------------------------------------------------------------
+
+func TestRequestVote_Figure2_Rule1_RejectStaleTerm(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 4,
+		VotedFor:    -1,
+	}, nil)
+	defer srv.Close()
+
+	initialTimer := srv.lastHeartbeat
+
+	// Candidate with term 2 (stale compared to receiver's term 4)
+	reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+		Term:         2,
+		CandidateId:  2,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	})
+
+	if reply.VoteGranted {
+		t.Fatalf("Figure 2 Rule 1: expected VoteGranted false for stale term")
+	}
+	if reply.Term != 4 {
+		t.Fatalf("Figure 2 Rule 1: expected reply term 4 (currentTerm), got %d", reply.Term)
+	}
+	if srv.PersistentState.CurrentTerm != 4 {
+		t.Fatalf("receiver currentTerm should not change on stale RPC, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != -1 {
+		t.Fatalf("receiver votedFor should remain -1, got %d", srv.PersistentState.VotedFor)
+	}
+	if !srv.lastHeartbeat.Equal(initialTimer) {
+		t.Fatalf("stale RequestVote must not reset election timer")
+	}
+}
+
+func TestRequestVote_Figure2_StepDownOnHigherTerm(t *testing.T) {
+	t.Run("CandidateStepsDownOnHigherTerm", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    1,
+		}, nil)
+		defer srv.Close()
+		srv.SetState(raft.Candidate)
+
+		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+			Term:         5,
+			CandidateId:  2,
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		})
+
+		if !reply.VoteGranted {
+			t.Fatalf("expected vote granted to candidate 2 on higher term")
+		}
+		if reply.Term != 5 {
+			t.Fatalf("expected reply term 5, got %d", reply.Term)
+		}
+		if srv.GetState() != raft.Follower {
+			t.Fatalf("expected node to convert to Follower, got %s", srv.GetState())
+		}
+		if srv.PersistentState.CurrentTerm != 5 {
+			t.Fatalf("expected currentTerm 5, got %d", srv.PersistentState.CurrentTerm)
+		}
+		if srv.PersistentState.VotedFor != 2 {
+			t.Fatalf("expected votedFor 2, got %d", srv.PersistentState.VotedFor)
+		}
+	})
+
+	t.Run("LeaderStepsDownOnHigherTermAndStopsHeartbeat", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 3,
+			VotedFor:    1,
+		}, nil)
+		defer srv.Close()
+		srv.becomeLeader()
+
+		if srv.GetHeartbeatTicker() == nil {
+			t.Fatalf("expected active heartbeat ticker for leader")
+		}
+
+		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+			Term:         6,
+			CandidateId:  3,
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		})
+
+		if !reply.VoteGranted {
+			t.Fatalf("expected vote granted to candidate 3")
+		}
+		if reply.Term != 6 {
+			t.Fatalf("expected reply term 6, got %d", reply.Term)
+		}
+		if srv.GetState() != raft.Follower {
+			t.Fatalf("expected leader to step down to Follower, got %s", srv.GetState())
+		}
+		if srv.GetHeartbeatTicker() != nil {
+			t.Fatalf("expected heartbeat ticker stopped after stepping down to Follower")
+		}
+	})
+}
+
+func TestRequestVote_Figure2_Rule2_GrantVoteWhenVotedForNull(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 2,
+		VotedFor:    -1, // null vote
+	}, nil)
+	defer srv.Close()
+
+	reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+		Term:         2,
+		CandidateId:  3,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	})
+
+	if !reply.VoteGranted {
+		t.Fatalf("Figure 2 Rule 2: expected vote to be granted when votedFor is null")
+	}
+	if reply.Term != 2 {
+		t.Fatalf("expected reply term 2, got %d", reply.Term)
+	}
+	if srv.PersistentState.VotedFor != 3 {
+		t.Fatalf("expected votedFor to be updated to 3, got %d", srv.PersistentState.VotedFor)
+	}
+
+	loaded, err := srv.GetStorage().Load()
+	if err != nil {
+		t.Fatalf("failed to load storage: %v", err)
+	}
+	if loaded.VotedFor != 3 || loaded.CurrentTerm != 2 {
+		t.Fatalf("expected persisted state (term=2, votedFor=3), got %+v", loaded)
+	}
+}
+
+func TestRequestVote_Figure2_Rule2_GrantVoteWhenAlreadyVotedForSameCandidate(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 2,
+		VotedFor:    3, // already voted for candidate 3
+	}, nil)
+	defer srv.Close()
+
+	// Retransmitted RequestVote from candidate 3
+	reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+		Term:         2,
+		CandidateId:  3,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	})
+
+	if !reply.VoteGranted {
+		t.Fatalf("Figure 2 Rule 2: expected vote granted when already voted for same candidate")
+	}
+	if srv.PersistentState.VotedFor != 3 {
+		t.Fatalf("votedFor should remain 3, got %d", srv.PersistentState.VotedFor)
+	}
+}
+
+func TestRequestVote_Figure2_Rule2_RejectVoteWhenAlreadyVotedForDifferentCandidate(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 2,
+		VotedFor:    3, // already voted for candidate 3
+	}, nil)
+	defer srv.Close()
+
+	initialTimer := srv.lastHeartbeat
+
+	// Competing candidate 4 requests vote in the same term
+	reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+		Term:         2,
+		CandidateId:  4,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	})
+
+	if reply.VoteGranted {
+		t.Fatalf("Figure 2 Rule 2: must reject vote when already voted for a different candidate in same term")
+	}
+	if reply.Term != 2 {
+		t.Fatalf("expected reply term 2, got %d", reply.Term)
+	}
+	if srv.PersistentState.VotedFor != 3 {
+		t.Fatalf("votedFor must remain 3, got %d", srv.PersistentState.VotedFor)
+	}
+	if !srv.lastHeartbeat.Equal(initialTimer) {
+		t.Fatalf("denying vote must not reset election timer")
+	}
+}
+
+func TestRequestVote_Figure2_Rule2_RejectWhenLogNotUpToDate(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 1,
+		VotedFor:    -1,
+	}, nil)
+	defer srv.Close()
+
+	// Configure mock/hook to simulate candidate's log being stale
+	srv.SetLogUpToDateChecker(func(lastLogIndex uint64, lastLogTerm uint64) bool {
+		return false
+	})
+
+	reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+		Term:         1,
+		CandidateId:  2,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	})
+
+	if reply.VoteGranted {
+		t.Fatalf("Figure 2 Rule 2: must deny vote when candidate's log is not up to date")
+	}
+	if srv.PersistentState.VotedFor != -1 {
+		t.Fatalf("votedFor must remain -1 on rejected vote, got %d", srv.PersistentState.VotedFor)
+	}
+}
+
+func TestRequestVote_IsLogUpToDate_StubReturnsTrueByDefault(t *testing.T) {
+	srv := NewServer(1, nil, nil, nil)
+	defer srv.Close()
+
+	// Verify default stub returns true
+	if !srv.IsLogUpToDate(100, 5) {
+		t.Fatalf("expected default IsLogUpToDate stub to return true")
+	}
+}
+
+func TestAppendEntries_Figure2_Rule1_RejectStaleTerm(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 5,
+		VotedFor:    -1,
+	}, nil)
+	defer srv.Close()
+
+	initialTimer := srv.lastHeartbeat
+
+	// Leader with term 3 sending AppendEntries to follower in term 5
+	reply := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+		Term:         3,
+		LeaderId:     2,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+	})
+
+	if reply.Success {
+		t.Fatalf("Figure 2 AppendEntries Rule 1: expected Success false for stale term")
+	}
+	if reply.Term != 5 {
+		t.Fatalf("expected reply term 5 (currentTerm), got %d", reply.Term)
+	}
+	if !srv.lastHeartbeat.Equal(initialTimer) {
+		t.Fatalf("stale AppendEntries must not reset election timer")
+	}
+}
+
+func TestAppendEntries_Figure2_StepDownOnHigherTerm(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 2,
+		VotedFor:    1,
+	}, nil)
+	defer srv.Close()
+	srv.becomeLeader()
+
+	// Incoming AppendEntries with term 7 from new leader 3
+	reply := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+		Term:         7,
+		LeaderId:     3,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+	})
+
+	if reply.Term != 7 {
+		t.Fatalf("expected reply term 7, got %d", reply.Term)
+	}
+	if !reply.Success {
+		t.Fatalf("expected valid heartbeat on higher term to succeed")
+	}
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected leader to step down to Follower, got %s", srv.GetState())
+	}
+	if srv.PersistentState.CurrentTerm != 7 {
+		t.Fatalf("expected currentTerm 7, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != -1 {
+		t.Fatalf("expected votedFor reset to -1, got %d", srv.PersistentState.VotedFor)
+	}
+	if srv.GetHeartbeatTicker() != nil {
+		t.Fatalf("expected heartbeat ticker to be stopped")
+	}
+}
+
+func TestAppendEntries_Figure2_CandidateRevertsOnSameTermLeader(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 3,
+		VotedFor:    1,
+	}, nil)
+	defer srv.Close()
+	srv.SetState(raft.Candidate)
+
+	// AppendEntries with same term 3 from elected leader 2 (§5.2)
+	reply := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+		Term:         3,
+		LeaderId:     2,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+	})
+
+	if !reply.Success {
+		t.Fatalf("expected heartbeat from current leader to succeed")
+	}
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("candidate should revert to Follower on receiving AppendEntries from current leader, got %s", srv.GetState())
+	}
+}
+
+func TestAppendEntries_Figure2_Rule2_LogMatching(t *testing.T) {
+	logEntries := []raft.LogEntry{
+		{Index: 1, Term: 1, Command: []byte("set a=1")},
+		{Index: 2, Term: 2, Command: []byte("set b=2")},
+		{Index: 3, Term: 2, Command: []byte("set c=3")},
+	}
+
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 3,
+		VotedFor:    -1,
+		Log:         logEntries,
+	}, nil)
+	defer srv.Close()
+
+	// 1. PrevLogIndex == 0 always matches (start of log)
+	reply1 := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+		Term:         3,
+		LeaderId:     2,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+	})
+	if !reply1.Success {
+		t.Fatalf("expected success for PrevLogIndex=0")
+	}
+
+	// 2. Matching PrevLogIndex and PrevLogTerm (index 2, term 2)
+	reply2 := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+		Term:         3,
+		LeaderId:     2,
+		PrevLogIndex: 2,
+		PrevLogTerm:  2,
+	})
+	if !reply2.Success {
+		t.Fatalf("expected success when prevLogIndex and prevLogTerm match log entry")
+	}
+
+	// 3. Term mismatch at PrevLogIndex (index 2, actual term 2 != prevLogTerm 1)
+	reply3 := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+		Term:         3,
+		LeaderId:     2,
+		PrevLogIndex: 2,
+		PrevLogTerm:  1,
+	})
+	if reply3.Success {
+		t.Fatalf("Figure 2 Rule 2: expected failure when term at prevLogIndex does not match")
+	}
+
+	// 4. Missing entry at PrevLogIndex (index 5 > log length 3)
+	reply4 := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+		Term:         3,
+		LeaderId:     2,
+		PrevLogIndex: 5,
+		PrevLogTerm:  2,
+	})
+	if reply4.Success {
+		t.Fatalf("Figure 2 Rule 2: expected failure when log does not contain entry at prevLogIndex")
+	}
+}
+
 
 
 

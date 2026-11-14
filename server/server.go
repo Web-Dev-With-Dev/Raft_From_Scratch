@@ -132,6 +132,9 @@ type Server struct {
 
 	httpServer   *http.Server
 	httpListener net.Listener
+
+	// logUpToDateChecker is an optional testing hook for log up-to-date assertions.
+	logUpToDateChecker func(lastLogIndex uint64, lastLogTerm uint64) bool
 }
 
 // NewServer creates and initializes a new Raft Server.
@@ -1079,7 +1082,36 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArg
 	return s.processAppendEntries(req), nil
 }
 
-// processRequestVote evaluates an incoming RequestVote RPC.
+// IsLogUpToDate checks whether a candidate's log is at least as up-to-date as this receiver's log (§5.4).
+// Stub returning true for now; full comparison logic will be added in Day 17.
+func (s *Server) IsLogUpToDate(lastLogIndex uint64, lastLogTerm uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isLogUpToDateLocked(lastLogIndex, lastLogTerm)
+}
+
+// isLogUpToDateLocked checks log freshness with s.mu held (or within the single event loop).
+func (s *Server) isLogUpToDateLocked(lastLogIndex uint64, lastLogTerm uint64) bool {
+	if s.logUpToDateChecker != nil {
+		return s.logUpToDateChecker(lastLogIndex, lastLogTerm)
+	}
+	return s.isLogUpToDate(lastLogIndex, lastLogTerm)
+}
+
+func (s *Server) isLogUpToDate(lastLogIndex uint64, lastLogTerm uint64) bool {
+	// Stub: always returns true for now per Day 16 specification.
+	// Day 17 will implement §5.4 term and index comparison.
+	return true
+}
+
+// SetLogUpToDateChecker sets an optional hook for testing log up-to-date evaluations.
+func (s *Server) SetLogUpToDateChecker(fn func(lastLogIndex uint64, lastLogTerm uint64) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logUpToDateChecker = fn
+}
+
+// processRequestVote evaluates an incoming RequestVote RPC exactly per Raft paper Figure 2 rules 1-2.
 func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.RequestVoteReply {
 	s.GetLogger().Info("received RequestVote",
 		"candidate_id", req.CandidateId,
@@ -1089,11 +1121,13 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 	)
 
 	var currentTerm uint64
+	var votedFor raft.NodeID = -1
 	if s.PersistentState != nil {
 		currentTerm = uint64(s.PersistentState.CurrentTerm)
+		votedFor = s.PersistentState.VotedFor
 	}
 
-	// 1. Reply false if term < currentTerm (§5.1)
+	// Figure 2 RequestVote Rule 1: Reply false if term < currentTerm (§5.1)
 	if req.Term < currentTerm {
 		s.GetLogger().Warn("rejected RequestVote from candidate with stale term",
 			"candidate_id", req.CandidateId,
@@ -1106,23 +1140,49 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 		}
 	}
 
-	// If leader or candidate discovers a higher term, step down to follower (§5.1)
-	if (s.State == raft.Leader || s.State == raft.Candidate) && req.Term > currentTerm {
-		s.becomeFollowerLocked(raft.Term(req.Term))
-		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	// Rules for Servers (§5.1):
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1).
+	steppedDown := false
+	if req.Term > currentTerm {
+		oldRole := s.State
+		s.State = raft.Follower
+		s.stopHeartbeatTickerLocked()
+		s.votesReceived = make(map[raft.NodeID]bool)
+
+		if s.PersistentState != nil {
+			s.PersistentState.CurrentTerm = raft.Term(req.Term)
+			s.PersistentState.VotedFor = -1
+			currentTerm = uint64(s.PersistentState.CurrentTerm)
+			votedFor = -1
+		}
+		steppedDown = true
+
+		s.GetLogger().Info("transitioned to Follower on discovering higher term",
+			"node_id", int(s.ID),
+			"previous_state", oldRole.String(),
+			"term", currentTerm,
+		)
 	}
 
-	voteGranted := false
+	// Figure 2 RequestVote Rule 2:
+	// If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+	canVote := (votedFor == -1 || votedFor == raft.NodeID(req.CandidateId))
+	logOk := s.isLogUpToDateLocked(req.LastLogIndex, req.LastLogTerm)
 
-	// In Raft (§5.2, §5.4):
-	// If votedFor is null or candidateId, and candidate's log is at least as up-to-date as receiver's log, grant vote
-	if voteGranted {
+	voteGranted := false
+	if canVote && logOk {
+		voteGranted = true
 		if s.PersistentState != nil {
 			s.PersistentState.VotedFor = raft.NodeID(req.CandidateId)
-			_ = s.persistLocked()
 		}
+
+		// Persist state changes (currentTerm and votedFor)
+		_ = s.persistLocked()
+
+		// Reset election timer when granting vote (§5.2)
+		s.lastHeartbeat = time.Now()
 		if s.ElectionTimer != nil {
-			s.lastHeartbeat = time.Now()
 			newTimeout := s.ElectionTimer.Reset()
 			s.GetLogger().Info("reset election timer on granting vote",
 				"candidate_id", req.CandidateId,
@@ -1130,6 +1190,28 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 				"timeout_ms", newTimeout.Milliseconds(),
 			)
 		}
+
+		s.GetLogger().Info("granted vote to candidate",
+			"candidate_id", req.CandidateId,
+			"term", currentTerm,
+		)
+	} else {
+		// If stepped down due to higher term but vote was not granted, persist the higher term with votedFor = -1
+		if steppedDown {
+			_ = s.persistLocked()
+			s.lastHeartbeat = time.Now()
+			if s.ElectionTimer != nil {
+				s.ElectionTimer.Reset()
+			}
+		}
+
+		s.GetLogger().Info("denied vote to candidate",
+			"candidate_id", req.CandidateId,
+			"term", currentTerm,
+			"voted_for", int(votedFor),
+			"can_vote", canVote,
+			"log_ok", logOk,
+		)
 	}
 
 	return &raftpb.RequestVoteReply{
@@ -1138,7 +1220,7 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 	}
 }
 
-// processAppendEntries evaluates an incoming AppendEntries RPC.
+// processAppendEntries evaluates an incoming AppendEntries RPC exactly per Raft paper Figure 2 rules 1-2.
 func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.AppendEntriesReply {
 	s.GetLogger().Info("received AppendEntries",
 		"leader_id", req.LeaderId,
@@ -1154,7 +1236,7 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 		currentTerm = uint64(s.PersistentState.CurrentTerm)
 	}
 
-	// 1. Reply false if term < currentTerm (§5.1)
+	// Figure 2 AppendEntries Rule 1: Reply false if term < currentTerm (§5.1)
 	if req.Term < currentTerm {
 		s.GetLogger().Warn("rejected AppendEntries from stale leader",
 			"leader_id", req.LeaderId,
@@ -1167,13 +1249,19 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 		}
 	}
 
-	// 2. Valid heartbeat/RPC from current or new leader:
-	// If candidate receives AppendEntries from leader, revert to follower (§5.2)
-	// If leader receives AppendEntries from new leader with >= currentTerm, revert to follower (§5.1, §5.2)
-	if s.State == raft.Candidate || (s.State == raft.Leader && req.Term >= currentTerm) {
+	// Rules for Servers (§5.1):
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1).
+	if req.Term > currentTerm {
+		s.becomeFollowerLocked(raft.Term(req.Term))
+		if s.PersistentState != nil {
+			currentTerm = uint64(s.PersistentState.CurrentTerm)
+		}
+	} else if s.State == raft.Candidate {
+		// §5.2: If candidate receives AppendEntries from current leader (req.Term == currentTerm), revert to follower
 		s.becomeFollowerLocked(raft.Term(req.Term))
 	} else {
-		// 3. Reset election timer triggered by valid heartbeat/RPC received (§5.2)
+		// Valid heartbeat from current leader for follower/leader: reset election timer (§5.2)
 		s.lastHeartbeat = time.Now()
 		if s.ElectionTimer != nil {
 			newTimeout := s.ElectionTimer.Reset()
@@ -1185,15 +1273,25 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 		}
 	}
 
-	if s.PersistentState != nil {
-		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	// Figure 2 AppendEntries Rule 2:
+	// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	success := true
+	if req.PrevLogIndex > 0 {
+		var logLen uint64
+		if s.PersistentState != nil {
+			logLen = uint64(len(s.PersistentState.Log))
+		}
+		if req.PrevLogIndex > logLen {
+			success = false
+		} else if s.PersistentState.Log[req.PrevLogIndex-1].Term != raft.Term(req.PrevLogTerm) {
+			success = false
+		}
 	}
 
 	return &raftpb.AppendEntriesReply{
 		Term:    currentTerm,
-		Success: false, // Stub until log replication logic is added
+		Success: success,
 	}
-	
 }
 
 // becomeFollower transitions the node to the Follower role for the specified term.
