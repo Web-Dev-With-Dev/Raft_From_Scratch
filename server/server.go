@@ -913,11 +913,8 @@ func (s *Server) stopHeartbeatTickerLocked() {
 	}
 }
 
-// Stop immediately stops the gRPC server and closes the active listener.
+// Stop immediately stops the gRPC server, debug HTTP server, and main event loop.
 func (s *Server) Stop() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 	})
@@ -925,9 +922,12 @@ func (s *Server) Stop() {
 	if s.loopRunning.Load() {
 		select {
 		case <-s.loopDone:
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(1 * time.Second):
 		}
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
@@ -954,11 +954,8 @@ func (s *Server) Stop() {
 	}
 }
 
-// GracefulStop gracefully stops the gRPC server, waiting for pending RPCs to finish.
+// GracefulStop gracefully stops the gRPC server, debug HTTP server, and closes listeners.
 func (s *Server) GracefulStop() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 	})
@@ -966,9 +963,12 @@ func (s *Server) GracefulStop() {
 	if s.loopRunning.Load() {
 		select {
 		case <-s.loopDone:
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(1 * time.Second):
 		}
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
@@ -1536,7 +1536,11 @@ func (s *Server) run() {
 			reply := s.processRequestVote(ev.Args)
 			s.mu.Unlock()
 			if ev.ResCh != nil {
-				ev.ResCh <- reply
+				select {
+				case ev.ResCh <- reply:
+				case <-s.stopCh:
+					return
+				}
 			}
 
 		case ev := <-s.appendEntriesCh:
@@ -1544,7 +1548,11 @@ func (s *Server) run() {
 			reply := s.processAppendEntries(ev.Args)
 			s.mu.Unlock()
 			if ev.ResCh != nil {
-				ev.ResCh <- reply
+				select {
+				case ev.ResCh <- reply:
+				case <-s.stopCh:
+					return
+				}
 			}
 
 		case act := <-s.stateActionCh:
@@ -1552,7 +1560,11 @@ func (s *Server) run() {
 			act.fn()
 			s.mu.Unlock()
 			if act.resCh != nil {
-				act.resCh <- struct{}{}
+				select {
+				case act.resCh <- struct{}{}:
+				case <-s.stopCh:
+					return
+				}
 			}
 		}
 	}

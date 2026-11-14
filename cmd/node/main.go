@@ -62,9 +62,12 @@ func main() {
 		}
 	}
 
+	dialCtx, dialCancel := context.WithCancel(context.Background())
+	defer dialCancel()
+
 	// Concurrently dial peers with retry/backoff
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(dialCtx, 15*time.Second)
 		defer cancel()
 
 		policy := rpc.DefaultRetryPolicy()
@@ -82,7 +85,12 @@ func main() {
 		time.Sleep(150 * time.Millisecond) // brief pause to let all nodes finish mutual dials
 		srv.GetLogger().Info("starting peer RPC reachability verification", "peer_count", len(peers))
 		for _, peer := range peers {
-			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), srv.RPCTimeout())
+			select {
+			case <-dialCtx.Done():
+				return
+			default:
+			}
+			rpcCtx, rpcCancel := context.WithTimeout(dialCtx, srv.RPCTimeout())
 			reply, err := srv.SendRequestVote(rpcCtx, peer, &raft.RequestVoteArgs{
 				Term:         0,
 				CandidateID:  id,
@@ -108,6 +116,7 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	sig := <-sigCh
 
+	dialCancel()
 	srv.GetLogger().Info("received termination signal, shutting down", "signal", sig.String())
 	if err := srv.Close(); err != nil {
 		srv.GetLogger().Error("error closing server", "error", err)

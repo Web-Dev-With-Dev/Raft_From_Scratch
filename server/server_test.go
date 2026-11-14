@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -2260,6 +2261,74 @@ func TestServer_DebugHTTPServer_Lifecycle(t *testing.T) {
 		t.Fatalf("unexpected status values: %+v", status)
 	}
 }
+
+func TestServer_NoGoroutineLeak(t *testing.T) {
+	// Let any runtime background tasks settle
+	for i := 0; i < 5; i++ {
+		runtime.GC()
+		time.Sleep(20 * time.Millisecond)
+	}
+	baseline := runtime.NumGoroutine()
+
+	for iter := 0; iter < 3; iter++ {
+		srv := NewServer(1, []Peer{
+			{ID: 2, Address: "127.0.0.1:54321"},
+		}, &raft.PersistentState{
+			CurrentTerm: 0,
+			VotedFor:    -1,
+		}, rpc.NewClientPool())
+
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+
+		if err := srv.Serve(lis); err != nil {
+			t.Fatalf("failed to serve: %v", err)
+		}
+
+		httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen http: %v", err)
+		}
+		if err := srv.ServeHTTPDebug(httpLis); err != nil {
+			t.Fatalf("failed to start debug http: %v", err)
+		}
+
+		// exercise debug http
+		resp, err := http.Get("http://" + httpLis.Addr().String() + "/status")
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+
+		// exercise state mutation and election timer reset
+		srv.ResetElectionTimeout()
+		srv.SetState(raft.Follower)
+
+		// Close server
+		if err := srv.Close(); err != nil {
+			t.Fatalf("failed to close server: %v", err)
+		}
+	}
+
+	// Verify all goroutines terminate and return to baseline
+	var current int
+	settled := false
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		runtime.GC()
+		current = runtime.NumGoroutine()
+		if current <= baseline {
+			settled = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if !settled {
+		t.Fatalf("goroutine leak detected: baseline=%d, current=%d", baseline, current)
+	}
+}
+
 
 
 
