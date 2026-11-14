@@ -1109,8 +1109,22 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArg
 	return s.processAppendEntries(req), nil
 }
 
+// LastLogInfo returns the (index, term) of the receiver's last log entry.
+// If the log is empty or state is uninitialized, it returns (0, 0).
+func (s *Server) LastLogInfo() (raft.LogIndex, raft.Term) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastLogInfoLocked()
+}
+
+func (s *Server) lastLogInfoLocked() (raft.LogIndex, raft.Term) {
+	if s.PersistentState != nil {
+		return s.PersistentState.LastLogInfo()
+	}
+	return 0, 0
+}
+
 // IsLogUpToDate checks whether a candidate's log is at least as up-to-date as this receiver's log (§5.4).
-// Stub returning true for now; full comparison logic will be added in Day 17.
 func (s *Server) IsLogUpToDate(lastLogIndex uint64, lastLogTerm uint64) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1126,9 +1140,21 @@ func (s *Server) isLogUpToDateLocked(lastLogIndex uint64, lastLogTerm uint64) bo
 }
 
 func (s *Server) isLogUpToDate(lastLogIndex uint64, lastLogTerm uint64) bool {
-	// Stub: always returns true for now per Day 16 specification.
-	// Day 17 will implement §5.4 term and index comparison.
-	return true
+	myLastIndex, myLastTerm := s.lastLogInfoLocked()
+	upToDate := raft.IsLogUpToDate(
+		raft.LogIndex(lastLogIndex),
+		raft.Term(lastLogTerm),
+		myLastIndex,
+		myLastTerm,
+	)
+	s.GetLogger().Debug("evaluated candidate log up-to-date rule",
+		"candidate_last_index", lastLogIndex,
+		"candidate_last_term", lastLogTerm,
+		"receiver_last_index", uint64(myLastIndex),
+		"receiver_last_term", uint64(myLastTerm),
+		"up_to_date", upToDate,
+	)
+	return upToDate
 }
 
 // SetLogUpToDateChecker sets an optional hook for testing log up-to-date evaluations.
@@ -1498,10 +1524,7 @@ func (s *Server) becomeLeaderLocked() {
 		s.ElectionTimer.Stop()
 	}
 
-	var lastLogIndex raft.LogIndex = 0
-	if s.PersistentState != nil && len(s.PersistentState.Log) > 0 {
-		lastLogIndex = s.PersistentState.Log[len(s.PersistentState.Log)-1].Index
-	}
+	lastLogIndex, _ := s.lastLogInfoLocked()
 
 	s.VolatileStateLeader = &raft.VolatileStateLeader{
 		NextIndex:  make(map[raft.NodeID]raft.LogIndex),
@@ -1598,13 +1621,7 @@ func (s *Server) broadcastRequestVotesLocked() {
 	}
 
 	term := s.PersistentState.CurrentTerm
-	var lastLogIndex raft.LogIndex
-	var lastLogTerm raft.Term
-	if s.PersistentState != nil && len(s.PersistentState.Log) > 0 {
-		lastEntry := s.PersistentState.Log[len(s.PersistentState.Log)-1]
-		lastLogIndex = lastEntry.Index
-		lastLogTerm = lastEntry.Term
-	}
+	lastLogIndex, lastLogTerm := s.lastLogInfoLocked()
 
 	timeout := s.RPCTimeout()
 	id := s.ID
@@ -1658,15 +1675,9 @@ func (s *Server) broadcastRequestVotesLocked() {
 // SendRequestVotesParallel sends RequestVote RPCs in parallel to all provided peers using goroutines,
 // streaming results back onto the provided results channel.
 func (s *Server) SendRequestVotesParallel(ctx context.Context, term raft.Term, peers []Peer, resCh chan<- RequestVoteResult) {
-	var lastLogIndex raft.LogIndex
-	var lastLogTerm raft.Term
 	s.mu.RLock()
 	id := s.ID
-	if s.PersistentState != nil && len(s.PersistentState.Log) > 0 {
-		lastEntry := s.PersistentState.Log[len(s.PersistentState.Log)-1]
-		lastLogIndex = lastEntry.Index
-		lastLogTerm = lastEntry.Term
-	}
+	lastLogIndex, lastLogTerm := s.lastLogInfoLocked()
 	timeout := s.RPCTimeout()
 	s.mu.RUnlock()
 

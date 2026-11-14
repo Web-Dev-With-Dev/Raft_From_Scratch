@@ -30,6 +30,30 @@ type PersistentState struct {
 	Log         []LogEntry
 }
 
+// LastLogInfo returns the (index, term) of the last log entry in PersistentState.
+// Returns (0, 0) if the state is nil or the log contains no entries.
+func (p *PersistentState) LastLogInfo() (LogIndex, Term) {
+	if p == nil || len(p.Log) == 0 {
+		return 0, 0
+	}
+	last := p.Log[len(p.Log)-1]
+	return last.Index, last.Term
+}
+
+// IsLogUpToDate evaluates whether a candidate's log (with candidateLastIndex, candidateLastTerm)
+// is at least as up-to-date as the receiver's log (with receiverLastIndex, receiverLastTerm)
+// per Raft paper §5.4.1 (Election restriction):
+//
+// "If the logs have last entries with different terms, then the log with the later term
+// is more up-to-date. If the logs end with the same term, then whichever log is longer
+// is more up-to-date."
+func IsLogUpToDate(candidateLastIndex LogIndex, candidateLastTerm Term, receiverLastIndex LogIndex, receiverLastTerm Term) bool {
+	if candidateLastTerm != receiverLastTerm {
+		return candidateLastTerm > receiverLastTerm
+	}
+	return candidateLastIndex >= receiverLastIndex
+}
+
 type VolatileState struct {
 	CommitIndex LogIndex `json:"commit_index"`
 	LastApplied LogIndex `json:"last_applied"`

@@ -1401,13 +1401,13 @@ func TestLeaderHeartbeatTicker_StopsCleanlyOnStepDown(t *testing.T) {
 
 	// Wait for heartbeats to tick
 	time.Sleep(50 * time.Millisecond)
-	countAtStepDown := srv.HeartbeatsSent()
-	if countAtStepDown == 0 {
+	if srv.HeartbeatsSent() == 0 {
 		t.Fatalf("expected heartbeats to have fired while leader")
 	}
 
 	// 2. Step down to follower
 	srv.becomeFollower(3)
+	countAtStepDown := srv.HeartbeatsSent()
 
 	// Verify ticker is stopped and nil
 	if ticker := srv.GetHeartbeatTicker(); ticker != nil {
@@ -2554,14 +2554,274 @@ func TestRequestVote_Figure2_Rule2_RejectWhenLogNotUpToDate(t *testing.T) {
 	}
 }
 
-func TestRequestVote_IsLogUpToDate_StubReturnsTrueByDefault(t *testing.T) {
-	srv := NewServer(1, nil, nil, nil)
+func TestServer_LastLogInfo(t *testing.T) {
+	// Empty log should return (0, 0)
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 1,
+		VotedFor:    -1,
+		Log:         []raft.LogEntry{},
+	}, nil)
 	defer srv.Close()
 
-	// Verify default stub returns true
-	if !srv.IsLogUpToDate(100, 5) {
-		t.Fatalf("expected default IsLogUpToDate stub to return true")
+	lastIndex, lastTerm := srv.LastLogInfo()
+	if lastIndex != 0 || lastTerm != 0 {
+		t.Fatalf("expected (0, 0) for empty server log, got (%d, %d)", lastIndex, lastTerm)
 	}
+
+	// Populated log should return last entry's (Index, Term)
+	srv.PersistentState.Log = []raft.LogEntry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 2},
+	}
+	lastIndex, lastTerm = srv.LastLogInfo()
+	if lastIndex != 3 || lastTerm != 2 {
+		t.Fatalf("expected (3, 2) for populated server log, got (%d, %d)", lastIndex, lastTerm)
+	}
+}
+
+func TestRequestVote_Figure2_Rule2_LogUpToDate_TableDriven(t *testing.T) {
+	// Raft paper §5.4.1:
+	// "If the logs have last entries with different terms, then the log with the later term is more up-to-date.
+	//  If the logs end with the same term, then whichever log is longer is more up-to-date."
+	//
+	// Receiver log baseline: 3 entries ending at Index: 3, Term: 2.
+	receiverLog := []raft.LogEntry{
+		{Index: 1, Term: 1, Command: "x<-1"},
+		{Index: 2, Term: 1, Command: "x<-2"},
+		{Index: 3, Term: 2, Command: "x<-3"},
+	}
+
+	tests := []struct {
+		name          string
+		candLastIndex uint64
+		candLastTerm  uint64
+		wantGranted   bool
+		paperCase     string
+	}{
+		// Case 1: Candidate last log term > Receiver last log term -> Grant
+		{
+			name:          "Case 1a: Higher term with shorter log",
+			candLastIndex: 1,
+			candLastTerm:  3,
+			wantGranted:   true,
+			paperCase:     "Case 1: candidateLastLogTerm > receiverLastLogTerm",
+		},
+		{
+			name:          "Case 1b: Higher term with longer log",
+			candLastIndex: 5,
+			candLastTerm:  3,
+			wantGranted:   true,
+			paperCase:     "Case 1: candidateLastLogTerm > receiverLastLogTerm",
+		},
+
+		// Case 2: Candidate last log term < Receiver last log term -> Deny
+		{
+			name:          "Case 2a: Lower term with longer log",
+			candLastIndex: 10,
+			candLastTerm:  1,
+			wantGranted:   false,
+			paperCase:     "Case 2: candidateLastLogTerm < receiverLastLogTerm",
+		},
+		{
+			name:          "Case 2b: Lower term with shorter log",
+			candLastIndex: 2,
+			candLastTerm:  1,
+			wantGranted:   false,
+			paperCase:     "Case 2: candidateLastLogTerm < receiverLastLogTerm",
+		},
+
+		// Case 3: Candidate last log term == Receiver last log term AND candidateLastIndex >= receiverLastIndex -> Grant
+		{
+			name:          "Case 3a: Same term with strictly longer log",
+			candLastIndex: 4,
+			candLastTerm:  2,
+			wantGranted:   true,
+			paperCase:     "Case 3: candidateLastLogTerm == receiverLastLogTerm && candidateLastIndex >= receiverLastIndex",
+		},
+		{
+			name:          "Case 3b: Same term with equal log length",
+			candLastIndex: 3,
+			candLastTerm:  2,
+			wantGranted:   true,
+			paperCase:     "Case 3: candidateLastLogTerm == receiverLastLogTerm && candidateLastIndex >= receiverLastIndex",
+		},
+
+		// Case 4: Candidate last log term == Receiver last log term AND candidateLastIndex < receiverLastIndex -> Deny
+		{
+			name:          "Case 4a: Same term with strictly shorter log",
+			candLastIndex: 2,
+			candLastTerm:  2,
+			wantGranted:   false,
+			paperCase:     "Case 4: candidateLastLogTerm == receiverLastLogTerm && candidateLastIndex < receiverLastIndex",
+		},
+		{
+			name:          "Case 4b: Same term with zero index",
+			candLastIndex: 0,
+			candLastTerm:  2,
+			wantGranted:   false,
+			paperCase:     "Case 4: candidateLastLogTerm == receiverLastLogTerm && candidateLastIndex < receiverLastIndex",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := store.NewMemoryStorage()
+			srv := NewServer(1, nil, &raft.PersistentState{
+				CurrentTerm: 5,
+				VotedFor:    -1,
+				Log:         append([]raft.LogEntry(nil), receiverLog...),
+			}, nil)
+			srv.SetStorage(storage)
+			defer srv.Close()
+
+			// Test Server.IsLogUpToDate direct method
+			isUpToDate := srv.IsLogUpToDate(tc.candLastIndex, tc.candLastTerm)
+			if isUpToDate != tc.wantGranted {
+				t.Fatalf("[%s] IsLogUpToDate(%d, %d) = %v; want %v",
+					tc.paperCase, tc.candLastIndex, tc.candLastTerm, isUpToDate, tc.wantGranted)
+			}
+
+			// Test processRequestVote RPC handler with real check
+			reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+				Term:         5,
+				CandidateId:  2,
+				LastLogIndex: tc.candLastIndex,
+				LastLogTerm:  tc.candLastTerm,
+			})
+
+			if reply.VoteGranted != tc.wantGranted {
+				t.Fatalf("[%s] processRequestVote: VoteGranted = %v; want %v",
+					tc.paperCase, reply.VoteGranted, tc.wantGranted)
+			}
+
+			if tc.wantGranted {
+				if srv.PersistentState.VotedFor != 2 {
+					t.Fatalf("expected votedFor=2 on granted vote, got %d", srv.PersistentState.VotedFor)
+				}
+				// Verify persistence
+				stored, err := storage.Load()
+				if err != nil || stored.VotedFor != 2 {
+					t.Fatalf("expected persisted votedFor=2, got err=%v, votedFor=%v", err, stored.VotedFor)
+				}
+			} else {
+				if srv.PersistentState.VotedFor != -1 {
+					t.Fatalf("expected votedFor=-1 on denied vote, got %d", srv.PersistentState.VotedFor)
+				}
+			}
+		})
+	}
+}
+
+func TestRequestVote_Figure2_HigherTermWithStaleLog_StepsDownButDeniesVote(t *testing.T) {
+	// If candidate has higher term (T > currentTerm), receiver steps down to Follower with term T.
+	// However, if candidate's log is stale, the receiver must deny the vote and persist votedFor = -1.
+	storage := store.NewMemoryStorage()
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 5,
+		VotedFor:    -1,
+		Log: []raft.LogEntry{
+			{Index: 1, Term: 1},
+			{Index: 2, Term: 3},
+			{Index: 3, Term: 3},
+		},
+	}, nil)
+	srv.SetStorage(storage)
+	defer srv.Close()
+
+	// Candidate has term 6 (higher than 5), but lastLogTerm 2 < 3 (Case 2: stale log)
+	reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+		Term:         6,
+		CandidateId:  2,
+		LastLogIndex: 10,
+		LastLogTerm:  2,
+	})
+
+	if reply.VoteGranted {
+		t.Fatalf("vote must be denied when candidate log is stale even with higher term")
+	}
+	if reply.Term != 6 {
+		t.Fatalf("reply term must be updated term 6, got %d", reply.Term)
+	}
+	if srv.PersistentState.CurrentTerm != 6 {
+		t.Fatalf("server currentTerm must update to 6, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != -1 {
+		t.Fatalf("votedFor must remain -1 when vote is denied despite term step-down, got %d", srv.PersistentState.VotedFor)
+	}
+
+	// Verify atomic persistence of term update with unvoted state
+	stored, err := storage.Load()
+	if err != nil {
+		t.Fatalf("failed to load state from storage: %v", err)
+	}
+	if stored.CurrentTerm != 6 || stored.VotedFor != -1 {
+		t.Fatalf("expected persisted state term=6, votedFor=-1; got term=%d, votedFor=%d", stored.CurrentTerm, stored.VotedFor)
+	}
+}
+
+func TestRequestVote_Figure2_EmptyLogComparisons(t *testing.T) {
+	// Subtest 1: Both receiver and candidate have empty logs -> vote granted (Case 3)
+	t.Run("BothLogsEmpty_GrantsVote", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 1,
+			VotedFor:    -1,
+			Log:         nil,
+		}, nil)
+		defer srv.Close()
+
+		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+			Term:         1,
+			CandidateId:  2,
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		})
+		if !reply.VoteGranted {
+			t.Fatalf("expected vote granted when both logs are empty")
+		}
+	})
+
+	// Subtest 2: Receiver has empty log, candidate has entries -> vote granted (Case 1)
+	t.Run("ReceiverEmpty_CandidatePopulated_GrantsVote", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 1,
+			VotedFor:    -1,
+			Log:         nil,
+		}, nil)
+		defer srv.Close()
+
+		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+			Term:         1,
+			CandidateId:  2,
+			LastLogIndex: 2,
+			LastLogTerm:  1,
+		})
+		if !reply.VoteGranted {
+			t.Fatalf("expected vote granted when receiver log is empty and candidate has entries")
+		}
+	})
+
+	// Subtest 3: Receiver has entries, candidate has empty log -> vote denied (Case 2)
+	t.Run("ReceiverPopulated_CandidateEmpty_DeniesVote", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 1,
+			VotedFor:    -1,
+			Log: []raft.LogEntry{
+				{Index: 1, Term: 1},
+			},
+		}, nil)
+		defer srv.Close()
+
+		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+			Term:         1,
+			CandidateId:  2,
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		})
+		if reply.VoteGranted {
+			t.Fatalf("expected vote denied when receiver has entries and candidate has empty log")
+		}
+	})
 }
 
 func TestAppendEntries_Figure2_Rule1_RejectStaleTerm(t *testing.T) {
