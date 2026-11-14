@@ -3780,6 +3780,337 @@ func TestCluster_LeaderSuppressesFollowerElectionsWhileHealthy(t *testing.T) {
 	}
 }
 
+func TestNode_Kill_And_PauseResume(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{CurrentTerm: 1, VotedFor: -1}, nil)
+	if err := srv.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer srv.Close()
+
+	srv.StartEventLoop()
+
+	if srv.IsKilled() {
+		t.Fatalf("expected node not killed initially")
+	}
+	if srv.IsPaused() {
+		t.Fatalf("expected node not paused initially")
+	}
+
+	// Test Pause
+	srv.Pause()
+	if !srv.IsPaused() {
+		t.Fatalf("expected node to report IsPaused() == true")
+	}
+
+	// Double pause is an idempotent no-op
+	srv.Pause()
+	if !srv.IsPaused() {
+		t.Fatalf("expected node to still report IsPaused() == true")
+	}
+
+	// Test Resume
+	srv.Resume()
+	if srv.IsPaused() {
+		t.Fatalf("expected node to report IsPaused() == false after Resume()")
+	}
+
+	// Double resume is an idempotent no-op
+	srv.Resume()
+	if srv.IsPaused() {
+		t.Fatalf("expected node to still report IsPaused() == false")
+	}
+
+	// Test Kill
+	srv.Kill()
+	if !srv.IsKilled() {
+		t.Fatalf("expected node to report IsKilled() == true after Kill()")
+	}
+}
+
+func TestCluster_KillLeader_RemainingNodesElectNewLeader(t *testing.T) {
+	// Raft §5.2: Leader failure and re-election.
+	// 1. Setup a 3-node live cluster with full mesh connectivity and active event loops.
+	// 2. Elect Node 1 as the initial leader in Term 1.
+	// 3. Abruptly kill the leader process mid-test (simulating crash).
+	// 4. Remaining followers detect leader silence via election timeout and elect a single new leader.
+	// 5. Measure and log time-to-new-leader (should be roughly 1-3x election timeout).
+
+	minTimeout := 120 * time.Millisecond
+	maxTimeout := 240 * time.Millisecond
+	heartbeatInterval := 25 * time.Millisecond
+
+	servers := make([]*Server, 3)
+	for i := 0; i < 3; i++ {
+		id := raft.NodeID(i + 1)
+		srv := NewServer(id, nil, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
+		srv.SetHeartbeatInterval(heartbeatInterval)
+		srv.SetRPCTimeout(60 * time.Millisecond)
+		if srv.GetElectionTimer() != nil {
+			srv.GetElectionTimer().SetRange(minTimeout, maxTimeout)
+			srv.ResetElectionTimeout()
+		}
+		if err := srv.Start("127.0.0.1:0"); err != nil {
+			t.Fatalf("failed to start server %d: %v", id, err)
+		}
+		defer srv.Close()
+		servers[i] = srv
+	}
+
+	// Full mesh peer setup
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 3; j++ {
+			if i != j {
+				servers[i].AddPeer(Peer{
+					ID:      servers[j].ID,
+					Address: servers[j].Addr().String(),
+				})
+			}
+		}
+	}
+
+	for _, srv := range servers {
+		if err := srv.ConnectPeers(); err != nil {
+			t.Fatalf("node %d failed to connect peers: %v", srv.ID, err)
+		}
+	}
+
+	// Start event loops on all servers
+	for _, srv := range servers {
+		srv.StartEventLoop()
+	}
+
+	leaderNode := servers[0]
+
+	// Trigger election on Node 1 to establish initial leadership
+	leaderNode.StartElection()
+
+	// Wait for Node 1 to become leader
+	electionDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(electionDeadline) {
+		if leaderNode.GetState() == raft.Leader {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if leaderNode.GetState() != raft.Leader {
+		t.Fatalf("expected Node 1 to become initial Leader, got %s", leaderNode.GetState())
+	}
+	initialTerm := leaderNode.Status().Term
+	if initialTerm < 1 {
+		t.Fatalf("expected initial leader term >= 1, got %d", initialTerm)
+	}
+
+	// Allow heartbeats to stabilize leadership across followers
+	time.Sleep(80 * time.Millisecond)
+
+	// Verify both followers are in Follower state
+	if servers[1].GetState() != raft.Follower {
+		t.Fatalf("expected node 2 to be Follower, got %s", servers[1].GetState())
+	}
+	if servers[2].GetState() != raft.Follower {
+		t.Fatalf("expected node 3 to be Follower, got %s", servers[2].GetState())
+	}
+
+	// 3. Kill the current leader process abruptly mid-test
+	killTime := time.Now()
+	leaderNode.Kill()
+
+	if !leaderNode.IsKilled() {
+		t.Fatalf("expected leaderNode.IsKilled() == true after Kill()")
+	}
+
+	// 4. Poll remaining nodes (servers[1] and servers[2]) for new leader election
+	reElectionDeadline := time.Now().Add(3 * time.Second)
+	var newLeader *Server
+	for time.Now().Before(reElectionDeadline) {
+		if servers[1].GetState() == raft.Leader {
+			newLeader = servers[1]
+			break
+		}
+		if servers[2].GetState() == raft.Leader {
+			newLeader = servers[2]
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	timeToNewLeader := time.Since(killTime)
+
+	if newLeader == nil {
+		t.Fatalf("remaining nodes failed to elect a new leader within %v (node2 state: %s, node3 state: %s)",
+			time.Since(killTime), servers[1].GetState(), servers[2].GetState())
+	}
+
+	newTerm := newLeader.Status().Term
+
+	// 5. Measure and log time-to-new-leader
+	t.Logf("================================================================================")
+	t.Logf("ELECTION FAILOVER MEASUREMENT:")
+	t.Logf("Leader Node %d killed at: %v", leaderNode.ID, killTime.Format("15:04:05.000"))
+	t.Logf("New Leader elected: Node %d at term %d", newLeader.ID, newTerm)
+	t.Logf("Time to elect new leader: %v (%.2f ms)", timeToNewLeader, float64(timeToNewLeader.Microseconds())/1000.0)
+	t.Logf("Configured Election Timeout Range: [%v, %v]", minTimeout, maxTimeout)
+	t.Logf("Configured Heartbeat Interval: %v", heartbeatInterval)
+	t.Logf("Ratio to Min Election Timeout: %.2fx", float64(timeToNewLeader)/float64(minTimeout))
+	t.Logf("Ratio to Max Election Timeout: %.2fx", float64(timeToNewLeader)/float64(maxTimeout))
+	t.Logf("================================================================================")
+
+	// Assertions
+	if newLeader.ID == leaderNode.ID {
+		t.Fatalf("new leader cannot be the killed node")
+	}
+	if newTerm <= initialTerm {
+		t.Fatalf("expected new leader term > %d, got %d", initialTerm, newTerm)
+	}
+
+	// Wait briefly for new leader's heartbeats to suppress the other follower
+	time.Sleep(60 * time.Millisecond)
+
+	var otherNode *Server
+	if newLeader.ID == servers[1].ID {
+		otherNode = servers[2]
+	} else {
+		otherNode = servers[1]
+	}
+
+	if otherNode.GetState() != raft.Follower {
+		t.Fatalf("expected remaining node %d to be Follower, got %s", otherNode.ID, otherNode.GetState())
+	}
+
+	// Verify time-to-new-leader bounds (~1-3x election timeout)
+	if timeToNewLeader < minTimeout/2 {
+		t.Fatalf("time-to-new-leader %v unexpectedly faster than minTimeout/2 (%v)", timeToNewLeader, minTimeout/2)
+	}
+	maxAllowed := 3*maxTimeout + 500*time.Millisecond
+	if timeToNewLeader > maxAllowed {
+		t.Fatalf("time-to-new-leader %v exceeded upper bound %v (~3x timeout)", timeToNewLeader, maxAllowed)
+	}
+}
+
+func TestCluster_PauseLeader_RemainingNodesElectNewLeader(t *testing.T) {
+	// Raft §5.2: Mid-test goroutine pause (simulating SIGSTOP / freeze).
+	// 1. Setup a 3-node live cluster with full mesh connectivity and active event loops.
+	// 2. Elect Node 1 as initial leader.
+	// 3. Pause Node 1's event loop mid-test.
+	// 4. Verify remaining nodes detect timeout and elect a new leader.
+	// 5. Resume Node 1; verify Node 1 steps down to Follower upon seeing the higher term.
+
+	minTimeout := 120 * time.Millisecond
+	maxTimeout := 240 * time.Millisecond
+	heartbeatInterval := 25 * time.Millisecond
+
+	servers := make([]*Server, 3)
+	for i := 0; i < 3; i++ {
+		id := raft.NodeID(i + 1)
+		srv := NewServer(id, nil, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
+		srv.SetHeartbeatInterval(heartbeatInterval)
+		srv.SetRPCTimeout(60 * time.Millisecond)
+		if srv.GetElectionTimer() != nil {
+			srv.GetElectionTimer().SetRange(minTimeout, maxTimeout)
+			srv.ResetElectionTimeout()
+		}
+		if err := srv.Start("127.0.0.1:0"); err != nil {
+			t.Fatalf("failed to start server %d: %v", id, err)
+		}
+		defer srv.Close()
+		servers[i] = srv
+	}
+
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 3; j++ {
+			if i != j {
+				servers[i].AddPeer(Peer{
+					ID:      servers[j].ID,
+					Address: servers[j].Addr().String(),
+				})
+			}
+		}
+	}
+
+	for _, srv := range servers {
+		if err := srv.ConnectPeers(); err != nil {
+			t.Fatalf("node %d failed to connect peers: %v", srv.ID, err)
+		}
+	}
+
+	for _, srv := range servers {
+		srv.StartEventLoop()
+	}
+
+	leaderNode := servers[0]
+	leaderNode.StartElection()
+
+	electionDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(electionDeadline) {
+		if leaderNode.GetState() == raft.Leader {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if leaderNode.GetState() != raft.Leader {
+		t.Fatalf("expected Node 1 to become initial Leader, got %s", leaderNode.GetState())
+	}
+	initialTerm := leaderNode.Status().Term
+
+	time.Sleep(80 * time.Millisecond)
+
+	// Pause leader goroutine
+	pauseTime := time.Now()
+	leaderNode.Pause()
+	if !leaderNode.IsPaused() {
+		t.Fatalf("expected leaderNode.IsPaused() == true")
+	}
+
+	// Poll remaining nodes for new leader
+	reElectionDeadline := time.Now().Add(3 * time.Second)
+	var newLeader *Server
+	for time.Now().Before(reElectionDeadline) {
+		if servers[1].GetState() == raft.Leader {
+			newLeader = servers[1]
+			break
+		}
+		if servers[2].GetState() == raft.Leader {
+			newLeader = servers[2]
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	timeToNewLeader := time.Since(pauseTime)
+
+	if newLeader == nil {
+		t.Fatalf("remaining nodes failed to elect new leader while leader was paused")
+	}
+
+	t.Logf("Leader paused: new leader %d elected in %v (term %d > initial %d)",
+		newLeader.ID, timeToNewLeader, newLeader.Status().Term, initialTerm)
+
+	if newLeader.Status().Term <= initialTerm {
+		t.Fatalf("expected new leader term > %d, got %d", initialTerm, newLeader.Status().Term)
+	}
+
+	// Resume old leader
+	leaderNode.Resume()
+	if leaderNode.IsPaused() {
+		t.Fatalf("expected leaderNode.IsPaused() == false after Resume()")
+	}
+
+	// Wait for new leader's heartbeat to reach resumed Node 1
+	stepDownDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(stepDownDeadline) {
+		if leaderNode.GetState() == raft.Follower {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if leaderNode.GetState() != raft.Follower {
+		t.Fatalf("expected resumed old leader to step down to Follower on seeing higher term, got %s", leaderNode.GetState())
+	}
+}
+
 
 
 

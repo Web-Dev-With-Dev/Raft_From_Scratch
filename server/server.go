@@ -162,6 +162,12 @@ type Server struct {
 
 	// heartbeatsReceived counts the total number of valid heartbeats received by this node.
 	heartbeatsReceived uint64
+
+	// pause controls for mid-test process / goroutine pausing
+	paused        atomic.Bool
+	resumeCh      chan struct{}
+	pauseNotifyCh chan struct{}
+	pauseMu       sync.Mutex
 }
 
 // NewServer creates and initializes a new Raft Server.
@@ -195,6 +201,7 @@ func NewServer(
 	heartbeatResultCh := make(chan HeartbeatResult, 64)
 	stateActionCh := make(chan stateAction, 64)
 	loopDone := make(chan struct{})
+	pauseNotifyCh := make(chan struct{}, 1)
 
 	memStorage := store.NewMemoryStorage()
 	if persistentState != nil {
@@ -221,6 +228,7 @@ func NewServer(
 		heartbeatResultCh: heartbeatResultCh,
 		stateActionCh:     stateActionCh,
 		loopDone:          loopDone,
+		pauseNotifyCh:     pauseNotifyCh,
 	}
 }
 
@@ -1050,6 +1058,64 @@ func (s *Server) GracefulStop() {
 		_ = s.httpListener.Close()
 		s.httpListener = nil
 	}
+}
+
+// Kill simulates a hard crash of the node process mid-test.
+// It abruptly closes the server, terminates its listeners and event loop,
+// and shuts down client connections without graceful cleanup.
+func (s *Server) Kill() {
+	s.GetLogger().Info("killed node process mid-test (simulating crash)", "node_id", int(s.ID))
+	_ = s.Close()
+}
+
+// IsKilled reports whether the node has been killed or stopped.
+func (s *Server) IsKilled() bool {
+	select {
+	case <-s.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// Pause pauses the node's event loop and message processing, simulating a process freeze,
+// SIGSTOP, or long GC pause mid-test.
+func (s *Server) Pause() {
+	s.pauseMu.Lock()
+	defer s.pauseMu.Unlock()
+	if s.paused.Load() {
+		return
+	}
+	s.resumeCh = make(chan struct{})
+	s.paused.Store(true)
+
+	// Wake up event loop if blocked in select so it enters paused state immediately
+	select {
+	case s.pauseNotifyCh <- struct{}{}:
+	default:
+	}
+
+	s.GetLogger().Info("paused node event loop mid-test", "node_id", int(s.ID))
+}
+
+// Resume resumes a previously paused node's event loop and message processing.
+func (s *Server) Resume() {
+	s.pauseMu.Lock()
+	defer s.pauseMu.Unlock()
+	if !s.paused.Load() {
+		return
+	}
+	s.paused.Store(false)
+	if s.resumeCh != nil {
+		close(s.resumeCh)
+	}
+
+	s.GetLogger().Info("resumed node event loop mid-test", "node_id", int(s.ID))
+}
+
+// IsPaused returns true if the node is currently paused.
+func (s *Server) IsPaused() bool {
+	return s.paused.Load()
 }
 
 // Addr returns the network address the gRPC server is listening on, or nil if not running.
@@ -2088,6 +2154,19 @@ func (s *Server) run() {
 	}()
 
 	for {
+		if s.paused.Load() {
+			s.pauseMu.Lock()
+			rCh := s.resumeCh
+			s.pauseMu.Unlock()
+			if rCh != nil {
+				select {
+				case <-rCh:
+				case <-s.stopCh:
+					return
+				}
+			}
+		}
+
 		var timerCh <-chan time.Time
 		if s.State != raft.Leader && s.ElectionTimer != nil {
 			timerCh = s.ElectionTimer.C()
@@ -2105,6 +2184,9 @@ func (s *Server) run() {
 		select {
 		case <-s.stopCh:
 			return
+
+		case <-s.pauseNotifyCh:
+			continue
 
 		case t, ok := <-timerCh:
 			if !ok {
