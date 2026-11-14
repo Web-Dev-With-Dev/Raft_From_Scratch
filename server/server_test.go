@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1342,6 +1343,7 @@ func TestLeaderHeartbeat_LogsWouldSendHeartbeatToPeer(t *testing.T) {
 	nodeID := raft.NodeID(1)
 
 	testLogger := NewNodeLogger(nodeID, buf, &LogOptions{
+		Level:       slog.LevelDebug,
 		DisableTime: true,
 	})
 

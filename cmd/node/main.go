@@ -4,12 +4,15 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"raft/config"
+	"raft/logger"
 	"raft/raft"
 	"raft/rpc"
 	"raft/server"
@@ -19,9 +22,26 @@ func main() {
 	nodeIDFlag := flag.Int("id", 1, "Node ID for this Raft instance (e.g. 1, 2, 3)")
 	configPathFlag := flag.String("config", "cluster.json", "Path to cluster configuration JSON file")
 	statusAddrFlag := flag.String("status-addr", "", "Optional HTTP address for debug /status endpoint (e.g. 127.0.0.1:9001)")
+	logLevelFlag := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	flag.Parse()
 
 	id := raft.NodeID(*nodeIDFlag)
+
+	var level slog.Level
+	switch strings.ToLower(*logLevelFlag) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	nodeLogger := logger.NewNodeLogger(id, os.Stderr, &logger.Options{
+		Level: level,
+	})
 
 	// Load cluster configuration
 	cfg, err := config.LoadClusterConfig(*configPathFlag)
@@ -42,6 +62,7 @@ func main() {
 
 	// Initialize the server
 	srv := server.NewServer(id, peers, nil, nil)
+	srv.SetLogger(nodeLogger)
 
 	// Start listening and serving gRPC
 	if err := srv.Start(nodeCfg.Address); err != nil {

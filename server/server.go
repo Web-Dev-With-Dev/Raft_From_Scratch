@@ -566,7 +566,7 @@ func (s *Server) ResetElectionTimeout() time.Duration {
 			fn: func() {
 				if s.ElectionTimer != nil {
 					d := s.ElectionTimer.Reset()
-					s.GetLogger().Info("reset election timeout", "timeout_ms", d.Milliseconds())
+					s.GetLogger().Debug("reset election timeout", "timeout_ms", d.Milliseconds())
 					resCh <- d
 				} else {
 					resCh <- 0
@@ -590,7 +590,7 @@ func (s *Server) ResetElectionTimeout() time.Duration {
 		return 0
 	}
 	d := s.ElectionTimer.Reset()
-	s.GetLogger().Info("reset election timeout", "timeout_ms", d.Milliseconds())
+	s.GetLogger().Debug("reset election timeout", "timeout_ms", d.Milliseconds())
 	return d
 }
 
@@ -651,7 +651,7 @@ func (s *Server) HandleHeartbeat(leaderID raft.NodeID, term raft.Term) (bool, ti
 	var newTimeout time.Duration
 	if s.ElectionTimer != nil {
 		newTimeout = s.ElectionTimer.Reset()
-		s.GetLogger().Info("reset election timer on valid heartbeat",
+		s.GetLogger().Debug("reset election timer on valid heartbeat",
 			"leader_id", int(leaderID),
 			"term", uint64(term),
 			"timeout_ms", newTimeout.Milliseconds(),
@@ -1300,7 +1300,7 @@ func (s *Server) resetElectionTimerOnGrantingVoteLocked(candidateID int64, term 
 
 // processRequestVote evaluates an incoming RequestVote RPC exactly per Raft paper Figure 2 rules 1-2.
 func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.RequestVoteReply {
-	s.GetLogger().Info("received RequestVote",
+	s.GetLogger().Debug("received RequestVote",
 		"candidate_id", req.CandidateId,
 		"term", req.Term,
 		"last_log_index", req.LastLogIndex,
@@ -1414,7 +1414,7 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 
 // processAppendEntries evaluates an incoming AppendEntries RPC exactly per Raft paper Figure 2 rules 1-2.
 func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.AppendEntriesReply {
-	s.GetLogger().Info("received AppendEntries",
+	s.GetLogger().Debug("received AppendEntries",
 		"leader_id", req.LeaderId,
 		"term", req.Term,
 		"prev_log_index", req.PrevLogIndex,
@@ -1457,7 +1457,7 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 		s.lastHeartbeat = time.Now()
 		if s.ElectionTimer != nil {
 			newTimeout := s.ElectionTimer.Reset()
-			s.GetLogger().Info("reset election timer on valid heartbeat/AppendEntries",
+			s.GetLogger().Debug("reset election timer on valid heartbeat/AppendEntries",
 				"leader_id", req.LeaderId,
 				"term", req.Term,
 				"timeout_ms", newTimeout.Milliseconds(),
@@ -2021,7 +2021,7 @@ func (s *Server) handleHeartbeatTick() {
 	if s.PersistentState != nil {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
 	}
-	s.GetLogger().Info("leader heartbeat ticker fired (will call AppendEntries)",
+	s.GetLogger().Debug("leader heartbeat ticker fired (will call AppendEntries)",
 		"node_id", int(s.ID),
 		"term", curTerm,
 		"peers_count", len(s.Peers),
@@ -2060,7 +2060,7 @@ func (s *Server) broadcastHeartbeats() {
 		if peer.ID == id {
 			continue
 		}
-		s.GetLogger().Info(fmt.Sprintf("would send heartbeat to peer %d", peer.ID),
+		s.GetLogger().Debug(fmt.Sprintf("would send heartbeat to peer %d", peer.ID),
 			"leader_id", int(id),
 			"peer_id", int(peer.ID),
 			"peer_addr", peer.Address,
@@ -2294,7 +2294,7 @@ func (s *Server) SendRequestVote(ctx context.Context, peer Peer, args *raft.Requ
 		}
 	}
 
-	s.GetLogger().Info("sending RequestVote", "peer_id", int(peer.ID), "term", uint64(args.Term))
+	s.GetLogger().Debug("sending RequestVote", "peer_id", int(peer.ID), "term", uint64(args.Term))
 	reply, err := s.RPCClientPool.SendRequestVote(ctx, peer, args)
 	if err != nil {
 		s.GetLogger().Warn("failed to send RequestVote", "peer_id", int(peer.ID), "error", err, "is_timeout", rpc.IsTimeout(err))
@@ -2314,7 +2314,7 @@ func (s *Server) SendAppendEntries(ctx context.Context, peer Peer, args *raft.Ap
 		}
 	}
 
-	s.GetLogger().Info("sending AppendEntries", "peer_id", int(peer.ID), "term", uint64(args.Term), "entries_count", len(args.Entries))
+	s.GetLogger().Debug("sending AppendEntries", "peer_id", int(peer.ID), "term", uint64(args.Term), "entries_count", len(args.Entries))
 	reply, err := s.RPCClientPool.SendAppendEntries(ctx, peer, args)
 	if err != nil {
 		s.GetLogger().Warn("failed to send AppendEntries", "peer_id", int(peer.ID), "error", err, "is_timeout", rpc.IsTimeout(err))
