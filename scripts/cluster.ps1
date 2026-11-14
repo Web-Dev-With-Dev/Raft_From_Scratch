@@ -48,15 +48,15 @@ function Start-Cluster {
     Write-Host "----------------------------------------------------------------------"
 
     $nodes = @(
-        @{ ID = 1; Name = "Node 1" },
-        @{ ID = 2; Name = "Node 2" },
-        @{ ID = 3; Name = "Node 3" }
+        @{ ID = 1; Name = "Node 1"; StatusAddr = "127.0.0.1:9001" },
+        @{ ID = 2; Name = "Node 2"; StatusAddr = "127.0.0.1:9002" },
+        @{ ID = 3; Name = "Node 3"; StatusAddr = "127.0.0.1:9003" }
     )
 
     $processes = @()
     try {
         foreach ($node in $nodes) {
-            $p = Start-Process -FilePath $NodeExe -ArgumentList "-id $($node.ID) -config $Config" -NoNewWindow -PassThru
+            $p = Start-Process -FilePath $NodeExe -ArgumentList "-id $($node.ID) -config $Config -status-addr $($node.StatusAddr)" -NoNewWindow -PassThru
             $processes += $p
         }
 
@@ -88,6 +88,11 @@ function Show-Status {
         $procs | Format-Table Id, ProcessName, StartTime, WorkingSet
     } else {
         Write-Host "No active cluster nodes running." -ForegroundColor Yellow
+    }
+
+    $pollScript = Join-Path $ScriptDir "poll_status.ps1"
+    if (Test-Path $pollScript) {
+        & $pollScript -Count 1
     }
 }
 

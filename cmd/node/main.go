@@ -49,10 +49,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Optionally start the debug HTTP endpoint (/status)
-	if *statusAddrFlag != "" {
-		if err := srv.StartHTTPServer(*statusAddrFlag); err != nil {
-			srv.GetLogger().Warn("failed to start debug HTTP status server", "address", *statusAddrFlag, "error", err)
+	// Start the debug HTTP endpoint (/status: defaults to 127.0.0.1:9000+id)
+	statusAddr := *statusAddrFlag
+	if statusAddr == "" {
+		statusAddr = fmt.Sprintf("127.0.0.1:%d", 9000+int(id))
+	}
+	if statusAddr != "disabled" && statusAddr != "none" {
+		if err := srv.StartHTTPServer(statusAddr); err != nil {
+			srv.GetLogger().Warn("failed to start debug HTTP status server", "address", statusAddr, "error", err)
+		} else {
+			srv.GetLogger().Info("started debug HTTP status server", "address", statusAddr, "endpoint", fmt.Sprintf("http://%s/status", statusAddr))
 		}
 	}
 

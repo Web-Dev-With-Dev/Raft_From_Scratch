@@ -82,15 +82,15 @@ start() {
     trap cleanup SIGINT SIGTERM EXIT
 
     # Launch node 1
-    "$NODE_BIN" -id 1 -config "$CONFIG_FILE" &
+    "$NODE_BIN" -id 1 -config "$CONFIG_FILE" -status-addr "127.0.0.1:9001" &
     PIDS+=($!)
 
     # Launch node 2
-    "$NODE_BIN" -id 2 -config "$CONFIG_FILE" &
+    "$NODE_BIN" -id 2 -config "$CONFIG_FILE" -status-addr "127.0.0.1:9002" &
     PIDS+=($!)
 
     # Launch node 3
-    "$NODE_BIN" -id 3 -config "$CONFIG_FILE" &
+    "$NODE_BIN" -id 3 -config "$CONFIG_FILE" -status-addr "127.0.0.1:9003" &
     PIDS+=($!)
 
     # Wait for all node processes
@@ -108,6 +108,10 @@ stop() {
     echo "==> Cluster stopped."
 }
 
+status() {
+    "$SCRIPT_DIR/scripts/poll_status.sh" "http://127.0.0.1:9001/status http://127.0.0.1:9002/status http://127.0.0.1:9003/status" 1 1
+}
+
 case "${1:-start}" in
     start)
         start
@@ -118,8 +122,11 @@ case "${1:-start}" in
     build)
         build
         ;;
+    status)
+        status
+        ;;
     *)
-        echo "Usage: $0 {start|stop|build}"
+        echo "Usage: $0 {start|stop|build|status}"
         exit 1
         ;;
 esac
