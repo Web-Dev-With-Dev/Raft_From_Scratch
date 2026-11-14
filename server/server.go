@@ -62,6 +62,14 @@ type AppendEntriesEvent struct {
 	ResCh chan<- *raftpb.AppendEntriesReply
 }
 
+// RequestVoteResult represents the outcome of an asynchronous RequestVote RPC sent to a peer.
+type RequestVoteResult struct {
+	PeerID       raft.NodeID
+	ElectionTerm raft.Term
+	Reply        *raft.RequestVoteReply
+	Err          error
+}
+
 type stateAction struct {
 	fn    func()
 	resCh chan struct{}
@@ -123,6 +131,7 @@ type Server struct {
 	stopOnce        sync.Once
 	requestVoteCh   chan RequestVoteEvent
 	appendEntriesCh chan AppendEntriesEvent
+	voteResultCh    chan RequestVoteResult
 	stateActionCh   chan stateAction
 	loopDone        chan struct{}
 	loopRunning     atomic.Bool
@@ -164,6 +173,7 @@ func NewServer(
 	stopCh := make(chan struct{})
 	requestVoteCh := make(chan RequestVoteEvent, 64)
 	appendEntriesCh := make(chan AppendEntriesEvent, 64)
+	voteResultCh := make(chan RequestVoteResult, 64)
 	stateActionCh := make(chan stateAction, 64)
 	loopDone := make(chan struct{})
 
@@ -188,6 +198,7 @@ func NewServer(
 		stopCh:            stopCh,
 		requestVoteCh:     requestVoteCh,
 		appendEntriesCh:   appendEntriesCh,
+		voteResultCh:      voteResultCh,
 		stateActionCh:     stateActionCh,
 		loopDone:          loopDone,
 	}
@@ -205,6 +216,22 @@ func (s *Server) GetState() raft.RaftState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.State
+}
+
+// VotesReceived returns a copy of the candidate's recorded votes.
+func (s *Server) VotesReceived() map[raft.NodeID]bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make(map[raft.NodeID]bool, len(s.votesReceived))
+	for k, v := range s.votesReceived {
+		res[k] = v
+	}
+	return res
+}
+
+// VoteResultChannel returns the internal vote result channel used by the event loop.
+func (s *Server) VoteResultChannel() chan RequestVoteResult {
+	return s.voteResultCh
 }
 
 // GetStorage returns the current storage engine.
@@ -1517,7 +1544,7 @@ func (s *Server) becomeLeaderLocked() {
 // handleElectionTimeout is called when the election timer fires.
 // In Raft (§5.2):
 // The node transitions to Candidate, increments currentTerm, votes for itself,
-// and resets the election timer to start a new election cycle.
+// and broadcasts RequestVote RPCs in parallel to all peers using goroutines + results channel.
 func (s *Server) handleElectionTimeout(t time.Time) {
 	s.GetLogger().Info("election timeout fired", "node_id", int(s.ID), "state", s.State.String(), "time", t)
 
@@ -1525,7 +1552,249 @@ func (s *Server) handleElectionTimeout(t time.Time) {
 		return
 	}
 
+	s.startElectionLocked()
+}
+
+// StartElection initiates an election cycle on the server.
+// If the event loop is running, the election is queued onto the event loop.
+func (s *Server) StartElection() {
+	if s.loopRunning.Load() {
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				s.startElectionLocked()
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return
+		}
+		select {
+		case <-resCh:
+		case <-s.stopCh:
+		}
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startElectionLocked()
+}
+
+// startElectionLocked begins an election cycle:
+// 1. Transitions to Candidate, increments term, votes for self, persists state, resets timer (§5.2)
+// 2. Sends RequestVote RPCs in parallel to all peers using goroutines + results channel
+func (s *Server) startElectionLocked() {
 	s.becomeCandidateLocked()
+	s.broadcastRequestVotesLocked()
+}
+
+// broadcastRequestVotesLocked sends RequestVote RPCs in parallel to all peers using goroutines,
+// streaming results back onto s.voteResultCh.
+func (s *Server) broadcastRequestVotesLocked() {
+	if s.State != raft.Candidate || len(s.Peers) == 0 {
+		return
+	}
+
+	term := s.PersistentState.CurrentTerm
+	var lastLogIndex raft.LogIndex
+	var lastLogTerm raft.Term
+	if s.PersistentState != nil && len(s.PersistentState.Log) > 0 {
+		lastEntry := s.PersistentState.Log[len(s.PersistentState.Log)-1]
+		lastLogIndex = lastEntry.Index
+		lastLogTerm = lastEntry.Term
+	}
+
+	timeout := s.RPCTimeout()
+	id := s.ID
+
+	s.GetLogger().Info("broadcasting RequestVote RPCs in parallel to all peers",
+		"node_id", int(id),
+		"term", uint64(term),
+		"peers_count", len(s.Peers),
+		"timeout_ms", timeout.Milliseconds(),
+	)
+
+	for _, peer := range s.Peers {
+		if peer.ID == id {
+			continue
+		}
+
+		go func(p Peer) {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			stopDone := make(chan struct{})
+			go func() {
+				select {
+				case <-s.stopCh:
+					cancel()
+				case <-stopDone:
+				}
+			}()
+			defer close(stopDone)
+
+			reply, err := s.SendRequestVote(ctx, p, &raft.RequestVoteArgs{
+				Term:         term,
+				CandidateID:  id,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			})
+
+			select {
+			case s.voteResultCh <- RequestVoteResult{
+				PeerID:       p.ID,
+				ElectionTerm: term,
+				Reply:        reply,
+				Err:          err,
+			}:
+			case <-s.stopCh:
+			}
+		}(peer)
+	}
+}
+
+// SendRequestVotesParallel sends RequestVote RPCs in parallel to all provided peers using goroutines,
+// streaming results back onto the provided results channel.
+func (s *Server) SendRequestVotesParallel(ctx context.Context, term raft.Term, peers []Peer, resCh chan<- RequestVoteResult) {
+	var lastLogIndex raft.LogIndex
+	var lastLogTerm raft.Term
+	s.mu.RLock()
+	id := s.ID
+	if s.PersistentState != nil && len(s.PersistentState.Log) > 0 {
+		lastEntry := s.PersistentState.Log[len(s.PersistentState.Log)-1]
+		lastLogIndex = lastEntry.Index
+		lastLogTerm = lastEntry.Term
+	}
+	timeout := s.RPCTimeout()
+	s.mu.RUnlock()
+
+	for _, peer := range peers {
+		if peer.ID == id {
+			continue
+		}
+
+		go func(p Peer) {
+			rpcCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+
+			reply, err := s.SendRequestVote(rpcCtx, p, &raft.RequestVoteArgs{
+				Term:         term,
+				CandidateID:  id,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			})
+
+			select {
+			case resCh <- RequestVoteResult{
+				PeerID:       p.ID,
+				ElectionTerm: term,
+				Reply:        reply,
+				Err:          err,
+			}:
+			case <-ctx.Done():
+			case <-s.stopCh:
+			}
+		}(peer)
+	}
+}
+
+// HandleVoteResult processes a vote result (steps down on higher term, or transitions to Leader on majority).
+func (s *Server) HandleVoteResult(res RequestVoteResult) {
+	if s.loopRunning.Load() {
+		select {
+		case s.voteResultCh <- res:
+		case <-s.stopCh:
+		}
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.handleVoteResultLocked(res)
+}
+
+// handleVoteResultLocked processes an incoming vote result from a peer.
+// In Raft (§5.1 & §5.2):
+// - If reply contains higher term: step down to Follower immediately
+// - If vote granted: count vote; on majority, transition to Leader
+func (s *Server) handleVoteResultLocked(res RequestVoteResult) {
+	if res.Err != nil {
+		s.GetLogger().Debug("RequestVote RPC to peer failed or timed out",
+			"peer_id", int(res.PeerID),
+			"error", res.Err,
+		)
+		return
+	}
+	if res.Reply == nil {
+		return
+	}
+
+	var currentTerm uint64
+	if s.PersistentState != nil {
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	// 1. If RPC response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	if uint64(res.Reply.Term) > currentTerm {
+		s.GetLogger().Info("discovered higher term in RequestVote reply, stepping down to follower",
+			"node_id", int(s.ID),
+			"reply_term", uint64(res.Reply.Term),
+			"current_term", currentTerm,
+			"peer_id", int(res.PeerID),
+		)
+		s.becomeFollowerLocked(res.Reply.Term)
+		return
+	}
+
+	// 2. Ignore votes if no longer Candidate or if reply is from an older election term
+	if s.State != raft.Candidate || res.ElectionTerm != raft.Term(currentTerm) {
+		return
+	}
+
+	// 3. Count vote if granted
+	if res.Reply.VoteGranted {
+		if s.votesReceived == nil {
+			s.votesReceived = make(map[raft.NodeID]bool)
+			s.votesReceived[s.ID] = true
+		}
+		s.votesReceived[res.PeerID] = true
+		votesCount := len(s.votesReceived)
+		totalNodes := len(s.Peers) + 1
+		majority := (totalNodes / 2) + 1
+
+		s.GetLogger().Info("received granted vote from peer",
+			"node_id", int(s.ID),
+			"peer_id", int(res.PeerID),
+			"term", currentTerm,
+			"votes_count", votesCount,
+			"majority_required", majority,
+		)
+
+		// 4. On majority, transition to Leader (§5.2)
+		if votesCount >= majority {
+			s.GetLogger().Info("achieved majority votes, transitioning to Leader",
+				"node_id", int(s.ID),
+				"term", currentTerm,
+				"votes_count", votesCount,
+				"total_nodes", totalNodes,
+				"majority", majority,
+			)
+			s.becomeLeaderLocked()
+
+			// Immediately broadcast heartbeats to establish authority (§5.2)
+			s.broadcastHeartbeats()
+		}
+	} else {
+		s.GetLogger().Info("vote denied by peer",
+			"node_id", int(s.ID),
+			"peer_id", int(res.PeerID),
+			"term", currentTerm,
+			"reply_term", res.Reply.Term,
+		)
+	}
 }
 
 // handleHeartbeatTick is called on each tick of the leader-only heartbeat ticker (every 50ms).
@@ -1622,6 +1891,11 @@ func (s *Server) run() {
 			}
 			s.mu.Lock()
 			s.handleElectionTimeout(t)
+			s.mu.Unlock()
+
+		case res := <-s.voteResultCh:
+			s.mu.Lock()
+			s.handleVoteResultLocked(res)
 			s.mu.Unlock()
 
 		case <-heartbeatCh:

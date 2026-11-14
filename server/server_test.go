@@ -2711,6 +2711,334 @@ func TestAppendEntries_Figure2_Rule2_LogMatching(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Leader Election: Parallel RequestVote, Vote Counting, and Term Handling
+// ---------------------------------------------------------------------------
+
+func TestElection_OnTimeout_TransitionsToCandidate_IncrementsTerm_VotesForSelf(t *testing.T) {
+	srv := NewServer(1, []Peer{
+		{ID: 2, Address: "127.0.0.1:60002"},
+		{ID: 3, Address: "127.0.0.1:60003"},
+	}, &raft.PersistentState{
+		CurrentTerm: 2,
+		VotedFor:    -1,
+		Log:         make([]raft.LogEntry, 0),
+	}, nil)
+	defer srv.Close()
+
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected initial Follower state, got %v", srv.GetState())
+	}
+
+	// Trigger election timeout
+	srv.handleElectionTimeout(time.Now())
+
+	// 1. Transition to Candidate
+	if srv.GetState() != raft.Candidate {
+		t.Fatalf("expected state Candidate after election timeout, got %v", srv.GetState())
+	}
+
+	// 2. Increment term (2 -> 3)
+	if srv.PersistentState.CurrentTerm != 3 {
+		t.Fatalf("expected CurrentTerm incremented to 3, got %d", srv.PersistentState.CurrentTerm)
+	}
+
+	// 3. Vote for self
+	if srv.PersistentState.VotedFor != 1 {
+		t.Fatalf("expected VotedFor self (1), got %d", srv.PersistentState.VotedFor)
+	}
+
+	// 4. Record self-vote in votesReceived
+	votes := srv.VotesReceived()
+	if !votes[1] {
+		t.Fatalf("expected self-vote recorded in votesReceived")
+	}
+	if len(votes) != 1 {
+		t.Fatalf("expected exactly 1 vote (self) initially, got %d", len(votes))
+	}
+
+	// 5. Persisted state verified
+	loaded, err := srv.GetStorage().Load()
+	if err != nil {
+		t.Fatalf("failed to load storage: %v", err)
+	}
+	if loaded.CurrentTerm != 3 || loaded.VotedFor != 1 {
+		t.Fatalf("expected persisted state (term=3, votedFor=1), got %+v", loaded)
+	}
+}
+
+func TestElection_SendRequestVoteInParallel_ResultsChannel(t *testing.T) {
+	// Start two peer servers that will grant votes
+	peer2 := NewServer(2, nil, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
+	defer peer2.Close()
+	lis2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen peer 2: %v", err)
+	}
+	if err := peer2.Serve(lis2); err != nil {
+		t.Fatalf("failed to serve peer 2: %v", err)
+	}
+
+	peer3 := NewServer(3, nil, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
+	defer peer3.Close()
+	lis3, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen peer 3: %v", err)
+	}
+	if err := peer3.Serve(lis3); err != nil {
+		t.Fatalf("failed to serve peer 3: %v", err)
+	}
+
+	peers := []Peer{
+		{ID: 2, Address: lis2.Addr().String()},
+		{ID: 3, Address: lis3.Addr().String()},
+	}
+
+	srv := NewServer(1, peers, &raft.PersistentState{CurrentTerm: 1, VotedFor: 1}, nil)
+	defer srv.Close()
+
+	// Connect peers in client pool
+	if err := srv.ConnectPeers(); err != nil {
+		t.Fatalf("failed to connect peers: %v", err)
+	}
+
+	resCh := make(chan RequestVoteResult, len(peers))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Send RequestVote RPCs in parallel to all peers using goroutines + results channel
+	srv.SendRequestVotesParallel(ctx, 2, peers, resCh)
+
+	// Collect responses from the results channel
+	collected := make(map[raft.NodeID]*raft.RequestVoteReply)
+	for i := 0; i < len(peers); i++ {
+		select {
+		case res := <-resCh:
+			if res.Err != nil {
+				t.Fatalf("unexpected RPC error from peer %d: %v", res.PeerID, res.Err)
+			}
+			if res.Reply == nil {
+				t.Fatalf("nil reply received from peer %d", res.PeerID)
+			}
+			collected[res.PeerID] = res.Reply
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out collecting parallel RequestVote responses (collected %d/%d)", len(collected), len(peers))
+		}
+	}
+
+	// Verify both peers responded and granted vote
+	for _, p := range peers {
+		reply, exists := collected[p.ID]
+		if !exists {
+			t.Fatalf("missing response for peer %d", p.ID)
+		}
+		if !reply.VoteGranted {
+			t.Fatalf("expected vote granted from peer %d", p.ID)
+		}
+		if reply.Term != 2 {
+			t.Fatalf("expected reply term 2 from peer %d, got %d", p.ID, reply.Term)
+		}
+	}
+}
+
+func TestElection_VoteCounting_AchievesMajority_BecomesLeader(t *testing.T) {
+	// 3-node cluster: majority is 2 out of 3
+	peers := []Peer{
+		{ID: 2, Address: "127.0.0.1:60002"},
+		{ID: 3, Address: "127.0.0.1:60003"},
+	}
+
+	srv := NewServer(1, peers, &raft.PersistentState{
+		CurrentTerm: 1,
+		VotedFor:    -1,
+	}, nil)
+	defer srv.Close()
+
+	// Transition to Candidate for Term 2 (has self-vote: 1 vote out of 3)
+	srv.becomeCandidate()
+	if srv.GetState() != raft.Candidate {
+		t.Fatalf("expected Candidate state, got %s", srv.GetState())
+	}
+
+	// Deliver vote from Peer 2 -> 2 votes out of 3 (Majority reached!)
+	srv.HandleVoteResult(RequestVoteResult{
+		PeerID:       2,
+		ElectionTerm: 2,
+		Reply: &raft.RequestVoteReply{
+			Term:        2,
+			VoteGranted: true,
+		},
+	})
+
+	if srv.GetState() != raft.Leader {
+		t.Fatalf("expected Leader state after achieving majority, got %s", srv.GetState())
+	}
+	if srv.GetHeartbeatTicker() == nil {
+		t.Fatalf("expected leader heartbeat ticker to be armed")
+	}
+
+	// Deliver redundant vote from Peer 3 -> 3 votes out of 3
+	srv.HandleVoteResult(RequestVoteResult{
+		PeerID:       3,
+		ElectionTerm: 2,
+		Reply: &raft.RequestVoteReply{
+			Term:        2,
+			VoteGranted: true,
+		},
+	})
+
+	// Must remain Leader cleanly
+	if srv.GetState() != raft.Leader {
+		t.Fatalf("expected to remain Leader, got %s", srv.GetState())
+	}
+	votes := srv.VotesReceived()
+	if len(votes) < 2 {
+		t.Fatalf("expected at least majority votes recorded, got %d", len(votes))
+	}
+}
+
+func TestElection_HigherTermSeen_StepsDownToFollower(t *testing.T) {
+	peers := []Peer{
+		{ID: 2, Address: "127.0.0.1:60002"},
+		{ID: 3, Address: "127.0.0.1:60003"},
+	}
+
+	srv := NewServer(1, peers, &raft.PersistentState{
+		CurrentTerm: 2,
+		VotedFor:    1,
+	}, nil)
+	defer srv.Close()
+	srv.SetState(raft.Candidate)
+
+	// Peer 2 responds with higher term (term 5)
+	srv.HandleVoteResult(RequestVoteResult{
+		PeerID:       2,
+		ElectionTerm: 2,
+		Reply: &raft.RequestVoteReply{
+			Term:        5,
+			VoteGranted: false,
+		},
+	})
+
+	// Must step down to Follower immediately (§5.1)
+	if srv.GetState() != raft.Follower {
+		t.Fatalf("expected Candidate to step down to Follower on seeing higher term, got %s", srv.GetState())
+	}
+	if srv.PersistentState.CurrentTerm != 5 {
+		t.Fatalf("expected currentTerm updated to 5, got %d", srv.PersistentState.CurrentTerm)
+	}
+	if srv.PersistentState.VotedFor != -1 {
+		t.Fatalf("expected votedFor reset to -1, got %d", srv.PersistentState.VotedFor)
+	}
+
+	loaded, err := srv.GetStorage().Load()
+	if err != nil {
+		t.Fatalf("failed to load storage: %v", err)
+	}
+	if loaded.CurrentTerm != 5 || loaded.VotedFor != -1 {
+		t.Fatalf("expected persisted state (term=5, votedFor=-1), got %+v", loaded)
+	}
+}
+
+func TestElection_IgnoresStaleElectionResults(t *testing.T) {
+	peers := []Peer{
+		{ID: 2, Address: "127.0.0.1:60002"},
+		{ID: 3, Address: "127.0.0.1:60003"},
+	}
+
+	srv := NewServer(1, peers, &raft.PersistentState{
+		CurrentTerm: 5,
+		VotedFor:    1,
+	}, nil)
+	defer srv.Close()
+	srv.SetState(raft.Candidate)
+
+	// Late response arriving from an earlier election cycle (term 3)
+	srv.HandleVoteResult(RequestVoteResult{
+		PeerID:       2,
+		ElectionTerm: 3,
+		Reply: &raft.RequestVoteReply{
+			Term:        3,
+			VoteGranted: true,
+		},
+	})
+
+	// Stale vote should NOT be counted in current term 5
+	votes := srv.VotesReceived()
+	if votes[2] {
+		t.Fatalf("vote from old election term must not be recorded in current election")
+	}
+	if srv.GetState() != raft.Candidate {
+		t.Fatalf("state should remain Candidate, got %s", srv.GetState())
+	}
+}
+
+func TestElection_FullClusterElectionsViaEventLoop(t *testing.T) {
+	// Spin up 3 live servers with event loops and gRPC listeners
+	srv2 := NewServer(2, nil, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
+	defer srv2.Close()
+	lis2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen 2: %v", err)
+	}
+	if err := srv2.Serve(lis2); err != nil {
+		t.Fatalf("serve 2: %v", err)
+	}
+
+	srv3 := NewServer(3, nil, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
+	defer srv3.Close()
+	lis3, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen 3: %v", err)
+	}
+	if err := srv3.Serve(lis3); err != nil {
+		t.Fatalf("serve 3: %v", err)
+	}
+
+	peers1 := []Peer{
+		{ID: 2, Address: lis2.Addr().String()},
+		{ID: 3, Address: lis3.Addr().String()},
+	}
+
+	srv1 := NewServer(1, peers1, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
+	defer srv1.Close()
+	lis1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen 1: %v", err)
+	}
+	if err := srv1.Serve(lis1); err != nil {
+		t.Fatalf("serve 1: %v", err)
+	}
+
+	// Connect srv1 to peers
+	if err := srv1.ConnectPeers(); err != nil {
+		t.Fatalf("connect peers: %v", err)
+	}
+
+	// Start election on Node 1 via event loop
+	srv1.StartElection()
+
+	// Wait for election to resolve across the network
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv1.GetState() == raft.Leader {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if srv1.GetState() != raft.Leader {
+		t.Fatalf("expected Node 1 to achieve majority and become Leader, got %s", srv1.GetState())
+	}
+	if srv1.PersistentState.CurrentTerm < 1 {
+		t.Fatalf("expected term >= 1, got %d", srv1.PersistentState.CurrentTerm)
+	}
+	if srv1.GetHeartbeatTicker() == nil {
+		t.Fatalf("expected leader heartbeat ticker to be active")
+	}
+}
+
+
 
 
 
