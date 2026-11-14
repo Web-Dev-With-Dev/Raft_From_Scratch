@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -29,6 +31,18 @@ type LogOptions = logger.Options
 type ElectionTimer = raft.ElectionTimer
 type Storage = store.Storage
 type MemoryStorage = store.MemoryStorage
+
+// NodeStatus represents the runtime status of a Raft node exposed via the debug HTTP endpoint (/status).
+type NodeStatus struct {
+	ID          raft.NodeID   `json:"id"`
+	Term        raft.Term     `json:"term"`
+	State       string        `json:"state"`
+	VotedFor    raft.NodeID   `json:"votedFor"`
+	VotedForAlt raft.NodeID   `json:"voted_for"`
+	CommitIndex raft.LogIndex `json:"commitIndex"`
+	LastApplied raft.LogIndex `json:"lastApplied"`
+	LogLength   int           `json:"logLength"`
+}
 
 const (
 	DefaultMinElectionTimeout = raft.DefaultMinElectionTimeout
@@ -115,6 +129,9 @@ type Server struct {
 
 	grpcServer *grpc.Server
 	listener   net.Listener
+
+	httpServer   *http.Server
+	httpListener net.Listener
 }
 
 // NewServer creates and initializes a new Raft Server.
@@ -715,6 +732,117 @@ func (s *Server) RegisterService(grpcServer grpc.ServiceRegistrar) {
 	raftpb.RegisterRaftServiceServer(grpcServer, s)
 }
 
+// Status returns the current runtime status of the Raft node (term, state, votedFor, etc.).
+func (s *Server) Status() NodeStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var term raft.Term
+	votedFor := raft.NodeID(-1)
+	logLen := 0
+	if s.PersistentState != nil {
+		term = s.PersistentState.CurrentTerm
+		votedFor = s.PersistentState.VotedFor
+		logLen = len(s.PersistentState.Log)
+	}
+
+	var commitIndex, lastApplied raft.LogIndex
+	if s.VolatileState != nil {
+		commitIndex = s.VolatileState.CommitIndex
+		lastApplied = s.VolatileState.LastApplied
+	}
+
+	return NodeStatus{
+		ID:          s.ID,
+		Term:        term,
+		State:       s.State.String(),
+		VotedFor:    votedFor,
+		VotedForAlt: votedFor,
+		CommitIndex: commitIndex,
+		LastApplied: lastApplied,
+		LogLength:   logLen,
+	}
+}
+
+// HandleStatus serves the /status debug endpoint as an http.HandlerFunc.
+func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	status := s.Status()
+	w.Header().Set("Content-Type", "application/json")
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(status); err != nil {
+		s.GetLogger().Error("failed to encode status response", "error", err)
+	}
+}
+
+// HTTPHandler returns an http.Handler multiplexer configured with the /status endpoint.
+func (s *Server) HTTPHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", s.HandleStatus)
+	return mux
+}
+
+// StartHTTPServer starts the debug HTTP server on the specified network address in the background.
+func (s *Server) StartHTTPServer(address string) error {
+	s.GetLogger().Info("starting debug HTTP server", "address", address)
+	lis, err := net.Listen("tcp", address)
+	if err != nil {
+		s.GetLogger().Error("failed to listen on HTTP address", "address", address, "error", err)
+		return fmt.Errorf("failed to listen on HTTP address %s: %w", address, err)
+	}
+	return s.ServeHTTPDebug(lis)
+}
+
+// ServeHTTPDebug starts the debug HTTP server on the provided listener in the background.
+func (s *Server) ServeHTTPDebug(lis net.Listener) error {
+	s.mu.Lock()
+	if s.httpServer != nil {
+		s.mu.Unlock()
+		_ = lis.Close()
+		return fmt.Errorf("http server is already running")
+	}
+
+	httpServer := &http.Server{
+		Handler: s.HTTPHandler(),
+	}
+	s.httpServer = httpServer
+	s.httpListener = lis
+	addrStr := lis.Addr().String()
+	s.mu.Unlock()
+
+	s.GetLogger().Info("debug HTTP server listening", "address", addrStr)
+
+	go func() {
+		if err := httpServer.Serve(lis); err != nil && err != http.ErrServerClosed {
+			s.GetLogger().Error("debug HTTP server error during serve", "error", err)
+		}
+	}()
+
+	return nil
+}
+
+// HTTPAddr returns the network address the debug HTTP server is listening on, or nil if not running.
+func (s *Server) HTTPAddr() net.Addr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.httpListener != nil {
+		return s.httpListener.Addr()
+	}
+	return nil
+}
+
+// HTTPServer returns the active debug *http.Server instance, or nil if not running.
+func (s *Server) HTTPServer() *http.Server {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.httpServer
+}
+
 // Start starts the gRPC server listening on the specified network address in the background.
 // It registers the Raft service handlers and begins serving incoming RPC requests.
 func (s *Server) Start(address string, opts ...grpc.ServerOption) error {
@@ -815,6 +943,15 @@ func (s *Server) Stop() {
 		_ = s.listener.Close()
 		s.listener = nil
 	}
+	if s.httpServer != nil {
+		_ = s.httpServer.Close()
+		s.httpServer = nil
+		s.GetLogger().Info("stopped debug HTTP server")
+	}
+	if s.httpListener != nil {
+		_ = s.httpListener.Close()
+		s.httpListener = nil
+	}
 }
 
 // GracefulStop gracefully stops the gRPC server, waiting for pending RPCs to finish.
@@ -846,6 +983,17 @@ func (s *Server) GracefulStop() {
 	if s.listener != nil {
 		_ = s.listener.Close()
 		s.listener = nil
+	}
+	if s.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = s.httpServer.Shutdown(ctx)
+		cancel()
+		s.httpServer = nil
+		s.GetLogger().Info("gracefully stopped debug HTTP server")
+	}
+	if s.httpListener != nil {
+		_ = s.httpListener.Close()
+		s.httpListener = nil
 	}
 }
 

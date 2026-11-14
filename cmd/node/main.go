@@ -18,6 +18,7 @@ import (
 func main() {
 	nodeIDFlag := flag.Int("id", 1, "Node ID for this Raft instance (e.g. 1, 2, 3)")
 	configPathFlag := flag.String("config", "cluster.json", "Path to cluster configuration JSON file")
+	statusAddrFlag := flag.String("status-addr", "", "Optional HTTP address for debug /status endpoint (e.g. 127.0.0.1:9001)")
 	flag.Parse()
 
 	id := raft.NodeID(*nodeIDFlag)
@@ -46,6 +47,13 @@ func main() {
 	if err := srv.Start(nodeCfg.Address); err != nil {
 		srv.GetLogger().Error("failed to start node server", "error", err)
 		os.Exit(1)
+	}
+
+	// Optionally start the debug HTTP endpoint (/status)
+	if *statusAddrFlag != "" {
+		if err := srv.StartHTTPServer(*statusAddrFlag); err != nil {
+			srv.GetLogger().Warn("failed to start debug HTTP status server", "address", *statusAddrFlag, "error", err)
+		}
 	}
 
 	// Concurrently dial peers with retry/backoff

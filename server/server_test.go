@@ -3,7 +3,10 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -2109,6 +2112,153 @@ func TestServer_Persistence_SpyMockAssertions(t *testing.T) {
 			t.Fatalf("expected Persist() count unchanged (2) on repeat follower term, got %d", count)
 		}
 	})
+}
+
+func TestServer_DebugStatusEndpoint(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 3,
+		VotedFor:    2,
+		Log: []raft.LogEntry{
+			{Index: 1, Term: 1, Command: []byte("cmd1")},
+		},
+	}, nil)
+	defer srv.Close()
+
+	// 1. Test Status() method directly
+	status := srv.Status()
+	if status.ID != 1 {
+		t.Errorf("expected ID 1, got %d", status.ID)
+	}
+	if status.Term != 3 {
+		t.Errorf("expected Term 3, got %d", status.Term)
+	}
+	if status.State != "Follower" {
+		t.Errorf("expected State 'Follower', got %q", status.State)
+	}
+	if status.VotedFor != 2 {
+		t.Errorf("expected VotedFor 2, got %d", status.VotedFor)
+	}
+	if status.LogLength != 1 {
+		t.Errorf("expected LogLength 1, got %d", status.LogLength)
+	}
+
+	// 2. Test HTTP GET /status via httptest.ResponseRecorder
+	handler := srv.HTTPHandler()
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 OK, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("expected application/json content-type, got %q", ct)
+	}
+
+	var jsonMap map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &jsonMap); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+
+	// Assert required fields: term, state, votedFor
+	if termVal, ok := jsonMap["term"].(float64); !ok || uint64(termVal) != 3 {
+		t.Errorf("JSON 'term' field mismatch: got %v, want 3", jsonMap["term"])
+	}
+	if stateVal, ok := jsonMap["state"].(string); !ok || stateVal != "Follower" {
+		t.Errorf("JSON 'state' field mismatch: got %v, want 'Follower'", jsonMap["state"])
+	}
+	if votedVal, ok := jsonMap["votedFor"].(float64); !ok || int64(votedVal) != 2 {
+		t.Errorf("JSON 'votedFor' field mismatch: got %v, want 2", jsonMap["votedFor"])
+	}
+
+	// 3. Test Method Not Allowed for non-GET methods
+	postReq := httptest.NewRequest(http.MethodPost, "/status", nil)
+	postRec := httptest.NewRecorder()
+	handler.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected POST /status to return 405 Method Not Allowed, got %d", postRec.Code)
+	}
+}
+
+func TestServer_DebugStatusEndpoint_DynamicUpdates(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 1,
+		VotedFor:    -1,
+	}, nil)
+	defer srv.Close()
+
+	handler := srv.HTTPHandler()
+
+	// Initial Follower status
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	var s1 NodeStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &s1); err != nil {
+		t.Fatalf("failed to unmarshal status: %v", err)
+	}
+	if s1.Term != 1 || s1.State != "Follower" || s1.VotedFor != -1 {
+		t.Fatalf("initial status mismatch: %+v", s1)
+	}
+
+	// Transition to Candidate (term 2, votedFor self)
+	srv.becomeCandidate()
+
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+	var s2 NodeStatus
+	if err := json.Unmarshal(rec2.Body.Bytes(), &s2); err != nil {
+		t.Fatalf("failed to unmarshal status: %v", err)
+	}
+	if s2.Term != 2 || s2.State != "Candidate" || s2.VotedFor != 1 {
+		t.Fatalf("candidate status mismatch: %+v", s2)
+	}
+
+	// Transition to Leader
+	srv.becomeLeader()
+
+	rec3 := httptest.NewRecorder()
+	handler.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+	var s3 NodeStatus
+	if err := json.Unmarshal(rec3.Body.Bytes(), &s3); err != nil {
+		t.Fatalf("failed to unmarshal status: %v", err)
+	}
+	if s3.Term != 2 || s3.State != "Leader" || s3.VotedFor != 1 {
+		t.Fatalf("leader status mismatch: %+v", s3)
+	}
+}
+
+func TestServer_DebugHTTPServer_Lifecycle(t *testing.T) {
+	srv := NewServer(1, nil, &raft.PersistentState{
+		CurrentTerm: 5,
+		VotedFor:    3,
+	}, nil)
+	defer srv.Close()
+
+	// Start in-process httptest server using srv.HTTPHandler()
+	ts := httptest.NewServer(srv.HTTPHandler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	}
+
+	var status NodeStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if status.Term != 5 || status.VotedFor != 3 || status.State != "Follower" {
+		t.Fatalf("unexpected status values: %+v", status)
+	}
 }
 
 
