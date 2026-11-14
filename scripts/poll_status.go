@@ -16,11 +16,15 @@ import (
 
 // NodeStatus mirrors the /status response structure.
 type NodeStatus struct {
-	ID        int64  `json:"id"`
-	Term      uint64 `json:"term"`
-	State     string `json:"state"`
-	VotedFor  int64  `json:"votedFor"`
-	LogLength int    `json:"logLength"`
+	ID               int64  `json:"id"`
+	Term             uint64 `json:"term"`
+	State            string `json:"state"`
+	VotedFor         int64  `json:"votedFor"`
+	LogLength        int    `json:"logLength"`
+	ElectionsStarted uint64 `json:"electionsStarted"`
+	VotesGranted     uint64 `json:"votesGranted"`
+	VotesDenied      uint64 `json:"votesDenied"`
+	HeartbeatsSent   uint64 `json:"heartbeatsSent"`
 }
 
 type NodeResult struct {
@@ -144,14 +148,14 @@ func printTable(iteration int, results []NodeResult, clearScreen bool) {
 
 	now := time.Now().Format("2006-01-02 15:04:05")
 	fmt.Printf("\n--- [Iteration #%d | %s] Raft Cluster Status ---\n", iteration, now)
-	fmt.Printf("+---------+-----------+------+----------+------------+----------------------------------+\n")
-	fmt.Printf("| Node ID |   State   | Term | VotedFor | Status     | Endpoint                         |\n")
-	fmt.Printf("+---------+-----------+------+----------+------------+----------------------------------+\n")
+	fmt.Printf("+---------+-----------+------+----------+-------+---------+--------+------------+------------+----------------------------------+\n")
+	fmt.Printf("| Node ID |   State   | Term | VotedFor | Elect | Granted | Denied | Heartbeats | Status     | Endpoint                         |\n")
+	fmt.Printf("+---------+-----------+------+----------+-------+---------+--------+------------+------------+----------------------------------+\n")
 
 	for _, res := range results {
 		if res.Err != nil || res.Status == nil {
-			fmt.Printf("| %-7s | %-9s | %-4s | %-8s | %-10s | %-32s |\n",
-				"-", "-", "-", "-", "OFFLINE", truncate(res.Endpoint, 32),
+			fmt.Printf("| %-7s | %-9s | %-4s | %-8s | %-5s | %-7s | %-6s | %-10s | %-10s | %-32s |\n",
+				"-", "-", "-", "-", "-", "-", "-", "-", "OFFLINE", truncate(res.Endpoint, 32),
 			)
 			continue
 		}
@@ -165,12 +169,12 @@ func printTable(iteration int, results []NodeResult, clearScreen bool) {
 		}
 
 		nodeIDStr := fmt.Sprintf("Node %d", s.ID)
-		fmt.Printf("| %-7s | %-9s | %-4d | %-8s | %-10s | %-32s |\n",
-			nodeIDStr, s.State, s.Term, votedForStr, "ONLINE", truncate(res.Endpoint, 32),
+		fmt.Printf("| %-7s | %-9s | %-4d | %-8s | %-5d | %-7d | %-6d | %-10d | %-10s | %-32s |\n",
+			nodeIDStr, s.State, s.Term, votedForStr, s.ElectionsStarted, s.VotesGranted, s.VotesDenied, s.HeartbeatsSent, "ONLINE", truncate(res.Endpoint, 32),
 		)
 	}
 
-	fmt.Printf("+---------+-----------+------+----------+------------+----------------------------------+\n")
+	fmt.Printf("+---------+-----------+------+----------+-------+---------+--------+------------+------------+----------------------------------+\n")
 }
 
 func truncate(s string, maxLen int) string {

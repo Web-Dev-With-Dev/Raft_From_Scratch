@@ -32,16 +32,34 @@ type ElectionTimer = raft.ElectionTimer
 type Storage = store.Storage
 type MemoryStorage = store.MemoryStorage
 
+// ServerCounters holds runtime consensus event counters for a Raft node.
+type ServerCounters struct {
+	ElectionsStarted uint64 `json:"electionsStarted"`
+	VotesGranted     uint64 `json:"votesGranted"`
+	VotesDenied      uint64 `json:"votesDenied"`
+	HeartbeatsSent   uint64 `json:"heartbeatsSent"`
+}
+
 // NodeStatus represents the runtime status of a Raft node exposed via the debug HTTP endpoint (/status).
 type NodeStatus struct {
-	ID          raft.NodeID   `json:"id"`
-	Term        raft.Term     `json:"term"`
-	State       string        `json:"state"`
-	VotedFor    raft.NodeID   `json:"votedFor"`
-	VotedForAlt raft.NodeID   `json:"voted_for"`
-	CommitIndex raft.LogIndex `json:"commitIndex"`
-	LastApplied raft.LogIndex `json:"lastApplied"`
-	LogLength   int           `json:"logLength"`
+	ID                  raft.NodeID    `json:"id"`
+	Term                raft.Term      `json:"term"`
+	State               string         `json:"state"`
+	VotedFor            raft.NodeID    `json:"votedFor"`
+	VotedForAlt         raft.NodeID    `json:"voted_for"`
+	CommitIndex         raft.LogIndex  `json:"commitIndex"`
+	LastApplied         raft.LogIndex  `json:"lastApplied"`
+	LogLength           int            `json:"logLength"`
+	ElectionsStarted    uint64         `json:"electionsStarted"`
+	ElectionsStartedAlt uint64         `json:"elections_started"`
+	VotesGranted        uint64         `json:"votesGranted"`
+	VotesGrantedAlt     uint64         `json:"votes_granted"`
+	VotesDenied         uint64         `json:"votesDenied"`
+	VotesDeniedAlt      uint64         `json:"votes_denied"`
+	HeartbeatsSent      uint64         `json:"heartbeatsSent"`
+	HeartbeatsSentAlt   uint64         `json:"heartbeats_sent"`
+	Counters            ServerCounters `json:"counters"`
+	RecentEvents        []Event        `json:"recentEvents,omitempty"`
 }
 
 const (
@@ -157,8 +175,17 @@ type Server struct {
 	// requestVoteFilter is an optional testing hook to intercept/filter RequestVote RPCs.
 	requestVoteFilter func(req *raftpb.RequestVoteArgs) bool
 
+	// electionsStarted counts the total number of elections initiated by this node.
+	electionsStarted atomic.Uint64
+
 	// votesGranted counts the total number of votes granted by this node.
-	votesGranted uint64
+	votesGranted atomic.Uint64
+
+	// votesDenied counts the total number of votes denied by this node.
+	votesDenied atomic.Uint64
+
+	// eventLog records consensus events into an in-memory ring buffer for post-mortem debugging.
+	eventLog *EventLog
 
 	// heartbeatsReceived counts the total number of valid heartbeats received by this node.
 	heartbeatsReceived uint64
@@ -214,7 +241,7 @@ func NewServer(
 		_ = memStorage.Persist(persistentState)
 	}
 
-	return &Server{
+	srv := &Server{
 		ID:                id,
 		Peers:             peers,
 		PersistentState:   persistentState,
@@ -236,7 +263,12 @@ func NewServer(
 		loopDone:          loopDone,
 		pauseNotifyCh:     pauseNotifyCh,
 		heartbeatAcks:     make(map[raft.NodeID]bool),
+		eventLog:          NewEventLog(DefaultEventLogCapacity),
 	}
+	srv.recordEventLocked(EventServerStarted, fmt.Sprintf("server node %d initialized", id), map[string]interface{}{
+		"node_id": int(id),
+	})
+	return srv
 }
 
 // GetID returns the server node ID.
@@ -620,6 +652,12 @@ func (s *Server) handleCheckQuorumTimeoutLocked() {
 	}
 
 	if ackedCount < majority {
+		s.recordEventLocked(EventQuorumLoss, fmt.Sprintf("leader lost quorum contact (%d/%d acks, majority %d); stepping down to Follower", ackedCount, totalNodes, majority), map[string]interface{}{
+			"acked_nodes":       ackedCount,
+			"majority_required": majority,
+			"total_nodes":       totalNodes,
+			"term":              curTerm,
+		})
 		s.GetLogger().Info("leader lost contact with majority, stepping down to Follower (§6.2)",
 			"node_id", int(s.ID),
 			"term", curTerm,
@@ -881,7 +919,7 @@ func (s *Server) RegisterService(grpcServer grpc.ServiceRegistrar) {
 	raftpb.RegisterRaftServiceServer(grpcServer, s)
 }
 
-// Status returns the current runtime status of the Raft node (term, state, votedFor, etc.).
+// Status returns the current runtime status of the Raft node (term, state, votedFor, counters, etc.).
 func (s *Server) Status() NodeStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -901,15 +939,31 @@ func (s *Server) Status() NodeStatus {
 		lastApplied = s.VolatileState.LastApplied
 	}
 
+	counters := s.Counters()
+	var recentEvents []Event
+	if s.eventLog != nil {
+		recentEvents = s.eventLog.Recent(20)
+	}
+
 	return NodeStatus{
-		ID:          s.ID,
-		Term:        term,
-		State:       s.State.String(),
-		VotedFor:    votedFor,
-		VotedForAlt: votedFor,
-		CommitIndex: commitIndex,
-		LastApplied: lastApplied,
-		LogLength:   logLen,
+		ID:                  s.ID,
+		Term:                term,
+		State:               s.State.String(),
+		VotedFor:            votedFor,
+		VotedForAlt:         votedFor,
+		CommitIndex:         commitIndex,
+		LastApplied:         lastApplied,
+		LogLength:           logLen,
+		ElectionsStarted:    counters.ElectionsStarted,
+		ElectionsStartedAlt: counters.ElectionsStarted,
+		VotesGranted:        counters.VotesGranted,
+		VotesGrantedAlt:     counters.VotesGranted,
+		VotesDenied:         counters.VotesDenied,
+		VotesDeniedAlt:      counters.VotesDenied,
+		HeartbeatsSent:      counters.HeartbeatsSent,
+		HeartbeatsSentAlt:   counters.HeartbeatsSent,
+		Counters:            counters,
+		RecentEvents:        recentEvents,
 	}
 }
 
@@ -929,10 +983,34 @@ func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// HTTPHandler returns an http.Handler multiplexer configured with the /status endpoint.
+// HandleEvents serves the /events debug endpoint returning all recorded consensus events.
+func (s *Server) HandleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var events []Event
+	if s.eventLog != nil {
+		events = s.eventLog.Entries()
+	}
+	if events == nil {
+		events = []Event{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(events); err != nil {
+		s.GetLogger().Error("failed to encode events response", "error", err)
+	}
+}
+
+// HTTPHandler returns an http.Handler multiplexer configured with the /status and /events endpoints.
 func (s *Server) HTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", s.HandleStatus)
+	mux.HandleFunc("/events", s.HandleEvents)
 	return mux
 }
 
@@ -1083,6 +1161,10 @@ func (s *Server) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.recordEventLocked(EventServerStopped, fmt.Sprintf("server node %d stopped", s.ID), map[string]interface{}{
+		"node_id": int(s.ID),
+	})
+
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
 	}
@@ -1123,6 +1205,10 @@ func (s *Server) GracefulStop() {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.recordEventLocked(EventServerStopped, fmt.Sprintf("server node %d stopped", s.ID), map[string]interface{}{
+		"node_id": int(s.ID),
+	})
 
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
@@ -1353,11 +1439,59 @@ func (s *Server) SetRequestVoteFilter(fn func(req *raftpb.RequestVoteArgs) bool)
 	s.requestVoteFilter = fn
 }
 
+// ElectionsStarted returns the total number of elections initiated by this node.
+func (s *Server) ElectionsStarted() uint64 {
+	return s.electionsStarted.Load()
+}
+
 // VotesGranted returns the number of times this node has granted its vote to any candidate.
 func (s *Server) VotesGranted() uint64 {
+	return s.votesGranted.Load()
+}
+
+// VotesDenied returns the number of times this node has denied its vote to any candidate.
+func (s *Server) VotesDenied() uint64 {
+	return s.votesDenied.Load()
+}
+
+// Counters returns a snapshot of all Raft consensus event counters.
+func (s *Server) Counters() ServerCounters {
+	return ServerCounters{
+		ElectionsStarted: s.ElectionsStarted(),
+		VotesGranted:     s.VotesGranted(),
+		VotesDenied:      s.VotesDenied(),
+		HeartbeatsSent:   s.HeartbeatsSent(),
+	}
+}
+
+// EventLog returns the node's in-memory event log ring buffer for post-mortem debugging.
+func (s *Server) EventLog() *EventLog {
+	return s.eventLog
+}
+
+// RecordEvent records a custom event into the node's event log ring buffer.
+func (s *Server) RecordEvent(eventType EventType, message string, details map[string]interface{}) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.votesGranted
+	var term raft.Term
+	if s.PersistentState != nil {
+		term = s.PersistentState.CurrentTerm
+	}
+	s.mu.RUnlock()
+
+	if s.eventLog != nil {
+		s.eventLog.Append(eventType, term, message, details)
+	}
+}
+
+func (s *Server) recordEventLocked(eventType EventType, message string, details map[string]interface{}) {
+	if s.eventLog == nil {
+		return
+	}
+	var term raft.Term
+	if s.PersistentState != nil {
+		term = s.PersistentState.CurrentTerm
+	}
+	s.eventLog.Append(eventType, term, message, details)
 }
 
 // HeartbeatsReceived returns the number of valid empty AppendEntries (heartbeats) received.
@@ -1407,6 +1541,12 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 
 	// Optional testing filter hook
 	if s.requestVoteFilter != nil && !s.requestVoteFilter(req) {
+		s.votesDenied.Add(1)
+		s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d (filtered)", req.CandidateId, req.Term), map[string]interface{}{
+			"candidate_id": req.CandidateId,
+			"term":         req.Term,
+			"reason":       "filter",
+		})
 		s.GetLogger().Warn("dropped/rejected RequestVote via test filter hook",
 			"candidate_id", req.CandidateId,
 			"term", req.Term,
@@ -1419,6 +1559,13 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 
 	// Figure 2 RequestVote Rule 1: Reply false if term < currentTerm (§5.1)
 	if req.Term < currentTerm {
+		s.votesDenied.Add(1)
+		s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d (stale term < %d)", req.CandidateId, req.Term, currentTerm), map[string]interface{}{
+			"candidate_id": req.CandidateId,
+			"req_term":     req.Term,
+			"current_term": currentTerm,
+			"reason":       "stale_term",
+		})
 		s.GetLogger().Warn("rejected RequestVote from candidate with stale term",
 			"candidate_id", req.CandidateId,
 			"req_term", req.Term,
@@ -1448,6 +1595,11 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 		}
 		steppedDown = true
 
+		s.recordEventLocked(EventStepDown, fmt.Sprintf("discovered higher term %d; transitioned to Follower", req.Term), map[string]interface{}{
+			"previous_state": oldRole.String(),
+			"term":           currentTerm,
+		})
+
 		s.GetLogger().Info("transitioned to Follower on discovering higher term",
 			"node_id", int(s.ID),
 			"previous_state", oldRole.String(),
@@ -1463,7 +1615,11 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 	voteGranted := false
 	if canVote && logOk {
 		voteGranted = true
-		s.votesGranted++
+		s.votesGranted.Add(1)
+		s.recordEventLocked(EventVoteGranted, fmt.Sprintf("granted vote to candidate %d for term %d", req.CandidateId, currentTerm), map[string]interface{}{
+			"candidate_id": req.CandidateId,
+			"term":         currentTerm,
+		})
 		if s.PersistentState != nil {
 			s.PersistentState.VotedFor = raft.NodeID(req.CandidateId)
 		}
@@ -1479,6 +1635,15 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 			"term", currentTerm,
 		)
 	} else {
+		s.votesDenied.Add(1)
+		s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d", req.CandidateId, currentTerm), map[string]interface{}{
+			"candidate_id": req.CandidateId,
+			"term":         currentTerm,
+			"can_vote":     canVote,
+			"log_ok":       logOk,
+			"voted_for":    int(votedFor),
+		})
+
 		// If stepped down due to higher term but vote was not granted, persist the higher term with votedFor = -1
 		if steppedDown {
 			_ = s.persistLocked()
@@ -1558,6 +1723,10 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 
 	if len(req.Entries) == 0 {
 		s.heartbeatsReceived++
+		s.recordEventLocked(EventHeartbeatReceived, fmt.Sprintf("received heartbeat from leader %d for term %d", req.LeaderId, req.Term), map[string]interface{}{
+			"leader_id": req.LeaderId,
+			"term":      req.Term,
+		})
 	}
 
 	// Figure 2 AppendEntries Rule 2:
@@ -1640,6 +1809,13 @@ func (s *Server) becomeFollowerLocked(term raft.Term) {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
 	}
 
+	if oldRole != raft.Follower {
+		s.recordEventLocked(EventStateTransition, fmt.Sprintf("transitioned to Follower for term %d", curTerm), map[string]interface{}{
+			"previous_state": oldRole.String(),
+			"term":           curTerm,
+		})
+	}
+
 	s.GetLogger().Info("transitioned to Follower",
 		"node_id", int(s.ID),
 		"previous_state", oldRole.String(),
@@ -1686,6 +1862,7 @@ func (s *Server) becomeCandidate() {
 func (s *Server) becomeCandidateLocked() {
 	oldRole := s.State
 	s.State = raft.Candidate
+	s.electionsStarted.Add(1)
 
 	if s.PersistentState != nil {
 		s.PersistentState.CurrentTerm++
@@ -1706,6 +1883,12 @@ func (s *Server) becomeCandidateLocked() {
 	if s.PersistentState != nil {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
 	}
+
+	s.recordEventLocked(EventElectionStarted, fmt.Sprintf("started election for term %d", curTerm), map[string]interface{}{
+		"term":              curTerm,
+		"previous_state":    oldRole.String(),
+		"elections_started": s.electionsStarted.Load(),
+	})
 
 	s.GetLogger().Info("transitioned to Candidate (started election; RequestVote RPC broadcast stubbed)",
 		"node_id", int(s.ID),
@@ -1793,6 +1976,11 @@ func (s *Server) becomeLeaderLocked() {
 	if s.PersistentState != nil {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
 	}
+
+	s.recordEventLocked(EventStateTransition, fmt.Sprintf("transitioned to Leader for term %d", curTerm), map[string]interface{}{
+		"previous_state": oldRole.String(),
+		"term":           curTerm,
+	})
 
 	s.GetLogger().Info("transitioned to Leader (started leadership; heartbeat ticker armed; will call AppendEntries)",
 		"node_id", int(s.ID),
@@ -2117,6 +2305,13 @@ func (s *Server) handleHeartbeatTick() {
 	if s.PersistentState != nil {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
 	}
+
+	s.recordEventLocked(EventHeartbeatSent, fmt.Sprintf("leader heartbeat dispatched for term %d", curTerm), map[string]interface{}{
+		"term":            curTerm,
+		"peers_count":     len(s.Peers),
+		"heartbeats_sent": s.heartbeatsSent.Load(),
+	})
+
 	s.GetLogger().Debug("leader heartbeat ticker fired (will call AppendEntries)",
 		"node_id", int(s.ID),
 		"term", curTerm,
