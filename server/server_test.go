@@ -3298,6 +3298,236 @@ func TestElection_FullClusterElectionsViaEventLoop(t *testing.T) {
 	}
 }
 
+func TestRequestVote_ResetTimerOnGrantingVote_ReducesSplitVotes(t *testing.T) {
+	// Raft paper §5.2 / Figure 2:
+	// "If election timeout elapses without receiving AppendEntries RPC from current leader
+	//  or granting vote to candidate: convert to candidate"
+	//
+	// Resetting the election timer when granting a vote reduces the likelihood of split votes
+	// by giving the granted candidate time to collect remaining votes and establish leadership.
+
+	t.Run("GrantVote_ResetsElectionTimerAndUpdatesHeartbeat", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    -1,
+		}, nil)
+		defer srv.Close()
+
+		// Allow initial timer time to elapse slightly
+		time.Sleep(15 * time.Millisecond)
+		hbBefore := srv.LastHeartbeatTime()
+		grantedBefore := srv.VotesGranted()
+
+		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+			Term:         2,
+			CandidateId:  3,
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		})
+
+		if !reply.VoteGranted {
+			t.Fatalf("expected vote to be granted")
+		}
+		if !srv.LastHeartbeatTime().After(hbBefore) {
+			t.Fatalf("granting vote MUST update lastHeartbeat (reset election timer)")
+		}
+		if srv.VotesGranted() != grantedBefore+1 {
+			t.Fatalf("VotesGranted counter should increment by 1, got %d", srv.VotesGranted())
+		}
+	})
+
+	t.Run("DenyVote_AlreadyVoted_DoesNotResetElectionTimer", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    3, // already voted for candidate 3 in term 2
+		}, nil)
+		defer srv.Close()
+
+		time.Sleep(15 * time.Millisecond)
+		hbBefore := srv.LastHeartbeatTime()
+		grantedBefore := srv.VotesGranted()
+
+		// Candidate 4 requests vote in same term 2 -> denied
+		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+			Term:         2,
+			CandidateId:  4,
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		})
+
+		if reply.VoteGranted {
+			t.Fatalf("expected vote to be denied")
+		}
+		if !srv.LastHeartbeatTime().Equal(hbBefore) {
+			t.Fatalf("denying vote MUST NOT reset election timer, before=%v, after=%v", hbBefore, srv.LastHeartbeatTime())
+		}
+		if srv.VotesGranted() != grantedBefore {
+			t.Fatalf("VotesGranted counter should NOT change on denied vote")
+		}
+	})
+
+	t.Run("DenyVote_StaleLog_DoesNotResetElectionTimer", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    -1,
+			Log: []raft.LogEntry{
+				{Index: 1, Term: 2},
+			},
+		}, nil)
+		defer srv.Close()
+
+		time.Sleep(15 * time.Millisecond)
+		hbBefore := srv.LastHeartbeatTime()
+		grantedBefore := srv.VotesGranted()
+
+		// Candidate 3 has empty log (stale compared to receiver's log) -> denied
+		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{
+			Term:         2,
+			CandidateId:  3,
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		})
+
+		if reply.VoteGranted {
+			t.Fatalf("expected vote denied due to stale log")
+		}
+		if !srv.LastHeartbeatTime().Equal(hbBefore) {
+			t.Fatalf("denying vote due to stale log MUST NOT reset election timer")
+		}
+		if srv.VotesGranted() != grantedBefore {
+			t.Fatalf("VotesGranted counter should NOT change on denied vote")
+		}
+	})
+}
+
+func TestElection_SplitVote_TwoCandidatesSameTerm_ResolvesToOneLeader(t *testing.T) {
+	// Scenario:
+	// 1. A 3-node cluster (nodes 1, 2, 3) is started with event loops and full RPC connectivity.
+	// 2. Both Candidate 1 and Candidate 2 start elections simultaneously in Term 1 (forced via test hook).
+	// 3. Node 3 withholds its vote in Term 1 via test filter hook, ensuring a split vote in Term 1 (Node 1 gets 1 vote, Node 2 gets 1 vote).
+	// 4. In Term 1, neither candidate reaches majority (majority is 2).
+	// 5. As election timeouts expire, randomized durations ensure one candidate times out first.
+	// 6. That candidate increments term to Term 2, requests votes, and steps down the other candidate.
+	// 7. Node 3 and the stepped-down candidate grant votes and reset their election timers.
+	// 8. Exactly ONE candidate receives majority and becomes the sole cluster Leader.
+
+	servers := make([]*Server, 3)
+	for i := 0; i < 3; i++ {
+		id := raft.NodeID(i + 1)
+		srv := NewServer(id, nil, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
+		// Configure fast election timeout range [80ms, 180ms] for responsive test resolution
+		if srv.GetElectionTimer() != nil {
+			srv.GetElectionTimer().SetRange(80*time.Millisecond, 180*time.Millisecond)
+			srv.ResetElectionTimeout()
+		}
+		if err := srv.Start("127.0.0.1:0"); err != nil {
+			t.Fatalf("failed to start server %d: %v", id, err)
+		}
+		defer srv.Close()
+		servers[i] = srv
+	}
+
+	// Build full mesh peer routing
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 3; j++ {
+			if i != j {
+				servers[i].AddPeer(Peer{
+					ID:      servers[j].ID,
+					Address: servers[j].Addr().String(),
+				})
+			}
+		}
+	}
+
+	for _, srv := range servers {
+		if err := srv.ConnectPeers(); err != nil {
+			t.Fatalf("node %d failed to connect peers: %v", srv.ID, err)
+		}
+	}
+
+	node1, node2, node3 := servers[0], servers[1], servers[2]
+
+	// Node 3 test hook: reject/withhold votes in Term 1 to guarantee a split vote in Term 1
+	node3.SetRequestVoteFilter(func(req *raftpb.RequestVoteArgs) bool {
+		return req.Term > 1
+	})
+
+	// Force both Node 1 and Node 2 to start elections in Term 1 simultaneously
+	node1.StartElectionInTerm(1)
+	node2.StartElectionInTerm(1)
+
+	// Short pause to let Term 1 RequestVote RPCs complete
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify split vote in Term 1: neither node should have achieved leadership in Term 1
+	s1 := node1.GetState()
+	s2 := node2.GetState()
+	if s1 == raft.Leader && node1.PersistentState.CurrentTerm == 1 {
+		t.Fatalf("Node 1 should not become leader in Term 1 during forced split vote")
+	}
+	if s2 == raft.Leader && node2.PersistentState.CurrentTerm == 1 {
+		t.Fatalf("Node 2 should not become leader in Term 1 during forced split vote")
+	}
+
+	// Now wait for randomized timeouts + term increments to resolve to exactly ONE leader
+	deadline := time.Now().Add(3 * time.Second)
+	var electedLeader *Server
+
+	for time.Now().Before(deadline) {
+		leaders := 0
+		for _, srv := range servers {
+			if srv.GetState() == raft.Leader {
+				leaders++
+				electedLeader = srv
+			}
+		}
+		if leaders == 1 {
+			// Found exactly one leader!
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if electedLeader == nil {
+		t.Fatalf("cluster failed to elect a leader after split vote within deadline; states: node1=%s (term %d), node2=%s (term %d), node3=%s (term %d)",
+			node1.GetState(), node1.PersistentState.CurrentTerm,
+			node2.GetState(), node2.PersistentState.CurrentTerm,
+			node3.GetState(), node3.PersistentState.CurrentTerm,
+		)
+	}
+
+	// Verify that the winning leader's term is at least 2 (proves split-vote timeout and term increment occurred)
+	leaderTerm := electedLeader.PersistentState.CurrentTerm
+	if leaderTerm < 2 {
+		t.Fatalf("expected winning leader term >= 2 after split vote resolution, got %d", leaderTerm)
+	}
+
+	// Verify all other nodes stepped down to Follower
+	followerCount := 0
+	for _, srv := range servers {
+		if srv.ID != electedLeader.ID {
+			if srv.GetState() != raft.Follower {
+				t.Fatalf("expected node %d to be Follower, got %s", srv.ID, srv.GetState())
+			}
+			followerCount++
+		}
+	}
+	if followerCount != 2 {
+		t.Fatalf("expected exactly 2 followers, got %d", followerCount)
+	}
+
+	// Verify exactly 1 leader in cluster
+	leaders := 0
+	for _, srv := range servers {
+		if srv.GetState() == raft.Leader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("expected exactly 1 leader, got %d", leaders)
+	}
+}
+
 
 
 

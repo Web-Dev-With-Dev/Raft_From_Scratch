@@ -144,6 +144,12 @@ type Server struct {
 
 	// logUpToDateChecker is an optional testing hook for log up-to-date assertions.
 	logUpToDateChecker func(lastLogIndex uint64, lastLogTerm uint64) bool
+
+	// requestVoteFilter is an optional testing hook to intercept/filter RequestVote RPCs.
+	requestVoteFilter func(req *raftpb.RequestVoteArgs) bool
+
+	// votesGranted counts the total number of votes granted by this node.
+	votesGranted uint64
 }
 
 // NewServer creates and initializes a new Raft Server.
@@ -1164,6 +1170,42 @@ func (s *Server) SetLogUpToDateChecker(fn func(lastLogIndex uint64, lastLogTerm 
 	s.logUpToDateChecker = fn
 }
 
+// SetRequestVoteFilter sets an optional testing hook to filter or intercept incoming RequestVote RPCs.
+func (s *Server) SetRequestVoteFilter(fn func(req *raftpb.RequestVoteArgs) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requestVoteFilter = fn
+}
+
+// VotesGranted returns the number of times this node has granted its vote to any candidate.
+func (s *Server) VotesGranted() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.votesGranted
+}
+
+// resetElectionTimerOnGrantingVoteLocked resets the follower's election timer
+// upon granting a vote to a candidate, as required by Raft paper §5.2 / Figure 2:
+// "If election timeout elapses without receiving AppendEntries RPC from current leader
+// or granting vote to candidate: convert to candidate".
+//
+// Resetting the election timer when granting a vote gives the candidate a full election
+// timeout window to collect majority votes and establish leadership (by sending heartbeats),
+// significantly reducing the likelihood of split votes.
+func (s *Server) resetElectionTimerOnGrantingVoteLocked(candidateID int64, term uint64) time.Duration {
+	s.lastHeartbeat = time.Now()
+	var newTimeout time.Duration
+	if s.ElectionTimer != nil {
+		newTimeout = s.ElectionTimer.Reset()
+		s.GetLogger().Info("reset election timer on granting vote (§5.2)",
+			"candidate_id", candidateID,
+			"term", term,
+			"timeout_ms", newTimeout.Milliseconds(),
+		)
+	}
+	return newTimeout
+}
+
 // processRequestVote evaluates an incoming RequestVote RPC exactly per Raft paper Figure 2 rules 1-2.
 func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.RequestVoteReply {
 	s.GetLogger().Info("received RequestVote",
@@ -1178,6 +1220,18 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 	if s.PersistentState != nil {
 		currentTerm = uint64(s.PersistentState.CurrentTerm)
 		votedFor = s.PersistentState.VotedFor
+	}
+
+	// Optional testing filter hook
+	if s.requestVoteFilter != nil && !s.requestVoteFilter(req) {
+		s.GetLogger().Warn("dropped/rejected RequestVote via test filter hook",
+			"candidate_id", req.CandidateId,
+			"term", req.Term,
+		)
+		return &raftpb.RequestVoteReply{
+			Term:        currentTerm,
+			VoteGranted: false,
+		}
 	}
 
 	// Figure 2 RequestVote Rule 1: Reply false if term < currentTerm (§5.1)
@@ -1226,6 +1280,7 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 	voteGranted := false
 	if canVote && logOk {
 		voteGranted = true
+		s.votesGranted++
 		if s.PersistentState != nil {
 			s.PersistentState.VotedFor = raft.NodeID(req.CandidateId)
 		}
@@ -1233,16 +1288,8 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 		// Persist state changes (currentTerm and votedFor)
 		_ = s.persistLocked()
 
-		// Reset election timer when granting vote (§5.2)
-		s.lastHeartbeat = time.Now()
-		if s.ElectionTimer != nil {
-			newTimeout := s.ElectionTimer.Reset()
-			s.GetLogger().Info("reset election timer on granting vote",
-				"candidate_id", req.CandidateId,
-				"term", req.Term,
-				"timeout_ms", newTimeout.Milliseconds(),
-			)
-		}
+		// Reset election timer when granting vote (§5.2) to reduce split-vote likelihood
+		s.resetElectionTimerOnGrantingVoteLocked(req.CandidateId, req.Term)
 
 		s.GetLogger().Info("granted vote to candidate",
 			"candidate_id", req.CandidateId,
@@ -1603,6 +1650,63 @@ func (s *Server) StartElection() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.startElectionLocked()
+}
+
+// StartElectionInTerm forces the server to begin an election in a specific term (test hook).
+// When the event loop is active, the mutation is executed on the single event loop.
+func (s *Server) StartElectionInTerm(term raft.Term) {
+	if s.loopRunning.Load() {
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				s.startElectionInTermLocked(term)
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return
+		}
+		select {
+		case <-resCh:
+		case <-s.stopCh:
+		}
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startElectionInTermLocked(term)
+}
+
+func (s *Server) startElectionInTermLocked(term raft.Term) {
+	oldRole := s.State
+	s.State = raft.Candidate
+
+	if s.PersistentState != nil {
+		s.PersistentState.CurrentTerm = term
+		s.PersistentState.VotedFor = s.ID
+		_ = s.persistLocked()
+	}
+
+	s.stopHeartbeatTickerLocked()
+
+	if s.ElectionTimer != nil {
+		s.ElectionTimer.Reset()
+	}
+
+	s.votesReceived = make(map[raft.NodeID]bool)
+	s.votesReceived[s.ID] = true
+
+	s.GetLogger().Info("forced candidate election in term (test hook)",
+		"node_id", int(s.ID),
+		"previous_state", oldRole.String(),
+		"term", uint64(term),
+		"voted_for", int(s.ID),
+		"votes_count", 1,
+	)
+
+	s.broadcastRequestVotesLocked()
 }
 
 // startElectionLocked begins an election cycle:
