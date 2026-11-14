@@ -70,6 +70,14 @@ type RequestVoteResult struct {
 	Err          error
 }
 
+// HeartbeatResult represents the outcome of an asynchronous AppendEntries heartbeat RPC sent to a peer.
+type HeartbeatResult struct {
+	PeerID raft.NodeID
+	Term   raft.Term
+	Reply  *raft.AppendEntriesReply
+	Err    error
+}
+
 type stateAction struct {
 	fn    func()
 	resCh chan struct{}
@@ -131,7 +139,8 @@ type Server struct {
 	stopOnce        sync.Once
 	requestVoteCh   chan RequestVoteEvent
 	appendEntriesCh chan AppendEntriesEvent
-	voteResultCh    chan RequestVoteResult
+	voteResultCh      chan RequestVoteResult
+	heartbeatResultCh chan HeartbeatResult
 	stateActionCh   chan stateAction
 	loopDone        chan struct{}
 	loopRunning     atomic.Bool
@@ -150,6 +159,9 @@ type Server struct {
 
 	// votesGranted counts the total number of votes granted by this node.
 	votesGranted uint64
+
+	// heartbeatsReceived counts the total number of valid heartbeats received by this node.
+	heartbeatsReceived uint64
 }
 
 // NewServer creates and initializes a new Raft Server.
@@ -180,6 +192,7 @@ func NewServer(
 	requestVoteCh := make(chan RequestVoteEvent, 64)
 	appendEntriesCh := make(chan AppendEntriesEvent, 64)
 	voteResultCh := make(chan RequestVoteResult, 64)
+	heartbeatResultCh := make(chan HeartbeatResult, 64)
 	stateActionCh := make(chan stateAction, 64)
 	loopDone := make(chan struct{})
 
@@ -205,6 +218,7 @@ func NewServer(
 		requestVoteCh:     requestVoteCh,
 		appendEntriesCh:   appendEntriesCh,
 		voteResultCh:      voteResultCh,
+		heartbeatResultCh: heartbeatResultCh,
 		stateActionCh:     stateActionCh,
 		loopDone:          loopDone,
 	}
@@ -238,6 +252,11 @@ func (s *Server) VotesReceived() map[raft.NodeID]bool {
 // VoteResultChannel returns the internal vote result channel used by the event loop.
 func (s *Server) VoteResultChannel() chan RequestVoteResult {
 	return s.voteResultCh
+}
+
+// HeartbeatResultChannel returns the internal heartbeat result channel used by the event loop.
+func (s *Server) HeartbeatResultChannel() chan HeartbeatResult {
+	return s.heartbeatResultCh
 }
 
 // GetStorage returns the current storage engine.
@@ -1184,6 +1203,13 @@ func (s *Server) VotesGranted() uint64 {
 	return s.votesGranted
 }
 
+// HeartbeatsReceived returns the number of valid empty AppendEntries (heartbeats) received.
+func (s *Server) HeartbeatsReceived() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.heartbeatsReceived
+}
+
 // resetElectionTimerOnGrantingVoteLocked resets the follower's election timer
 // upon granting a vote to a candidate, as required by Raft paper §5.2 / Figure 2:
 // "If election timeout elapses without receiving AppendEntries RPC from current leader
@@ -1371,6 +1397,10 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 				"timeout_ms", newTimeout.Milliseconds(),
 			)
 		}
+	}
+
+	if len(req.Entries) == 0 {
+		s.heartbeatsReceived++
 	}
 
 	// Figure 2 AppendEntries Rule 2:
@@ -1941,21 +1971,97 @@ func (s *Server) handleHeartbeatTick() {
 	s.broadcastHeartbeats()
 }
 
-// broadcastHeartbeats sends AppendEntries heartbeats to all cluster peers.
-// Currently stubbed to log 'would send heartbeat to peer X' until log replication and peer RPC dispatch are wired.
+// broadcastHeartbeats sends real empty AppendEntries RPCs (heartbeats) to all cluster peers (§5.2).
+// In Raft (§5.2), leaders periodically send heartbeats (AppendEntries with no log entries)
+// to maintain authority and prevent election timeouts on followers.
 func (s *Server) broadcastHeartbeats() {
 	if s.State != raft.Leader {
 		return
 	}
+
+	term := s.PersistentState.CurrentTerm
+	id := s.ID
+	lastLogIndex, lastLogTerm := s.lastLogInfoLocked()
+
+	var commitIndex raft.LogIndex
+	if s.VolatileState != nil {
+		commitIndex = s.VolatileState.CommitIndex
+	}
+
+	timeout := s.RPCTimeout()
+
 	for _, peer := range s.Peers {
-		if peer.ID == s.ID {
+		if peer.ID == id {
 			continue
 		}
 		s.GetLogger().Info(fmt.Sprintf("would send heartbeat to peer %d", peer.ID),
-			"leader_id", int(s.ID),
+			"leader_id", int(id),
 			"peer_id", int(peer.ID),
 			"peer_addr", peer.Address,
 		)
+
+		if s.loopRunning.Load() && s.RPCClientPool != nil && peer.Address != "" {
+			go func(p Peer) {
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				defer cancel()
+
+				stopDone := make(chan struct{})
+				go func() {
+					select {
+					case <-s.stopCh:
+						cancel()
+					case <-stopDone:
+					}
+				}()
+				defer close(stopDone)
+
+				args := &raft.AppendEntriesArgs{
+					Term:         term,
+					LeaderID:     id,
+					PrevLogIndex: lastLogIndex,
+					PrevLogTerm:  lastLogTerm,
+					Entries:      nil,
+					LeaderCommit: commitIndex,
+				}
+
+				reply, err := s.SendAppendEntries(ctx, p, args)
+
+				select {
+				case s.heartbeatResultCh <- HeartbeatResult{
+					PeerID: p.ID,
+					Term:   term,
+					Reply:  reply,
+					Err:    err,
+				}:
+				case <-s.stopCh:
+				}
+			}(peer)
+		}
+	}
+}
+
+// handleHeartbeatResultLocked processes an AppendEntries heartbeat response received from a peer.
+// Must be called with s.mu held (or inside the event loop).
+func (s *Server) handleHeartbeatResultLocked(res HeartbeatResult) {
+	if res.Err != nil || res.Reply == nil {
+		return
+	}
+
+	var currentTerm uint64
+	if s.PersistentState != nil {
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	// Figure 2: If RPC response contains term T > currentTerm, convert to follower (§5.1)
+	if uint64(res.Reply.Term) > currentTerm {
+		s.GetLogger().Info("discovered higher term in AppendEntries heartbeat reply, stepping down to follower",
+			"node_id", int(s.ID),
+			"reply_term", uint64(res.Reply.Term),
+			"current_term", currentTerm,
+			"peer_id", int(res.PeerID),
+		)
+		s.becomeFollowerLocked(res.Reply.Term)
+		return
 	}
 }
 
@@ -2011,6 +2117,11 @@ func (s *Server) run() {
 		case res := <-s.voteResultCh:
 			s.mu.Lock()
 			s.handleVoteResultLocked(res)
+			s.mu.Unlock()
+
+		case res := <-s.heartbeatResultCh:
+			s.mu.Lock()
+			s.handleHeartbeatResultLocked(res)
 			s.mu.Unlock()
 
 		case <-heartbeatCh:

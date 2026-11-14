@@ -3528,6 +3528,258 @@ func TestElection_SplitVote_TwoCandidatesSameTerm_ResolvesToOneLeader(t *testing
 	}
 }
 
+func TestAppendEntries_FollowerResetsElectionTimerOnlyOnValidLeader(t *testing.T) {
+	// Raft §5.2 / Figure 2:
+	// A follower resets its election timer only on receiving valid AppendEntries
+	// from the current leader (term == currentTerm) or a new leader (term > currentTerm).
+	// Stale leaders (term < currentTerm) must be rejected and must NOT reset the timer.
+
+	t.Run("CurrentTermLeader_ResetsTimerAndIncrementsCount", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    -1,
+		}, nil)
+		defer srv.Close()
+
+		time.Sleep(15 * time.Millisecond)
+		hbBefore := srv.LastHeartbeatTime()
+		hbCountBefore := srv.HeartbeatsReceived()
+
+		reply := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+			Term:     2,
+			LeaderId: 2,
+		})
+
+		if !reply.Success {
+			t.Fatalf("expected AppendEntries from current leader to succeed")
+		}
+		if !srv.LastHeartbeatTime().After(hbBefore) {
+			t.Fatalf("valid AppendEntries MUST update LastHeartbeatTime (reset election timer)")
+		}
+		if srv.HeartbeatsReceived() != hbCountBefore+1 {
+			t.Fatalf("HeartbeatsReceived should increment to %d, got %d", hbCountBefore+1, srv.HeartbeatsReceived())
+		}
+	})
+
+	t.Run("HigherTermLeader_StepsDownUpdatesTermAndResetsTimer", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 2,
+			VotedFor:    1,
+		}, nil)
+		defer srv.Close()
+
+		time.Sleep(15 * time.Millisecond)
+		hbBefore := srv.LastHeartbeatTime()
+		hbCountBefore := srv.HeartbeatsReceived()
+
+		reply := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+			Term:     4,
+			LeaderId: 3,
+		})
+
+		if !reply.Success {
+			t.Fatalf("expected AppendEntries from higher term leader to succeed")
+		}
+		if reply.Term != 4 {
+			t.Fatalf("expected reply term 4, got %d", reply.Term)
+		}
+		if srv.PersistentState.CurrentTerm != 4 {
+			t.Fatalf("expected currentTerm updated to 4, got %d", srv.PersistentState.CurrentTerm)
+		}
+		if !srv.LastHeartbeatTime().After(hbBefore) {
+			t.Fatalf("AppendEntries from higher term leader MUST update LastHeartbeatTime")
+		}
+		if srv.HeartbeatsReceived() != hbCountBefore+1 {
+			t.Fatalf("HeartbeatsReceived should increment to %d, got %d", hbCountBefore+1, srv.HeartbeatsReceived())
+		}
+	})
+
+	t.Run("StaleLeader_RejectsAndDoesNotResetTimer", func(t *testing.T) {
+		srv := NewServer(1, nil, &raft.PersistentState{
+			CurrentTerm: 5,
+			VotedFor:    -1,
+		}, nil)
+		defer srv.Close()
+
+		time.Sleep(15 * time.Millisecond)
+		hbBefore := srv.LastHeartbeatTime()
+		hbCountBefore := srv.HeartbeatsReceived()
+
+		reply := srv.processAppendEntries(&raftpb.AppendEntriesArgs{
+			Term:     3, // Stale: 3 < 5
+			LeaderId: 2,
+		})
+
+		if reply.Success {
+			t.Fatalf("AppendEntries from stale leader must fail")
+		}
+		if reply.Term != 5 {
+			t.Fatalf("expected reply term 5, got %d", reply.Term)
+		}
+		if !srv.LastHeartbeatTime().Equal(hbBefore) {
+			t.Fatalf("stale AppendEntries MUST NOT update LastHeartbeatTime (must NOT reset election timer)")
+		}
+		if srv.HeartbeatsReceived() != hbCountBefore {
+			t.Fatalf("HeartbeatsReceived should NOT change on stale AppendEntries")
+		}
+	})
+}
+
+func TestLeader_BroadcastHeartbeats_SendsRealEmptyAppendEntries(t *testing.T) {
+	// Verify that the leader dispatches real empty AppendEntries RPCs over the network
+	// to connected cluster peers.
+	follower := NewServer(2, nil, &raft.PersistentState{CurrentTerm: 1, VotedFor: -1}, nil)
+	if err := follower.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start follower: %v", err)
+	}
+	defer follower.Close()
+
+	leader := NewServer(1, []Peer{
+		{ID: 2, Address: follower.Addr().String()},
+	}, &raft.PersistentState{CurrentTerm: 1, VotedFor: 1}, nil)
+	leader.SetHeartbeatInterval(25 * time.Millisecond)
+	if err := leader.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start leader: %v", err)
+	}
+	defer leader.Close()
+
+	if err := leader.ConnectPeers(); err != nil {
+		t.Fatalf("leader failed to connect to follower: %v", err)
+	}
+
+	// Transition leader to Leader state
+	leader.becomeLeader()
+
+	// Wait for several heartbeat intervals to fire
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if follower.HeartbeatsReceived() >= 3 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	received := follower.HeartbeatsReceived()
+	if received < 3 {
+		t.Fatalf("expected follower to receive at least 3 real empty AppendEntries heartbeats, got %d", received)
+	}
+}
+
+func TestCluster_LeaderSuppressesFollowerElectionsWhileHealthy(t *testing.T) {
+	// Raft §5.2:
+	// "A leader sends periodic heartbeats (AppendEntries RPCs that carry no log entries)
+	//  to all followers in order to maintain its authority... If election timeout elapses
+	//  without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate"
+	//
+	// Once a leader is elected, as long as it sends periodic heartbeats, no follower should time out,
+	// and no further elections should occur while the leader is healthy.
+
+	servers := make([]*Server, 3)
+	for i := 0; i < 3; i++ {
+		id := raft.NodeID(i + 1)
+		srv := NewServer(id, nil, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
+		srv.SetHeartbeatInterval(20 * time.Millisecond)
+		// Followers have election timeout range [80ms, 160ms]
+		if srv.GetElectionTimer() != nil {
+			srv.GetElectionTimer().SetRange(80*time.Millisecond, 160*time.Millisecond)
+			srv.ResetElectionTimeout()
+		}
+		if err := srv.Start("127.0.0.1:0"); err != nil {
+			t.Fatalf("failed to start server %d: %v", id, err)
+		}
+		defer srv.Close()
+		servers[i] = srv
+	}
+
+	// Full mesh routing
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 3; j++ {
+			if i != j {
+				servers[i].AddPeer(Peer{
+					ID:      servers[j].ID,
+					Address: servers[j].Addr().String(),
+				})
+			}
+		}
+	}
+
+	for _, srv := range servers {
+		if err := srv.ConnectPeers(); err != nil {
+			t.Fatalf("node %d failed to connect peers: %v", srv.ID, err)
+		}
+	}
+
+	leaderNode := servers[0]
+	followerA := servers[1]
+	followerB := servers[2]
+
+	// Start election on Node 1 to elect it leader
+	leaderNode.StartElection()
+
+	// Wait for Node 1 to become leader
+	electionDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(electionDeadline) {
+		if leaderNode.GetState() == raft.Leader {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if leaderNode.GetState() != raft.Leader {
+		t.Fatalf("expected Node 1 to become Leader, got %s", leaderNode.GetState())
+	}
+
+	initialTerm := leaderNode.PersistentState.CurrentTerm
+	if initialTerm < 1 {
+		t.Fatalf("expected leader term >= 1, got %d", initialTerm)
+	}
+
+	// Record heartbeats received so far by followers
+	hbAStart := followerA.HeartbeatsReceived()
+	hbBStart := followerB.HeartbeatsReceived()
+
+	// Let the cluster run for 400ms:
+	// - Heartbeat interval is 20ms (leader sends ~20 heartbeats)
+	// - Follower election timeout is 80-160ms (3 to 5 timeout windows elapse)
+	// While healthy heartbeats are being sent, neither follower should time out!
+	time.Sleep(400 * time.Millisecond)
+
+	// Verify Node 1 is STILL the ONLY leader
+	if leaderNode.GetState() != raft.Leader {
+		t.Fatalf("expected Node 1 to remain Leader, got %s", leaderNode.GetState())
+	}
+	if leaderNode.PersistentState.CurrentTerm != initialTerm {
+		t.Fatalf("leader term changed from %d to %d (unexpected re-election occurred)", initialTerm, leaderNode.PersistentState.CurrentTerm)
+	}
+
+	// Verify both followers remained in Follower state
+	if followerA.GetState() != raft.Follower {
+		t.Fatalf("follower A transitioned to %s; expected to remain Follower", followerA.GetState())
+	}
+	if followerB.GetState() != raft.Follower {
+		t.Fatalf("follower B transitioned to %s; expected to remain Follower", followerB.GetState())
+	}
+
+	// Verify followers received numerous heartbeats from the healthy leader
+	if followerA.HeartbeatsReceived() <= hbAStart+5 {
+		t.Fatalf("follower A received insufficient heartbeats: started with %d, now %d", hbAStart, followerA.HeartbeatsReceived())
+	}
+	if followerB.HeartbeatsReceived() <= hbBStart+5 {
+		t.Fatalf("follower B received insufficient heartbeats: started with %d, now %d", hbBStart, followerB.HeartbeatsReceived())
+	}
+
+	// Verify no split brain: exactly 1 leader in the entire cluster
+	leaderCount := 0
+	for _, srv := range servers {
+		if srv.GetState() == raft.Leader {
+			leaderCount++
+		}
+	}
+	if leaderCount != 1 {
+		t.Fatalf("expected exactly 1 leader in cluster, got %d", leaderCount)
+	}
+}
+
 
 
 
