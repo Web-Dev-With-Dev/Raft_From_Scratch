@@ -427,11 +427,13 @@ type Cluster struct {
 }
 
 type clusterOptions struct {
-	minTimeout        time.Duration
-	maxTimeout        time.Duration
-	heartbeatInterval time.Duration
-	rpcTimeout        time.Duration
-	autoStart         bool
+	minTimeout          time.Duration
+	maxTimeout          time.Duration
+	heartbeatInterval   time.Duration
+	rpcTimeout          time.Duration
+	checkQuorum         bool
+	checkQuorumInterval time.Duration
+	autoStart           bool
 }
 
 // ClusterOption configures test cluster parameters.
@@ -456,6 +458,20 @@ func WithHeartbeatInterval(interval time.Duration) ClusterOption {
 func WithRPCTimeout(timeout time.Duration) ClusterOption {
 	return func(o *clusterOptions) {
 		o.rpcTimeout = timeout
+	}
+}
+
+// WithCheckQuorum enables or disables check-quorum mechanism for all nodes in the cluster (§6.2).
+func WithCheckQuorum(enabled bool) ClusterOption {
+	return func(o *clusterOptions) {
+		o.checkQuorum = enabled
+	}
+}
+
+// WithCheckQuorumInterval configures the check-quorum timeout interval for all nodes.
+func WithCheckQuorumInterval(interval time.Duration) ClusterOption {
+	return func(o *clusterOptions) {
+		o.checkQuorumInterval = interval
 	}
 }
 
@@ -504,6 +520,12 @@ func NewCluster(t testing.TB, n int, opts ...ClusterOption) *Cluster {
 		if srv.GetElectionTimer() != nil {
 			srv.GetElectionTimer().SetRange(options.minTimeout, options.maxTimeout)
 			srv.ResetElectionTimeout()
+		}
+		if options.checkQuorum {
+			srv.SetCheckQuorum(true)
+			if options.checkQuorumInterval > 0 {
+				srv.SetCheckQuorumInterval(options.checkQuorumInterval)
+			}
 		}
 
 		servers[id] = srv
@@ -670,4 +692,22 @@ func (c *Cluster) Drop(src, dst raft.NodeID) {
 // SetDelay configures latency delay between src and dst.
 func (c *Cluster) SetDelay(src, dst raft.NodeID, delay time.Duration) {
 	c.Network.SetDelay(src, dst, delay)
+}
+
+// SetCheckQuorum enables or disables the check-quorum mechanism for all nodes in the cluster.
+func (c *Cluster) SetCheckQuorum(enabled bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, srv := range c.servers {
+		srv.SetCheckQuorum(enabled)
+	}
+}
+
+// SetCheckQuorumInterval updates the check-quorum interval for all nodes in the cluster.
+func (c *Cluster) SetCheckQuorumInterval(interval time.Duration) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, srv := range c.servers {
+		srv.SetCheckQuorumInterval(interval)
+	}
 }

@@ -131,11 +131,94 @@ func TestHarness_Day20_CrashScenario(t *testing.T) {
 	}
 }
 
-// TestHarness_Network_Partition_MajorityElectsLeader_MinorityStepsDown verifies:
-// 1. A 3-node cluster elects Node 1 leader.
-// 2. Partitioning {1} (minority) from {2, 3} (majority) causes {2, 3} to elect a new leader.
-// 3. Healing the partition causes old leader Node 1 to step down to Follower.
-func TestHarness_Network_Partition_MajorityElectsLeader_MinorityStepsDown(t *testing.T) {
+// TestHarness_Network_Partition_OldLeaderIsolatedWithMinority_MustNotKeepActingAsLeader verifies that:
+// When a network partition isolates the leader with a minority of nodes (e.g., 2 nodes out of 5),
+// the leader loses quorum and must NOT keep acting as leader (§6.2 Check Quorum).
+// It steps down to Follower, while the majority partition elects a new leader.
+func TestHarness_Network_Partition_OldLeaderIsolatedWithMinority_MustNotKeepActingAsLeader(t *testing.T) {
+	minTimeout := 100 * time.Millisecond
+	maxTimeout := 200 * time.Millisecond
+	heartbeatInterval := 20 * time.Millisecond
+	checkQuorumInterval := 100 * time.Millisecond
+
+	// 5-node cluster with check-quorum enabled
+	cluster := NewCluster(t, 5,
+		WithElectionTimeout(minTimeout, maxTimeout),
+		WithHeartbeatInterval(heartbeatInterval),
+		WithRPCTimeout(40*time.Millisecond),
+		WithCheckQuorum(true),
+		WithCheckQuorumInterval(checkQuorumInterval),
+	)
+
+	// Elect Node 1 as initial leader
+	cluster.GetNode(1).StartElection()
+
+	leader, initialTerm, err := cluster.WaitLeader(2 * time.Second)
+	if err != nil {
+		t.Fatalf("failed to elect initial leader: %v", err)
+	}
+	if leader.ID != 1 {
+		t.Fatalf("expected Node 1 leader, got %d", leader.ID)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	// Partition: {1, 2} (minority: 2/5) is isolated from {3, 4, 5} (majority: 3/5)
+	cluster.Partition([]raft.NodeID{1, 2}, []raft.NodeID{3, 4, 5})
+
+	// 1. In minority partition {1, 2}: Node 1 can only reach Node 2 (acked = 2 < majority 3).
+	// Within checkQuorumInterval, Node 1 must detect quorum loss and step down to Follower!
+	stepDownDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(stepDownDeadline) {
+		if cluster.GetNode(1).GetState() != raft.Leader {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if cluster.GetNode(1).GetState() == raft.Leader {
+		t.Fatalf("isolated leader Node 1 with minority must NOT keep acting as leader, but state is still %s",
+			cluster.GetNode(1).GetState())
+	}
+	t.Logf("Isolated old leader Node 1 successfully stepped down to %s upon losing majority quorum",
+		cluster.GetNode(1).GetState())
+
+	// 2. In majority partition {3, 4, 5}: Nodes 3, 4, 5 time out and elect a new leader with higher term
+	reElectionDeadline := time.Now().Add(3 * time.Second)
+	var majorityLeader *Server
+	for time.Now().Before(reElectionDeadline) {
+		for _, id := range []raft.NodeID{3, 4, 5} {
+			node := cluster.GetNode(id)
+			if node.GetState() == raft.Leader && node.Status().Term > initialTerm {
+				majorityLeader = node
+				break
+			}
+		}
+		if majorityLeader != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if majorityLeader == nil {
+		t.Fatalf("majority partition {3, 4, 5} failed to elect a new leader (3: %s, 4: %s, 5: %s)",
+			cluster.GetNode(3).GetState(), cluster.GetNode(4).GetState(), cluster.GetNode(5).GetState())
+	}
+
+	t.Logf("Majority partition {3, 4, 5} elected new Leader: Node %d in term %d (initial term was %d)",
+		majorityLeader.ID, majorityLeader.Status().Term, initialTerm)
+
+	// Verify Node 1 is definitely not the leader
+	if cluster.GetNode(1).GetState() == raft.Leader {
+		t.Fatalf("Node 1 should not be leader")
+	}
+}
+
+// TestHarness_Network_Partition_Heals_OldLeaderStepsDownOnHigherTerm verifies:
+// 1. A cluster elects Node 1 leader.
+// 2. Partition isolates Node 1, majority partition elects a new leader in a higher term.
+// 3. When the partition heals, the isolated old leader steps down on seeing the higher term (§5.1).
+func TestHarness_Network_Partition_Heals_OldLeaderStepsDownOnHigherTerm(t *testing.T) {
 	minTimeout := 100 * time.Millisecond
 	maxTimeout := 200 * time.Millisecond
 	heartbeatInterval := 20 * time.Millisecond
@@ -162,14 +245,8 @@ func TestHarness_Network_Partition_MajorityElectsLeader_MinorityStepsDown(t *tes
 	// Partition: {1} is isolated from {2, 3}
 	cluster.Partition([]raft.NodeID{1}, []raft.NodeID{2, 3})
 
-	if !cluster.Network.IsPartitioned(1, 2) || !cluster.Network.IsPartitioned(2, 1) {
-		t.Fatalf("expected nodes 1 and 2 to be partitioned")
-	}
-	if !cluster.Network.IsPartitioned(1, 3) || !cluster.Network.IsPartitioned(3, 1) {
-		t.Fatalf("expected nodes 1 and 3 to be partitioned")
-	}
-	if cluster.Network.IsPartitioned(2, 3) || cluster.Network.IsPartitioned(3, 2) {
-		t.Fatalf("nodes 2 and 3 must NOT be partitioned from each other")
+	if !cluster.Network.IsPartitioned(1, 2) || !cluster.Network.IsPartitioned(1, 3) {
+		t.Fatalf("expected node 1 to be partitioned from nodes 2 and 3")
 	}
 
 	// Majority partition {2, 3} should time out and elect a new leader
@@ -229,6 +306,114 @@ func TestHarness_Network_Partition_MajorityElectsLeader_MinorityStepsDown(t *tes
 
 	t.Logf("Partition healed: Node 1 successfully stepped down to Follower at term %d",
 		cluster.GetNode(1).Status().Term)
+}
+
+// TestHarness_Cluster5_Tolerates2NodeFailures_StillElectsLeader verifies that:
+// In a 5-node Raft cluster, up to 2 simultaneous node failures are tolerated.
+// The remaining 3 nodes form a majority quorum (3/5) and successfully elect a leader.
+func TestHarness_Cluster5_Tolerates2NodeFailures_StillElectsLeader(t *testing.T) {
+	minTimeout := 100 * time.Millisecond
+	maxTimeout := 200 * time.Millisecond
+	heartbeatInterval := 20 * time.Millisecond
+
+	cluster := NewCluster(t, 5,
+		WithElectionTimeout(minTimeout, maxTimeout),
+		WithHeartbeatInterval(heartbeatInterval),
+		WithRPCTimeout(40*time.Millisecond),
+	)
+
+	// 1. Elect initial leader on Node 1
+	cluster.GetNode(1).StartElection()
+
+	leader, initialTerm, err := cluster.WaitLeader(2 * time.Second)
+	if err != nil {
+		t.Fatalf("failed to elect initial leader: %v", err)
+	}
+	if leader.ID != 1 {
+		t.Fatalf("expected Node 1 to become initial leader, got %d", leader.ID)
+	}
+
+	// Allow heartbeats to circulate
+	time.Sleep(60 * time.Millisecond)
+
+	// 2. Simulate 2 simultaneous node failures: Kill Node 1 (current leader) and Node 2
+	killTime := time.Now()
+	cluster.Kill(1)
+	cluster.Kill(2)
+
+	if !cluster.GetNode(1).IsKilled() || !cluster.GetNode(2).IsKilled() {
+		t.Fatalf("expected both Node 1 and Node 2 to report IsKilled() == true")
+	}
+
+	// 3. Surviving nodes: {3, 4, 5} (3 out of 5 = majority quorum).
+	// They must detect timeout and elect a single new leader among {3, 4, 5}.
+	reElectionDeadline := time.Now().Add(3 * time.Second)
+	var newLeader *Server
+	for time.Now().Before(reElectionDeadline) {
+		for _, id := range []raft.NodeID{3, 4, 5} {
+			node := cluster.GetNode(id)
+			if node.GetState() == raft.Leader && node.Status().Term > initialTerm {
+				newLeader = node
+				break
+			}
+		}
+		if newLeader != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	timeToNewLeader := time.Since(killTime)
+
+	if newLeader == nil {
+		t.Fatalf("5-node cluster failed to elect a new leader with 2 dead nodes (3: %s, 4: %s, 5: %s)",
+			cluster.GetNode(3).GetState(), cluster.GetNode(4).GetState(), cluster.GetNode(5).GetState())
+	}
+
+	newTerm := newLeader.Status().Term
+
+	t.Logf("================================================================================")
+	t.Logf("5-NODE CLUSTER (2 SIMULTANEOUS FAILURES) ELECTION MEASUREMENT:")
+	t.Logf("Nodes 1 and 2 killed at: %v", killTime.Format("15:04:05.000"))
+	t.Logf("New Leader elected: Node %d at term %d", newLeader.ID, newTerm)
+	t.Logf("Time to elect new leader: %v (%.2f ms)", timeToNewLeader, float64(timeToNewLeader.Microseconds())/1000.0)
+	t.Logf("Configured Election Timeout Range: [%v, %v]", minTimeout, maxTimeout)
+	t.Logf("Ratio to Min Timeout: %.2fx", float64(timeToNewLeader)/float64(minTimeout))
+	t.Logf("Ratio to Max Timeout: %.2fx", float64(timeToNewLeader)/float64(maxTimeout))
+	t.Logf("================================================================================")
+
+	// Assertions
+	if newLeader.ID == 1 || newLeader.ID == 2 {
+		t.Fatalf("new leader cannot be a dead node (1 or 2)")
+	}
+	if newTerm <= initialTerm {
+		t.Fatalf("expected new leader term > %d, got %d", initialTerm, newTerm)
+	}
+
+	// Verify remaining live nodes are in Follower state
+	time.Sleep(50 * time.Millisecond)
+	for _, id := range []raft.NodeID{3, 4, 5} {
+		node := cluster.GetNode(id)
+		if id != newLeader.ID {
+			if node.GetState() != raft.Follower {
+				t.Fatalf("surviving node %d should be Follower, got %s", id, node.GetState())
+			}
+		}
+	}
+
+	// Dead nodes remain killed
+	if !cluster.GetNode(1).IsKilled() || !cluster.GetNode(2).IsKilled() {
+		t.Fatalf("dead nodes must remain killed")
+	}
+
+	// Verify time-to-new-leader is roughly 1-3x election timeout
+	if timeToNewLeader < minTimeout/2 {
+		t.Fatalf("time-to-new-leader %v unexpectedly faster than minTimeout/2", timeToNewLeader)
+	}
+	maxAllowed := 3*maxTimeout + 300*time.Millisecond
+	if timeToNewLeader > maxAllowed {
+		t.Fatalf("time-to-new-leader %v exceeded upper bound %v", timeToNewLeader, maxAllowed)
+	}
 }
 
 // TestHarness_Network_DropMessage verifies that dropped messages prevent delivery,

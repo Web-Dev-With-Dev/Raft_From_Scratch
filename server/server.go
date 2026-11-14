@@ -168,6 +168,12 @@ type Server struct {
 	resumeCh      chan struct{}
 	pauseNotifyCh chan struct{}
 	pauseMu       sync.Mutex
+
+	// checkQuorum controls (§6.2): leader steps down if it loses contact with a majority
+	checkQuorum         bool
+	checkQuorumInterval time.Duration
+	checkQuorumTimer    *time.Timer
+	heartbeatAcks       map[raft.NodeID]bool
 }
 
 // NewServer creates and initializes a new Raft Server.
@@ -229,6 +235,7 @@ func NewServer(
 		stateActionCh:     stateActionCh,
 		loopDone:          loopDone,
 		pauseNotifyCh:     pauseNotifyCh,
+		heartbeatAcks:     make(map[raft.NodeID]bool),
 	}
 }
 
@@ -548,6 +555,85 @@ func (s *Server) SetHeartbeatInterval(interval time.Duration) {
 	if s.State == raft.Leader && s.heartbeatTimer != nil {
 		s.heartbeatTimer.Reset(interval)
 	}
+}
+
+// SetCheckQuorum enables or disables the check-quorum mechanism (§6.2).
+// When enabled, a leader that cannot contact a majority of cluster nodes
+// within checkQuorumInterval steps down to Follower.
+func (s *Server) SetCheckQuorum(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.checkQuorum = enabled
+	if enabled && s.State == raft.Leader {
+		s.resetCheckQuorumTimerLocked()
+	} else if !enabled && s.checkQuorumTimer != nil {
+		s.checkQuorumTimer.Stop()
+		s.checkQuorumTimer = nil
+	}
+}
+
+// CheckQuorum returns whether check-quorum is enabled.
+func (s *Server) CheckQuorum() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.checkQuorum
+}
+
+// SetCheckQuorumInterval configures the timeout interval for quorum verification.
+func (s *Server) SetCheckQuorumInterval(interval time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.checkQuorumInterval = interval
+	if s.checkQuorum && s.State == raft.Leader && s.checkQuorumTimer != nil {
+		s.checkQuorumTimer.Reset(interval)
+	}
+}
+
+func (s *Server) resetCheckQuorumTimerLocked() {
+	if s.checkQuorumTimer != nil {
+		s.checkQuorumTimer.Stop()
+	}
+	interval := s.checkQuorumInterval
+	if interval <= 0 {
+		if s.ElectionTimer != nil {
+			minT, _ := s.ElectionTimer.Range()
+			interval = minT
+		} else {
+			interval = raft.DefaultMinElectionTimeout
+		}
+	}
+	s.checkQuorumTimer = time.NewTimer(interval)
+}
+
+func (s *Server) handleCheckQuorumTimeoutLocked() {
+	if s.State != raft.Leader || !s.checkQuorum {
+		return
+	}
+
+	totalNodes := len(s.Peers) + 1
+	majority := (totalNodes / 2) + 1
+	ackedCount := len(s.heartbeatAcks) + 1 // Self counts as 1
+
+	curTerm := uint64(0)
+	if s.PersistentState != nil {
+		curTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	if ackedCount < majority {
+		s.GetLogger().Info("leader lost contact with majority, stepping down to Follower (§6.2)",
+			"node_id", int(s.ID),
+			"term", curTerm,
+			"acked_nodes", ackedCount,
+			"majority_required", majority,
+			"total_nodes", totalNodes,
+		)
+		s.becomeFollowerLocked(raft.Term(curTerm))
+		return
+	}
+
+	// Quorum healthy: reset acknowledgments for next period and re-arm timer
+	s.heartbeatAcks = make(map[raft.NodeID]bool)
+	s.resetCheckQuorumTimerLocked()
 }
 
 // HeartbeatsSent returns the total number of leader heartbeat ticks dispatched.
@@ -974,6 +1060,11 @@ func (s *Server) stopHeartbeatTickerLocked() {
 		s.heartbeatTimer.Stop()
 		s.heartbeatTimer = nil
 	}
+	if s.checkQuorumTimer != nil {
+		s.checkQuorumTimer.Stop()
+		s.checkQuorumTimer = nil
+	}
+	s.heartbeatAcks = make(map[raft.NodeID]bool)
 }
 
 // Stop immediately stops the gRPC server, debug HTTP server, and main event loop.
@@ -1693,6 +1784,11 @@ func (s *Server) becomeLeaderLocked() {
 	}
 	s.heartbeatTimer = time.NewTimer(s.heartbeatInterval)
 
+	s.heartbeatAcks = make(map[raft.NodeID]bool)
+	if s.checkQuorum {
+		s.resetCheckQuorumTimerLocked()
+	}
+
 	var curTerm uint64
 	if s.PersistentState != nil {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
@@ -2109,6 +2205,13 @@ func (s *Server) broadcastHeartbeats() {
 // handleHeartbeatResultLocked processes an AppendEntries heartbeat response received from a peer.
 // Must be called with s.mu held (or inside the event loop).
 func (s *Server) handleHeartbeatResultLocked(res HeartbeatResult) {
+	if res.Err == nil && res.Reply != nil && res.Reply.Success {
+		if s.heartbeatAcks == nil {
+			s.heartbeatAcks = make(map[raft.NodeID]bool)
+		}
+		s.heartbeatAcks[res.PeerID] = true
+	}
+
 	if res.Err != nil || res.Reply == nil {
 		return
 	}
@@ -2181,12 +2284,22 @@ func (s *Server) run() {
 			}
 		}
 
+		var checkQuorumCh <-chan time.Time
+		if s.State == raft.Leader && s.checkQuorum && s.checkQuorumTimer != nil {
+			checkQuorumCh = s.checkQuorumTimer.C
+		}
+
 		select {
 		case <-s.stopCh:
 			return
 
 		case <-s.pauseNotifyCh:
 			continue
+
+		case <-checkQuorumCh:
+			s.mu.Lock()
+			s.handleCheckQuorumTimeoutLocked()
+			s.mu.Unlock()
 
 		case t, ok := <-timerCh:
 			if !ok {
