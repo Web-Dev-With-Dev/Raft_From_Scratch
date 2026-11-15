@@ -34,6 +34,15 @@ func (m *mockClock) After(d time.Duration) <-chan time.Time {
 	return t.C()
 }
 
+func (m *mockClock) AfterFunc(d time.Duration, f func()) Timer {
+	t := m.NewTimer(d)
+	go func() {
+		<-t.C()
+		f()
+	}()
+	return t
+}
+
 func (m *mockClock) NewTimer(d time.Duration) Timer {
 	m.mu.Lock()
 	defer m.mu.Unlock()

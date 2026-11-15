@@ -20,6 +20,10 @@ type Clock interface {
 	// After waits for the duration to elapse and then sends the current time
 	// on the returned channel.
 	After(d time.Duration) <-chan time.Time
+
+	// AfterFunc waits for the duration to elapse and then calls f in its own goroutine.
+	// It returns a Timer that can be used to cancel the call using its Stop method.
+	AfterFunc(d time.Duration, f func()) Timer
 }
 
 // Timer represents a single event. When the Timer expires, the current time
@@ -69,6 +73,11 @@ func (c *RealClock) After(d time.Duration) <-chan time.Time {
 	return time.After(d)
 }
 
+// AfterFunc waits for the duration to elapse and then calls f in its own goroutine.
+func (c *RealClock) AfterFunc(d time.Duration, f func()) Timer {
+	return &realTimer{t: time.AfterFunc(d, f)}
+}
+
 // NewTimer creates a real Timer wrapping time.NewTimer(d).
 func (c *RealClock) NewTimer(d time.Duration) Timer {
 	return &realTimer{t: time.NewTimer(d)}
@@ -110,4 +119,3 @@ func (rt *realTicker) Reset(d time.Duration) {
 func (rt *realTicker) Stop() {
 	rt.t.Stop()
 }
-
