@@ -284,4 +284,3 @@ func TestClientPool_ConnectWithRetry_ContextCancelled(t *testing.T) {
 		t.Fatalf("expected error on cancelled context")
 	}
 }
-

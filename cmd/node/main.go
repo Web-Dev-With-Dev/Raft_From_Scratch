@@ -18,126 +18,148 @@ import (
 	"raft/server"
 )
 
-func main() {
+type cliFlags struct {
+	nodeID     int
+	configPath string
+	statusAddr string
+	logLevel   string
+}
+
+func parseCLIFlags() cliFlags {
 	nodeIDFlag := flag.Int("id", 1, "Node ID for this Raft instance (e.g. 1, 2, 3)")
 	configPathFlag := flag.String("config", "cluster.json", "Path to cluster configuration JSON file")
 	statusAddrFlag := flag.String("status-addr", "", "Optional HTTP address for debug /status endpoint (e.g. 127.0.0.1:9001)")
 	logLevelFlag := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	flag.Parse()
-
-	id := raft.NodeID(*nodeIDFlag)
-
-	var level slog.Level
-	switch strings.ToLower(*logLevelFlag) {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn", "warning":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		level = slog.LevelInfo
+	return cliFlags{
+		nodeID:     *nodeIDFlag,
+		configPath: *configPathFlag,
+		statusAddr: *statusAddrFlag,
+		logLevel:   *logLevelFlag,
 	}
+}
 
+func main() {
+	flags := parseCLIFlags()
+	id := raft.NodeID(flags.nodeID)
 	nodeLogger := logger.NewNodeLogger(id, os.Stderr, &logger.Options{
-		Level: level,
+		Level: parseLogLevel(flags.logLevel),
 	})
 
-	// Load cluster configuration
-	cfg, err := config.LoadClusterConfig(*configPathFlag)
+	cfg, err := config.LoadClusterConfig(flags.configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading cluster config from %q: %v\n", *configPathFlag, err)
+		fmt.Fprintf(os.Stderr, "Error loading cluster config from %q: %v\n", flags.configPath, err)
 		os.Exit(1)
 	}
 
-	// Retrieve this node's address
 	nodeCfg, found := cfg.GetNode(id)
 	if !found {
-		fmt.Fprintf(os.Stderr, "Error: node ID %d not found in cluster configuration %q\n", id, *configPathFlag)
+		fmt.Fprintf(os.Stderr, "Error: node ID %d not found in cluster configuration %q\n", id, flags.configPath)
 		os.Exit(1)
 	}
 
-	// Retrieve remote peers (excluding self)
 	peers := cfg.PeersFor(id)
-
-	// Initialize the server
 	srv := server.NewServer(id, peers, nil, nil)
 	srv.SetLogger(nodeLogger)
 
-	// Start listening and serving gRPC
 	if err := srv.Start(nodeCfg.Address); err != nil {
 		srv.GetLogger().Error("failed to start node server", "error", err)
 		os.Exit(1)
 	}
 
-	// Start the debug HTTP endpoint (/status: defaults to 127.0.0.1:9000+id)
-	statusAddr := *statusAddrFlag
-	if statusAddr == "" {
-		statusAddr = fmt.Sprintf("127.0.0.1:%d", 9000+int(id))
-	}
-	if statusAddr != "disabled" && statusAddr != "none" {
-		if err := srv.StartHTTPServer(statusAddr); err != nil {
-			srv.GetLogger().Warn("failed to start debug HTTP status server", "address", statusAddr, "error", err)
-		} else {
-			srv.GetLogger().Info("started debug HTTP status server", "address", statusAddr, "endpoint", fmt.Sprintf("http://%s/status", statusAddr))
-		}
-	}
+	startDebugHTTPServer(srv, id, flags.statusAddr)
 
 	dialCtx, dialCancel := context.WithCancel(context.Background())
 	defer dialCancel()
 
-	// Concurrently dial peers with retry/backoff
-	go func() {
-		ctx, cancel := context.WithTimeout(dialCtx, 15*time.Second)
-		defer cancel()
+	go connectAndVerifyPeers(dialCtx, srv, id, peers)
+	waitForShutdown(srv, dialCancel)
+}
 
-		policy := rpc.DefaultRetryPolicy()
-		policy.MaxRetries = 10
-		policy.InitialBackoff = 100 * time.Millisecond
-		policy.MaxBackoff = 1 * time.Second
+func parseLogLevel(levelStr string) slog.Level {
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
 
-		if err := srv.ConnectPeersWithRetry(ctx, policy); err != nil {
-			srv.GetLogger().Warn("peer connection phase ended with incomplete connections", "error", err)
+func startDebugHTTPServer(srv *server.Server, id raft.NodeID, addrFlag string) {
+	statusAddr := addrFlag
+	if statusAddr == "" {
+		statusAddr = fmt.Sprintf("127.0.0.1:%d", 9000+int(id))
+	}
+	if statusAddr == "disabled" || statusAddr == "none" {
+		return
+	}
+	if err := srv.StartHTTPServer(statusAddr); err != nil {
+		srv.GetLogger().Warn("failed to start debug HTTP status server", "address", statusAddr, "error", err)
+	} else {
+		srv.GetLogger().Info("started debug HTTP status server", "address", statusAddr, "endpoint", fmt.Sprintf("http://%s/status", statusAddr))
+	}
+}
+
+func connectAndVerifyPeers(ctx context.Context, srv *server.Server, id raft.NodeID, peers []server.Peer) {
+	connCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	policy := rpc.DefaultRetryPolicy()
+	policy.MaxRetries = 10
+	policy.InitialBackoff = 100 * time.Millisecond
+	policy.MaxBackoff = 1 * time.Second
+
+	if err := srv.ConnectPeersWithRetry(connCtx, policy); err != nil {
+		srv.GetLogger().Warn("peer connection phase ended with incomplete connections", "error", err)
+		return
+	}
+	srv.GetLogger().Info("all cluster peers connected successfully")
+
+	time.Sleep(150 * time.Millisecond)
+	verifyPeerReachability(ctx, srv, id, peers)
+}
+
+func verifyPeerReachability(ctx context.Context, srv *server.Server, id raft.NodeID, peers []server.Peer) {
+	srv.GetLogger().Info("starting peer RPC reachability verification", "peer_count", len(peers))
+	for _, peer := range peers {
+		select {
+		case <-ctx.Done():
 			return
+		default:
 		}
-		srv.GetLogger().Info("all cluster peers connected successfully")
 
-		// Verify peer reachability by sending an RPC to each connected peer
-		time.Sleep(150 * time.Millisecond) // brief pause to let all nodes finish mutual dials
-		srv.GetLogger().Info("starting peer RPC reachability verification", "peer_count", len(peers))
-		for _, peer := range peers {
-			select {
-			case <-dialCtx.Done():
-				return
-			default:
-			}
-			rpcCtx, rpcCancel := context.WithTimeout(dialCtx, srv.RPCTimeout())
-			reply, err := srv.SendRequestVote(rpcCtx, peer, &raft.RequestVoteArgs{
-				Term:         0,
-				CandidateID:  id,
-				LastLogIndex: 0,
-				LastLogTerm:  0,
-			})
-			rpcCancel()
-			if err != nil {
-				srv.GetLogger().Warn("peer reachability RPC failed", "peer_id", int(peer.ID), "address", peer.Address, "error", err)
-			} else {
-				srv.GetLogger().Info("peer reachability verified via RPC",
-					"peer_id", int(peer.ID),
-					"address", peer.Address,
-					"reply_term", reply.Term,
-					"vote_granted", reply.VoteGranted,
-				)
-			}
+		rpcCtx, rpcCancel := context.WithTimeout(ctx, srv.RPCTimeout())
+		reply, err := srv.SendRequestVote(rpcCtx, peer, &raft.RequestVoteArgs{
+			Term:         0,
+			CandidateID:  id,
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		})
+		rpcCancel()
+
+		if err != nil {
+			srv.GetLogger().Warn("peer reachability RPC failed", "peer_id", int(peer.ID), "address", peer.Address, "error", err)
+		} else {
+			srv.GetLogger().Info("peer reachability verified via RPC",
+				"peer_id", int(peer.ID),
+				"address", peer.Address,
+				"reply_term", reply.Term,
+				"vote_granted", reply.VoteGranted,
+			)
 		}
-	}()
+	}
+}
 
-	// Wait for OS shutdown signal (Ctrl+C / SIGTERM)
+func waitForShutdown(srv *server.Server, cancel context.CancelFunc) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	sig := <-sigCh
 
-	dialCancel()
+	cancel()
 	srv.GetLogger().Info("received termination signal, shutting down", "signal", sig.String())
 	if err := srv.Close(); err != nil {
 		srv.GetLogger().Error("error closing server", "error", err)

@@ -153,15 +153,15 @@ type Server struct {
 	lastHeartbeat time.Time
 
 	// Concurrency channels for the single event loop goroutine:
-	stopCh          chan struct{}
-	stopOnce        sync.Once
-	requestVoteCh   chan RequestVoteEvent
-	appendEntriesCh chan AppendEntriesEvent
+	stopCh            chan struct{}
+	stopOnce          sync.Once
+	requestVoteCh     chan RequestVoteEvent
+	appendEntriesCh   chan AppendEntriesEvent
 	voteResultCh      chan RequestVoteResult
 	heartbeatResultCh chan HeartbeatResult
-	stateActionCh   chan stateAction
-	loopDone        chan struct{}
-	loopRunning     atomic.Bool
+	stateActionCh     chan stateAction
+	loopDone          chan struct{}
+	loopRunning       atomic.Bool
 
 	grpcServer *grpc.Server
 	listener   net.Listener
@@ -729,37 +729,29 @@ func (s *Server) ResetElectionTimeout() time.Duration {
 	return d
 }
 
-// HandleHeartbeat processes a heartbeat event from a leader.
-// When the event loop is active, the heartbeat is routed through the single event loop.
-func (s *Server) HandleHeartbeat(leaderID raft.NodeID, term raft.Term) (bool, time.Duration) {
-	if s.loopRunning.Load() {
-		resCh := make(chan *raftpb.AppendEntriesReply, 1)
-		args := &raftpb.AppendEntriesArgs{
-			LeaderId: int64(leaderID),
-			Term:     uint64(term),
-		}
-		select {
-		case s.appendEntriesCh <- AppendEntriesEvent{Args: args, ResCh: resCh}:
-		case <-s.stopCh:
-			return false, 0
-		}
-
-		select {
-		case reply := <-resCh:
-			valid := (uint64(term) >= reply.Term)
-			var timeout time.Duration
-			if s.ElectionTimer != nil {
-				timeout = s.ElectionTimer.Duration()
-			}
-			return valid, timeout
-		case <-s.stopCh:
-			return false, 0
-		}
+func (s *Server) handleHeartbeatViaLoop(leaderID raft.NodeID, term raft.Term) (bool, time.Duration) {
+	resCh := make(chan *raftpb.AppendEntriesReply, 1)
+	args := &raftpb.AppendEntriesArgs{LeaderId: int64(leaderID), Term: uint64(term)}
+	select {
+	case s.appendEntriesCh <- AppendEntriesEvent{Args: args, ResCh: resCh}:
+	case <-s.stopCh:
+		return false, 0
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	select {
+	case reply := <-resCh:
+		valid := (uint64(term) >= reply.Term)
+		var timeout time.Duration
+		if s.ElectionTimer != nil {
+			timeout = s.ElectionTimer.Duration()
+		}
+		return valid, timeout
+	case <-s.stopCh:
+		return false, 0
+	}
+}
 
+func (s *Server) handleHeartbeatDirectLocked(leaderID raft.NodeID, term raft.Term) (bool, time.Duration) {
 	var currentTerm raft.Term
 	if s.PersistentState != nil {
 		currentTerm = s.PersistentState.CurrentTerm
@@ -792,8 +784,18 @@ func (s *Server) HandleHeartbeat(leaderID raft.NodeID, term raft.Term) (bool, ti
 			"timeout_ms", newTimeout.Milliseconds(),
 		)
 	}
-
 	return true, newTimeout
+}
+
+// HandleHeartbeat processes a heartbeat event from a leader.
+// When the event loop is active, the heartbeat is routed through the single event loop.
+func (s *Server) HandleHeartbeat(leaderID raft.NodeID, term raft.Term) (bool, time.Duration) {
+	if s.loopRunning.Load() {
+		return s.handleHeartbeatViaLoop(leaderID, term)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.handleHeartbeatDirectLocked(leaderID, term)
 }
 
 // LastHeartbeatTime returns the timestamp of the last valid heartbeat received by the server.
@@ -930,11 +932,7 @@ func (s *Server) RegisterService(grpcServer grpc.ServiceRegistrar) {
 	raftpb.RegisterRaftServiceServer(grpcServer, s)
 }
 
-// Status returns the current runtime status of the Raft node (term, state, votedFor, counters, etc.).
-func (s *Server) Status() NodeStatus {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *Server) stateSnapshotLocked() (raft.Term, raft.NodeID, int, raft.LogIndex, raft.LogIndex) {
 	var term raft.Term
 	votedFor := raft.NodeID(-1)
 	logLen := 0
@@ -949,7 +947,15 @@ func (s *Server) Status() NodeStatus {
 		commitIndex = s.VolatileState.CommitIndex
 		lastApplied = s.VolatileState.LastApplied
 	}
+	return term, votedFor, logLen, commitIndex, lastApplied
+}
 
+// Status returns the current runtime status of the Raft node (term, state, votedFor, counters, etc.).
+func (s *Server) Status() NodeStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	term, votedFor, logLen, commitIndex, lastApplied := s.stateSnapshotLocked()
 	counters := s.Counters()
 	var recentEvents []Event
 	if s.eventLog != nil {
@@ -1093,16 +1099,7 @@ func (s *Server) Start(address string, opts ...grpc.ServerOption) error {
 	return s.Serve(lis, opts...)
 }
 
-// Serve starts the gRPC server on the provided listener in the background.
-// It registers the Raft service handlers and begins serving incoming RPC requests.
-func (s *Server) Serve(lis net.Listener, opts ...grpc.ServerOption) error {
-	s.mu.Lock()
-	if s.grpcServer != nil {
-		s.mu.Unlock()
-		_ = lis.Close()
-		return fmt.Errorf("server is already running")
-	}
-
+func (s *Server) buildGRPCServer(opts ...grpc.ServerOption) *grpc.Server {
 	defaultOpts := []grpc.ServerOption{
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             5 * time.Second, // Allow client keepalive pings every 5s
@@ -1115,18 +1112,28 @@ func (s *Server) Serve(lis net.Listener, opts ...grpc.ServerOption) error {
 		}),
 	}
 	serverOpts := append(defaultOpts, opts...)
-
 	grpcServer := grpc.NewServer(serverOpts...)
 	s.RegisterService(grpcServer)
+	return grpcServer
+}
 
+// Serve starts the gRPC server on the provided listener in the background.
+// It registers the Raft service handlers and begins serving incoming RPC requests.
+func (s *Server) Serve(lis net.Listener, opts ...grpc.ServerOption) error {
+	s.mu.Lock()
+	if s.grpcServer != nil {
+		s.mu.Unlock()
+		_ = lis.Close()
+		return fmt.Errorf("server is already running")
+	}
+
+	grpcServer := s.buildGRPCServer(opts...)
 	s.grpcServer = grpcServer
 	s.listener = lis
 	addrStr := lis.Addr().String()
 	s.mu.Unlock()
 
 	s.GetLogger().Info("gRPC server listening", "address", addrStr)
-
-	// Launch the single event-loop goroutine
 	s.StartEventLoop()
 
 	go func() {
@@ -1134,7 +1141,6 @@ func (s *Server) Serve(lis net.Listener, opts ...grpc.ServerOption) error {
 			s.GetLogger().Error("gRPC server error during serve", "error", err)
 		}
 	}()
-
 	return nil
 }
 
@@ -1156,44 +1162,52 @@ func (s *Server) stopHeartbeatTickerLocked() {
 	s.heartbeatAcks = make(map[raft.NodeID]bool)
 }
 
-// Stop immediately stops the gRPC server, debug HTTP server, and main event loop.
-func (s *Server) Stop() {
+func (s *Server) shutdownEventLoop() {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 	})
-
 	if s.loopRunning.Load() {
 		select {
 		case <-s.loopDone:
 		case <-time.After(1 * time.Second):
 		}
 	}
+}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *Server) cleanupServerLocked(graceful bool) {
 	s.recordEventLocked(EventServerStopped, fmt.Sprintf("server node %d stopped", s.ID), map[string]interface{}{
 		"node_id": int(s.ID),
 	})
-
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Stop()
 	}
 	s.stopHeartbeatTickerLocked()
 
 	if s.grpcServer != nil {
-		s.grpcServer.Stop()
+		if graceful {
+			s.grpcServer.GracefulStop()
+			s.GetLogger().Info("gracefully stopped gRPC server")
+		} else {
+			s.grpcServer.Stop()
+			s.GetLogger().Info("stopped gRPC server")
+		}
 		s.grpcServer = nil
-		s.GetLogger().Info("stopped gRPC server")
 	}
 	if s.listener != nil {
 		_ = s.listener.Close()
 		s.listener = nil
 	}
 	if s.httpServer != nil {
-		_ = s.httpServer.Close()
+		if graceful {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = s.httpServer.Shutdown(ctx)
+			cancel()
+			s.GetLogger().Info("gracefully stopped debug HTTP server")
+		} else {
+			_ = s.httpServer.Close()
+			s.GetLogger().Info("stopped debug HTTP server")
+		}
 		s.httpServer = nil
-		s.GetLogger().Info("stopped debug HTTP server")
 	}
 	if s.httpListener != nil {
 		_ = s.httpListener.Close()
@@ -1201,51 +1215,20 @@ func (s *Server) Stop() {
 	}
 }
 
-// GracefulStop gracefully stops the gRPC server, debug HTTP server, and closes listeners.
-func (s *Server) GracefulStop() {
-	s.stopOnce.Do(func() {
-		close(s.stopCh)
-	})
-
-	if s.loopRunning.Load() {
-		select {
-		case <-s.loopDone:
-		case <-time.After(1 * time.Second):
-		}
-	}
-
+// Stop immediately stops the gRPC server, debug HTTP server, and main event loop.
+func (s *Server) Stop() {
+	s.shutdownEventLoop()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.cleanupServerLocked(false)
+}
 
-	s.recordEventLocked(EventServerStopped, fmt.Sprintf("server node %d stopped", s.ID), map[string]interface{}{
-		"node_id": int(s.ID),
-	})
-
-	if s.ElectionTimer != nil {
-		s.ElectionTimer.Stop()
-	}
-	s.stopHeartbeatTickerLocked()
-
-	if s.grpcServer != nil {
-		s.grpcServer.GracefulStop()
-		s.grpcServer = nil
-		s.GetLogger().Info("gracefully stopped gRPC server")
-	}
-	if s.listener != nil {
-		_ = s.listener.Close()
-		s.listener = nil
-	}
-	if s.httpServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = s.httpServer.Shutdown(ctx)
-		cancel()
-		s.httpServer = nil
-		s.GetLogger().Info("gracefully stopped debug HTTP server")
-	}
-	if s.httpListener != nil {
-		_ = s.httpListener.Close()
-		s.httpListener = nil
-	}
+// GracefulStop gracefully stops the gRPC server, debug HTTP server, and closes listeners.
+func (s *Server) GracefulStop() {
+	s.shutdownEventLoop()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupServerLocked(true)
 }
 
 // Kill simulates a hard crash of the node process mid-test.
@@ -1534,6 +1517,103 @@ func (s *Server) resetElectionTimerOnGrantingVoteLocked(candidateID int64, term 
 	return newTimeout
 }
 
+func (s *Server) validateRequestVote(req *raftpb.RequestVoteArgs) (uint64, raft.NodeID, bool, *raftpb.RequestVoteReply) {
+	var currentTerm uint64
+	var votedFor raft.NodeID = -1
+	if s.PersistentState != nil {
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+		votedFor = s.PersistentState.VotedFor
+	}
+
+	if s.requestVoteFilter != nil && !s.requestVoteFilter(req) {
+		s.votesDenied.Add(1)
+		s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d (filtered)", req.CandidateId, req.Term), map[string]interface{}{
+			"candidate_id": req.CandidateId,
+			"term":         req.Term,
+			"reason":       "filter",
+		})
+		s.GetLogger().Warn("dropped/rejected RequestVote via test filter hook", "candidate_id", req.CandidateId, "term", req.Term)
+		return currentTerm, votedFor, false, &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
+	}
+
+	if req.Term < currentTerm {
+		s.votesDenied.Add(1)
+		s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d (stale term < %d)", req.CandidateId, req.Term, currentTerm), map[string]interface{}{
+			"candidate_id": req.CandidateId,
+			"req_term":     req.Term,
+			"current_term": currentTerm,
+			"reason":       "stale_term",
+		})
+		s.GetLogger().Warn("rejected RequestVote from candidate with stale term", "candidate_id", req.CandidateId, "req_term", req.Term, "current_term", currentTerm)
+		return currentTerm, votedFor, false, &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
+	}
+	return currentTerm, votedFor, true, nil
+}
+
+func (s *Server) stepDownOnHigherTermLocked(term uint64) (uint64, raft.NodeID, bool) {
+	oldRole := s.State
+	s.State = raft.Follower
+	s.stopHeartbeatTickerLocked()
+	s.votesReceived = make(map[raft.NodeID]bool)
+
+	var currentTerm uint64
+	var votedFor raft.NodeID = -1
+	if s.PersistentState != nil {
+		s.PersistentState.CurrentTerm = raft.Term(term)
+		s.PersistentState.VotedFor = -1
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	s.recordEventLocked(EventStepDown, fmt.Sprintf("discovered higher term %d; transitioned to Follower", term), map[string]interface{}{
+		"previous_state": oldRole.String(),
+		"term":           currentTerm,
+	})
+	s.GetLogger().Info("transitioned to Follower on discovering higher term",
+		"node_id", int(s.ID),
+		"previous_state", oldRole.String(),
+		"term", currentTerm,
+	)
+	return currentTerm, votedFor, true
+}
+
+func (s *Server) recordVoteGrantOrDenyLocked(req *raftpb.RequestVoteArgs, currentTerm uint64, votedFor raft.NodeID, steppedDown bool) bool {
+	canVote := (votedFor == -1 || votedFor == raft.NodeID(req.CandidateId))
+	logOk := s.isLogUpToDateLocked(req.LastLogIndex, req.LastLogTerm)
+
+	if canVote && logOk {
+		s.votesGranted.Add(1)
+		s.recordEventLocked(EventVoteGranted, fmt.Sprintf("granted vote to candidate %d for term %d", req.CandidateId, currentTerm), map[string]interface{}{
+			"candidate_id": req.CandidateId,
+			"term":         currentTerm,
+		})
+		if s.PersistentState != nil {
+			s.PersistentState.VotedFor = raft.NodeID(req.CandidateId)
+		}
+		_ = s.persistLocked()
+		s.resetElectionTimerOnGrantingVoteLocked(req.CandidateId, req.Term)
+		s.GetLogger().Info("granted vote to candidate", "candidate_id", req.CandidateId, "term", currentTerm)
+		return true
+	}
+
+	s.votesDenied.Add(1)
+	s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d", req.CandidateId, currentTerm), map[string]interface{}{
+		"candidate_id": req.CandidateId,
+		"term":         currentTerm,
+		"can_vote":     canVote,
+		"log_ok":       logOk,
+		"voted_for":    int(votedFor),
+	})
+	if steppedDown {
+		_ = s.persistLocked()
+		s.lastHeartbeat = time.Now()
+		if s.ElectionTimer != nil {
+			s.ElectionTimer.Reset()
+		}
+	}
+	s.GetLogger().Info("denied vote to candidate", "candidate_id", req.CandidateId, "term", currentTerm, "voted_for", int(votedFor), "can_vote", canVote, "log_ok", logOk)
+	return false
+}
+
 // processRequestVote evaluates an incoming RequestVote RPC exactly per Raft paper Figure 2 rules 1-2.
 func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.RequestVoteReply {
 	s.GetLogger().Debug("received RequestVote",
@@ -1543,184 +1623,32 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 		"last_log_term", req.LastLogTerm,
 	)
 
-	var currentTerm uint64
-	var votedFor raft.NodeID = -1
-	if s.PersistentState != nil {
-		currentTerm = uint64(s.PersistentState.CurrentTerm)
-		votedFor = s.PersistentState.VotedFor
+	currentTerm, votedFor, ok, earlyReply := s.validateRequestVote(req)
+	if !ok {
+		return earlyReply
 	}
 
-	// Optional testing filter hook
-	if s.requestVoteFilter != nil && !s.requestVoteFilter(req) {
-		s.votesDenied.Add(1)
-		s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d (filtered)", req.CandidateId, req.Term), map[string]interface{}{
-			"candidate_id": req.CandidateId,
-			"term":         req.Term,
-			"reason":       "filter",
-		})
-		s.GetLogger().Warn("dropped/rejected RequestVote via test filter hook",
-			"candidate_id", req.CandidateId,
-			"term", req.Term,
-		)
-		return &raftpb.RequestVoteReply{
-			Term:        currentTerm,
-			VoteGranted: false,
-		}
-	}
-
-	// Figure 2 RequestVote Rule 1: Reply false if term < currentTerm (§5.1)
-	if req.Term < currentTerm {
-		s.votesDenied.Add(1)
-		s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d (stale term < %d)", req.CandidateId, req.Term, currentTerm), map[string]interface{}{
-			"candidate_id": req.CandidateId,
-			"req_term":     req.Term,
-			"current_term": currentTerm,
-			"reason":       "stale_term",
-		})
-		s.GetLogger().Warn("rejected RequestVote from candidate with stale term",
-			"candidate_id", req.CandidateId,
-			"req_term", req.Term,
-			"current_term", currentTerm,
-		)
-		return &raftpb.RequestVoteReply{
-			Term:        currentTerm,
-			VoteGranted: false,
-		}
-	}
-
-	// Rules for Servers (§5.1):
-	// If RPC request or response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower (§5.1).
 	steppedDown := false
 	if req.Term > currentTerm {
-		oldRole := s.State
-		s.State = raft.Follower
-		s.stopHeartbeatTickerLocked()
-		s.votesReceived = make(map[raft.NodeID]bool)
-
-		if s.PersistentState != nil {
-			s.PersistentState.CurrentTerm = raft.Term(req.Term)
-			s.PersistentState.VotedFor = -1
-			currentTerm = uint64(s.PersistentState.CurrentTerm)
-			votedFor = -1
-		}
-		steppedDown = true
-
-		s.recordEventLocked(EventStepDown, fmt.Sprintf("discovered higher term %d; transitioned to Follower", req.Term), map[string]interface{}{
-			"previous_state": oldRole.String(),
-			"term":           currentTerm,
-		})
-
-		s.GetLogger().Info("transitioned to Follower on discovering higher term",
-			"node_id", int(s.ID),
-			"previous_state", oldRole.String(),
-			"term", currentTerm,
-		)
+		currentTerm, votedFor, steppedDown = s.stepDownOnHigherTermLocked(req.Term)
 	}
 
-	// Figure 2 RequestVote Rule 2:
-	// If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-	canVote := (votedFor == -1 || votedFor == raft.NodeID(req.CandidateId))
-	logOk := s.isLogUpToDateLocked(req.LastLogIndex, req.LastLogTerm)
-
-	voteGranted := false
-	if canVote && logOk {
-		voteGranted = true
-		s.votesGranted.Add(1)
-		s.recordEventLocked(EventVoteGranted, fmt.Sprintf("granted vote to candidate %d for term %d", req.CandidateId, currentTerm), map[string]interface{}{
-			"candidate_id": req.CandidateId,
-			"term":         currentTerm,
-		})
-		if s.PersistentState != nil {
-			s.PersistentState.VotedFor = raft.NodeID(req.CandidateId)
-		}
-
-		// Persist state changes (currentTerm and votedFor)
-		_ = s.persistLocked()
-
-		// Reset election timer when granting vote (§5.2) to reduce split-vote likelihood
-		s.resetElectionTimerOnGrantingVoteLocked(req.CandidateId, req.Term)
-
-		s.GetLogger().Info("granted vote to candidate",
-			"candidate_id", req.CandidateId,
-			"term", currentTerm,
-		)
-	} else {
-		s.votesDenied.Add(1)
-		s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d", req.CandidateId, currentTerm), map[string]interface{}{
-			"candidate_id": req.CandidateId,
-			"term":         currentTerm,
-			"can_vote":     canVote,
-			"log_ok":       logOk,
-			"voted_for":    int(votedFor),
-		})
-
-		// If stepped down due to higher term but vote was not granted, persist the higher term with votedFor = -1
-		if steppedDown {
-			_ = s.persistLocked()
-			s.lastHeartbeat = time.Now()
-			if s.ElectionTimer != nil {
-				s.ElectionTimer.Reset()
-			}
-		}
-
-		s.GetLogger().Info("denied vote to candidate",
-			"candidate_id", req.CandidateId,
-			"term", currentTerm,
-			"voted_for", int(votedFor),
-			"can_vote", canVote,
-			"log_ok", logOk,
-		)
-	}
-
+	voteGranted := s.recordVoteGrantOrDenyLocked(req, currentTerm, votedFor, steppedDown)
 	return &raftpb.RequestVoteReply{
 		Term:        currentTerm,
 		VoteGranted: voteGranted,
 	}
 }
 
-// processAppendEntries evaluates an incoming AppendEntries RPC exactly per Raft paper Figure 2 rules 1-2.
-func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.AppendEntriesReply {
-	s.GetLogger().Debug("received AppendEntries",
-		"leader_id", req.LeaderId,
-		"term", req.Term,
-		"prev_log_index", req.PrevLogIndex,
-		"prev_log_term", req.PrevLogTerm,
-		"entries_count", len(req.Entries),
-		"leader_commit", req.LeaderCommit,
-	)
-
-	var currentTerm uint64
-	if s.PersistentState != nil {
-		currentTerm = uint64(s.PersistentState.CurrentTerm)
-	}
-
-	// Figure 2 AppendEntries Rule 1: Reply false if term < currentTerm (§5.1)
-	if req.Term < currentTerm {
-		s.GetLogger().Warn("rejected AppendEntries from stale leader",
-			"leader_id", req.LeaderId,
-			"req_term", req.Term,
-			"current_term", currentTerm,
-		)
-		return &raftpb.AppendEntriesReply{
-			Term:    currentTerm,
-			Success: false,
-		}
-	}
-
-	// Rules for Servers (§5.1):
-	// If RPC request or response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower (§5.1).
+func (s *Server) applyAppendEntriesRoleAndTimer(req *raftpb.AppendEntriesArgs, currentTerm uint64) uint64 {
 	if req.Term > currentTerm {
 		s.becomeFollowerLocked(raft.Term(req.Term))
 		if s.PersistentState != nil {
 			currentTerm = uint64(s.PersistentState.CurrentTerm)
 		}
 	} else if s.State == raft.Candidate {
-		// §5.2: If candidate receives AppendEntries from current leader (req.Term == currentTerm), revert to follower
 		s.becomeFollowerLocked(raft.Term(req.Term))
 	} else {
-		// Valid heartbeat from current leader for follower/leader: reset election timer (§5.2)
 		s.lastHeartbeat = time.Now()
 		if s.ElectionTimer != nil {
 			newTimeout := s.ElectionTimer.Reset()
@@ -1739,21 +1667,50 @@ func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.App
 			"term":      req.Term,
 		})
 	}
+	return currentTerm
+}
 
-	// Figure 2 AppendEntries Rule 2:
-	// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-	success := true
-	if req.PrevLogIndex > 0 {
-		var logLen uint64
-		if s.PersistentState != nil {
-			logLen = uint64(len(s.PersistentState.Log))
-		}
-		if req.PrevLogIndex > logLen {
-			success = false
-		} else if s.PersistentState.Log[req.PrevLogIndex-1].Term != raft.Term(req.PrevLogTerm) {
-			success = false
-		}
+func (s *Server) checkPrevLogInLog(prevLogIndex uint64, prevLogTerm uint64) bool {
+	if prevLogIndex == 0 {
+		return true
 	}
+	var logLen uint64
+	if s.PersistentState != nil {
+		logLen = uint64(len(s.PersistentState.Log))
+	}
+	if prevLogIndex > logLen {
+		return false
+	}
+	return s.PersistentState.Log[prevLogIndex-1].Term == raft.Term(prevLogTerm)
+}
+
+// processAppendEntries evaluates an incoming AppendEntries RPC exactly per Raft paper Figure 2 rules 1-2.
+func (s *Server) processAppendEntries(req *raftpb.AppendEntriesArgs) *raftpb.AppendEntriesReply {
+	s.GetLogger().Debug("received AppendEntries",
+		"leader_id", req.LeaderId,
+		"term", req.Term,
+		"prev_log_index", req.PrevLogIndex,
+		"prev_log_term", req.PrevLogTerm,
+		"entries_count", len(req.Entries),
+		"leader_commit", req.LeaderCommit,
+	)
+
+	var currentTerm uint64
+	if s.PersistentState != nil {
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	if req.Term < currentTerm {
+		s.GetLogger().Warn("rejected AppendEntries from stale leader",
+			"leader_id", req.LeaderId,
+			"req_term", req.Term,
+			"current_term", currentTerm,
+		)
+		return &raftpb.AppendEntriesReply{Term: currentTerm, Success: false}
+	}
+
+	currentTerm = s.applyAppendEntriesRoleAndTimer(req, currentTerm)
+	success := s.checkPrevLogInLog(req.PrevLogIndex, req.PrevLogTerm)
 
 	return &raftpb.AppendEntriesReply{
 		Term:    currentTerm,
@@ -1937,6 +1894,37 @@ func (s *Server) becomeLeader() {
 	s.becomeLeaderLocked()
 }
 
+func (s *Server) initVolatileStateLeaderLocked(lastLogIndex raft.LogIndex) {
+	s.VolatileStateLeader = &raft.VolatileStateLeader{
+		NextIndex:  make(map[raft.NodeID]raft.LogIndex, len(s.Peers)),
+		MatchIndex: make(map[raft.NodeID]raft.LogIndex, len(s.Peers)),
+	}
+	for _, p := range s.Peers {
+		s.VolatileStateLeader.NextIndex[p.ID] = lastLogIndex + 1
+		s.VolatileStateLeader.MatchIndex[p.ID] = 0
+	}
+}
+
+func (s *Server) startLeaderTimersLocked() {
+	if s.heartbeatInterval <= 0 {
+		s.heartbeatInterval = raft.DefaultHeartbeatInterval
+	}
+	if s.heartbeatTicker != nil {
+		s.heartbeatTicker.Stop()
+	}
+	s.heartbeatTicker = time.NewTicker(s.heartbeatInterval)
+
+	if s.heartbeatTimer != nil {
+		s.heartbeatTimer.Stop()
+	}
+	s.heartbeatTimer = time.NewTimer(s.heartbeatInterval)
+
+	s.heartbeatAcks = make(map[raft.NodeID]bool)
+	if s.checkQuorum {
+		s.resetCheckQuorumTimerLocked()
+	}
+}
+
 // becomeLeaderLocked executes the leader transition.
 // Must be called with s.mu held (or inside the event loop).
 // In Raft (§5.2 & §5.3):
@@ -1953,35 +1941,8 @@ func (s *Server) becomeLeaderLocked() {
 	}
 
 	lastLogIndex, _ := s.lastLogInfoLocked()
-
-	s.VolatileStateLeader = &raft.VolatileStateLeader{
-		NextIndex:  make(map[raft.NodeID]raft.LogIndex),
-		MatchIndex: make(map[raft.NodeID]raft.LogIndex),
-	}
-	for _, p := range s.Peers {
-		s.VolatileStateLeader.NextIndex[p.ID] = lastLogIndex + 1
-		s.VolatileStateLeader.MatchIndex[p.ID] = 0
-	}
-
-	if s.heartbeatInterval <= 0 {
-		s.heartbeatInterval = raft.DefaultHeartbeatInterval
-	}
-
-	// Arm leader-only heartbeat ticker (every 50ms)
-	if s.heartbeatTicker != nil {
-		s.heartbeatTicker.Stop()
-	}
-	s.heartbeatTicker = time.NewTicker(s.heartbeatInterval)
-
-	if s.heartbeatTimer != nil {
-		s.heartbeatTimer.Stop()
-	}
-	s.heartbeatTimer = time.NewTimer(s.heartbeatInterval)
-
-	s.heartbeatAcks = make(map[raft.NodeID]bool)
-	if s.checkQuorum {
-		s.resetCheckQuorumTimerLocked()
-	}
+	s.initVolatileStateLeaderLocked(lastLogIndex)
+	s.startLeaderTimersLocked()
 
 	var curTerm uint64
 	if s.PersistentState != nil {
@@ -2108,6 +2069,38 @@ func (s *Server) startElectionLocked() {
 	s.broadcastRequestVotesLocked()
 }
 
+func (s *Server) sendVoteRequestToPeer(peer Peer, term raft.Term, lastLogIndex raft.LogIndex, lastLogTerm raft.Term, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	stopDone := make(chan struct{})
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-stopDone:
+		}
+	}()
+	defer close(stopDone)
+
+	reply, err := s.SendRequestVote(ctx, peer, &raft.RequestVoteArgs{
+		Term:         term,
+		CandidateID:  s.ID,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	})
+
+	select {
+	case s.voteResultCh <- RequestVoteResult{
+		PeerID:       peer.ID,
+		ElectionTerm: term,
+		Reply:        reply,
+		Err:          err,
+	}:
+	case <-s.stopCh:
+	}
+}
+
 // broadcastRequestVotesLocked sends RequestVote RPCs in parallel to all peers using goroutines,
 // streaming results back onto s.voteResultCh.
 func (s *Server) broadcastRequestVotesLocked() {
@@ -2117,7 +2110,6 @@ func (s *Server) broadcastRequestVotesLocked() {
 
 	term := s.PersistentState.CurrentTerm
 	lastLogIndex, lastLogTerm := s.lastLogInfoLocked()
-
 	timeout := s.RPCTimeout()
 	id := s.ID
 
@@ -2129,41 +2121,9 @@ func (s *Server) broadcastRequestVotesLocked() {
 	)
 
 	for _, peer := range s.Peers {
-		if peer.ID == id {
-			continue
+		if peer.ID != id {
+			go s.sendVoteRequestToPeer(peer, term, lastLogIndex, lastLogTerm, timeout)
 		}
-
-		go func(p Peer) {
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			defer cancel()
-
-			stopDone := make(chan struct{})
-			go func() {
-				select {
-				case <-s.stopCh:
-					cancel()
-				case <-stopDone:
-				}
-			}()
-			defer close(stopDone)
-
-			reply, err := s.SendRequestVote(ctx, p, &raft.RequestVoteArgs{
-				Term:         term,
-				CandidateID:  id,
-				LastLogIndex: lastLogIndex,
-				LastLogTerm:  lastLogTerm,
-			})
-
-			select {
-			case s.voteResultCh <- RequestVoteResult{
-				PeerID:       p.ID,
-				ElectionTerm: term,
-				Reply:        reply,
-				Err:          err,
-			}:
-			case <-s.stopCh:
-			}
-		}(peer)
 	}
 }
 
@@ -2221,16 +2181,58 @@ func (s *Server) HandleVoteResult(res RequestVoteResult) {
 	s.handleVoteResultLocked(res)
 }
 
+func (s *Server) checkHigherTermInVoteReply(replyTerm raft.Term, peerID raft.NodeID, currentTerm uint64) bool {
+	if uint64(replyTerm) > currentTerm {
+		s.GetLogger().Info("discovered higher term in RequestVote reply, stepping down to follower",
+			"node_id", int(s.ID),
+			"reply_term", uint64(replyTerm),
+			"current_term", currentTerm,
+			"peer_id", int(peerID),
+		)
+		s.becomeFollowerLocked(replyTerm)
+		return true
+	}
+	return false
+}
+
+func (s *Server) recordVoteAndCheckMajorityLocked(peerID raft.NodeID, currentTerm uint64) {
+	if s.votesReceived == nil {
+		s.votesReceived = make(map[raft.NodeID]bool)
+		s.votesReceived[s.ID] = true
+	}
+	s.votesReceived[peerID] = true
+	votesCount := len(s.votesReceived)
+	totalNodes := len(s.Peers) + 1
+	majority := (totalNodes / 2) + 1
+
+	s.GetLogger().Info("received granted vote from peer",
+		"node_id", int(s.ID),
+		"peer_id", int(peerID),
+		"term", currentTerm,
+		"votes_count", votesCount,
+		"majority_required", majority,
+	)
+
+	if votesCount >= majority {
+		s.GetLogger().Info("achieved majority votes, transitioning to Leader",
+			"node_id", int(s.ID),
+			"term", currentTerm,
+			"votes_count", votesCount,
+			"total_nodes", totalNodes,
+			"majority", majority,
+		)
+		s.becomeLeaderLocked()
+		s.broadcastHeartbeats()
+	}
+}
+
 // handleVoteResultLocked processes an incoming vote result from a peer.
 // In Raft (§5.1 & §5.2):
 // - If reply contains higher term: step down to Follower immediately
 // - If vote granted: count vote; on majority, transition to Leader
 func (s *Server) handleVoteResultLocked(res RequestVoteResult) {
 	if res.Err != nil {
-		s.GetLogger().Debug("RequestVote RPC to peer failed or timed out",
-			"peer_id", int(res.PeerID),
-			"error", res.Err,
-		)
+		s.GetLogger().Debug("RequestVote RPC to peer failed or timed out", "peer_id", int(res.PeerID), "error", res.Err)
 		return
 	}
 	if res.Reply == nil {
@@ -2242,57 +2244,16 @@ func (s *Server) handleVoteResultLocked(res RequestVoteResult) {
 		currentTerm = uint64(s.PersistentState.CurrentTerm)
 	}
 
-	// 1. If RPC response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower (§5.1)
-	if uint64(res.Reply.Term) > currentTerm {
-		s.GetLogger().Info("discovered higher term in RequestVote reply, stepping down to follower",
-			"node_id", int(s.ID),
-			"reply_term", uint64(res.Reply.Term),
-			"current_term", currentTerm,
-			"peer_id", int(res.PeerID),
-		)
-		s.becomeFollowerLocked(res.Reply.Term)
+	if s.checkHigherTermInVoteReply(res.Reply.Term, res.PeerID, currentTerm) {
 		return
 	}
 
-	// 2. Ignore votes if no longer Candidate or if reply is from an older election term
 	if s.State != raft.Candidate || res.ElectionTerm != raft.Term(currentTerm) {
 		return
 	}
 
-	// 3. Count vote if granted
 	if res.Reply.VoteGranted {
-		if s.votesReceived == nil {
-			s.votesReceived = make(map[raft.NodeID]bool)
-			s.votesReceived[s.ID] = true
-		}
-		s.votesReceived[res.PeerID] = true
-		votesCount := len(s.votesReceived)
-		totalNodes := len(s.Peers) + 1
-		majority := (totalNodes / 2) + 1
-
-		s.GetLogger().Info("received granted vote from peer",
-			"node_id", int(s.ID),
-			"peer_id", int(res.PeerID),
-			"term", currentTerm,
-			"votes_count", votesCount,
-			"majority_required", majority,
-		)
-
-		// 4. On majority, transition to Leader (§5.2)
-		if votesCount >= majority {
-			s.GetLogger().Info("achieved majority votes, transitioning to Leader",
-				"node_id", int(s.ID),
-				"term", currentTerm,
-				"votes_count", votesCount,
-				"total_nodes", totalNodes,
-				"majority", majority,
-			)
-			s.becomeLeaderLocked()
-
-			// Immediately broadcast heartbeats to establish authority (§5.2)
-			s.broadcastHeartbeats()
-		}
+		s.recordVoteAndCheckMajorityLocked(res.PeerID, currentTerm)
 	} else {
 		s.GetLogger().Info("vote denied by peer",
 			"node_id", int(s.ID),
@@ -2339,6 +2300,33 @@ func (s *Server) handleHeartbeatTick() {
 	s.broadcastHeartbeats()
 }
 
+func (s *Server) sendHeartbeatToPeer(peer Peer, args *raft.AppendEntriesArgs, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	stopDone := make(chan struct{})
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-stopDone:
+		}
+	}()
+	defer close(stopDone)
+
+	reply, err := s.SendAppendEntries(ctx, peer, args)
+
+	select {
+	case s.heartbeatResultCh <- HeartbeatResult{
+		PeerID: peer.ID,
+		Term:   args.Term,
+		Reply:  reply,
+		Err:    err,
+	}:
+	case <-s.stopCh:
+	}
+}
+
 // broadcastHeartbeats sends real empty AppendEntries RPCs (heartbeats) to all cluster peers (§5.2).
 // In Raft (§5.2), leaders periodically send heartbeats (AppendEntries with no log entries)
 // to maintain authority and prevent election timeouts on followers.
@@ -2355,7 +2343,6 @@ func (s *Server) broadcastHeartbeats() {
 	if s.VolatileState != nil {
 		commitIndex = s.VolatileState.CommitIndex
 	}
-
 	timeout := s.RPCTimeout()
 
 	for _, peer := range s.Peers {
@@ -2369,41 +2356,15 @@ func (s *Server) broadcastHeartbeats() {
 		)
 
 		if s.loopRunning.Load() && s.RPCClientPool != nil && peer.Address != "" {
-			go func(p Peer) {
-				ctx, cancel := context.WithTimeout(context.Background(), timeout)
-				defer cancel()
-
-				stopDone := make(chan struct{})
-				go func() {
-					select {
-					case <-s.stopCh:
-						cancel()
-					case <-stopDone:
-					}
-				}()
-				defer close(stopDone)
-
-				args := &raft.AppendEntriesArgs{
-					Term:         term,
-					LeaderID:     id,
-					PrevLogIndex: lastLogIndex,
-					PrevLogTerm:  lastLogTerm,
-					Entries:      nil,
-					LeaderCommit: commitIndex,
-				}
-
-				reply, err := s.SendAppendEntries(ctx, p, args)
-
-				select {
-				case s.heartbeatResultCh <- HeartbeatResult{
-					PeerID: p.ID,
-					Term:   term,
-					Reply:  reply,
-					Err:    err,
-				}:
-				case <-s.stopCh:
-				}
-			}(peer)
+			args := &raft.AppendEntriesArgs{
+				Term:         term,
+				LeaderID:     id,
+				PrevLogIndex: lastLogIndex,
+				PrevLogTerm:  lastLogTerm,
+				Entries:      nil,
+				LeaderCommit: commitIndex,
+			}
+			go s.sendHeartbeatToPeer(peer, args, timeout)
 		}
 	}
 }
@@ -2445,6 +2406,126 @@ func (s *Server) handleHeartbeatTimeout() {
 	s.handleHeartbeatTick()
 }
 
+func (s *Server) waitIfPaused() bool {
+	if !s.paused.Load() {
+		return false
+	}
+	s.pauseMu.Lock()
+	rCh := s.resumeCh
+	s.pauseMu.Unlock()
+	if rCh != nil {
+		select {
+		case <-rCh:
+		case <-s.stopCh:
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) selectActiveTimerChannels() (<-chan time.Time, <-chan time.Time, <-chan time.Time) {
+	var timerCh <-chan time.Time
+	if s.State != raft.Leader && s.ElectionTimer != nil {
+		timerCh = s.ElectionTimer.C()
+	}
+
+	var heartbeatCh <-chan time.Time
+	if s.State == raft.Leader {
+		if s.heartbeatTicker != nil {
+			heartbeatCh = s.heartbeatTicker.C
+		} else if s.heartbeatTimer != nil {
+			heartbeatCh = s.heartbeatTimer.C
+		}
+	}
+
+	var checkQuorumCh <-chan time.Time
+	if s.State == raft.Leader && s.checkQuorum && s.checkQuorumTimer != nil {
+		checkQuorumCh = s.checkQuorumTimer.C
+	}
+	return timerCh, heartbeatCh, checkQuorumCh
+}
+
+func (s *Server) handleRequestVoteEvent(ev RequestVoteEvent) bool {
+	s.mu.Lock()
+	reply := s.processRequestVote(ev.Args)
+	s.mu.Unlock()
+	if ev.ResCh != nil {
+		select {
+		case ev.ResCh <- reply:
+		case <-s.stopCh:
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) handleAppendEntriesEvent(ev AppendEntriesEvent) bool {
+	s.mu.Lock()
+	reply := s.processAppendEntries(ev.Args)
+	s.mu.Unlock()
+	if ev.ResCh != nil {
+		select {
+		case ev.ResCh <- reply:
+		case <-s.stopCh:
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) handleStateActionEvent(act stateAction) bool {
+	s.mu.Lock()
+	act.fn()
+	s.mu.Unlock()
+	if act.resCh != nil {
+		select {
+		case act.resCh <- struct{}{}:
+		case <-s.stopCh:
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) processEventLoopCycle(timerCh, heartbeatCh, checkQuorumCh <-chan time.Time) bool {
+	select {
+	case <-s.stopCh:
+		return true
+	case <-s.pauseNotifyCh:
+		return false
+	case <-checkQuorumCh:
+		s.mu.Lock()
+		s.handleCheckQuorumTimeoutLocked()
+		s.mu.Unlock()
+	case t, ok := <-timerCh:
+		if !ok {
+			return true
+		}
+		s.mu.Lock()
+		s.handleElectionTimeout(t)
+		s.mu.Unlock()
+	case res := <-s.voteResultCh:
+		s.mu.Lock()
+		s.handleVoteResultLocked(res)
+		s.mu.Unlock()
+	case res := <-s.heartbeatResultCh:
+		s.mu.Lock()
+		s.handleHeartbeatResultLocked(res)
+		s.mu.Unlock()
+	case <-heartbeatCh:
+		s.mu.Lock()
+		s.handleHeartbeatTick()
+		s.mu.Unlock()
+	case ev := <-s.requestVoteCh:
+		return s.handleRequestVoteEvent(ev)
+	case ev := <-s.appendEntriesCh:
+		return s.handleAppendEntriesEvent(ev)
+	case act := <-s.stateActionCh:
+		return s.handleStateActionEvent(act)
+	}
+	return false
+}
+
 // run is the central event loop of the Raft node.
 // It uses a select statement to multiplex between:
 // 1. Timer channel (election timeout when follower/candidate)
@@ -2463,108 +2544,12 @@ func (s *Server) run() {
 	}()
 
 	for {
-		if s.paused.Load() {
-			s.pauseMu.Lock()
-			rCh := s.resumeCh
-			s.pauseMu.Unlock()
-			if rCh != nil {
-				select {
-				case <-rCh:
-				case <-s.stopCh:
-					return
-				}
-			}
-		}
-
-		var timerCh <-chan time.Time
-		if s.State != raft.Leader && s.ElectionTimer != nil {
-			timerCh = s.ElectionTimer.C()
-		}
-
-		var heartbeatCh <-chan time.Time
-		if s.State == raft.Leader {
-			if s.heartbeatTicker != nil {
-				heartbeatCh = s.heartbeatTicker.C
-			} else if s.heartbeatTimer != nil {
-				heartbeatCh = s.heartbeatTimer.C
-			}
-		}
-
-		var checkQuorumCh <-chan time.Time
-		if s.State == raft.Leader && s.checkQuorum && s.checkQuorumTimer != nil {
-			checkQuorumCh = s.checkQuorumTimer.C
-		}
-
-		select {
-		case <-s.stopCh:
+		if s.waitIfPaused() {
 			return
-
-		case <-s.pauseNotifyCh:
-			continue
-
-		case <-checkQuorumCh:
-			s.mu.Lock()
-			s.handleCheckQuorumTimeoutLocked()
-			s.mu.Unlock()
-
-		case t, ok := <-timerCh:
-			if !ok {
-				return
-			}
-			s.mu.Lock()
-			s.handleElectionTimeout(t)
-			s.mu.Unlock()
-
-		case res := <-s.voteResultCh:
-			s.mu.Lock()
-			s.handleVoteResultLocked(res)
-			s.mu.Unlock()
-
-		case res := <-s.heartbeatResultCh:
-			s.mu.Lock()
-			s.handleHeartbeatResultLocked(res)
-			s.mu.Unlock()
-
-		case <-heartbeatCh:
-			s.mu.Lock()
-			s.handleHeartbeatTick()
-			s.mu.Unlock()
-
-		case ev := <-s.requestVoteCh:
-			s.mu.Lock()
-			reply := s.processRequestVote(ev.Args)
-			s.mu.Unlock()
-			if ev.ResCh != nil {
-				select {
-				case ev.ResCh <- reply:
-				case <-s.stopCh:
-					return
-				}
-			}
-
-		case ev := <-s.appendEntriesCh:
-			s.mu.Lock()
-			reply := s.processAppendEntries(ev.Args)
-			s.mu.Unlock()
-			if ev.ResCh != nil {
-				select {
-				case ev.ResCh <- reply:
-				case <-s.stopCh:
-					return
-				}
-			}
-
-		case act := <-s.stateActionCh:
-			s.mu.Lock()
-			act.fn()
-			s.mu.Unlock()
-			if act.resCh != nil {
-				select {
-				case act.resCh <- struct{}{}:
-				case <-s.stopCh:
-					return
-				}
-			}
+		}
+		timerCh, heartbeatCh, checkQuorumCh := s.selectActiveTimerChannels()
+		if s.processEventLoopCycle(timerCh, heartbeatCh, checkQuorumCh) {
+			return
 		}
 	}
 }
@@ -2713,5 +2698,3 @@ func (s *Server) Close() error {
 	}
 	return nil
 }
-
-

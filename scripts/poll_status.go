@@ -33,7 +33,7 @@ type NodeResult struct {
 	Err      error
 }
 
-func main() {
+func parsePollFlags() ([]string, time.Duration, int, bool) {
 	endpointsFlag := flag.String("endpoints",
 		"http://127.0.0.1:9001/status,http://127.0.0.1:9002/status,http://127.0.0.1:9003/status",
 		"Comma-separated list of node /status HTTP URLs",
@@ -47,34 +47,34 @@ func main() {
 	for i := range endpoints {
 		endpoints[i] = strings.TrimSpace(endpoints[i])
 	}
+	return endpoints, *intervalFlag, *countFlag, *clearScreenFlag
+}
 
-	client := &http.Client{
-		Timeout: 600 * time.Millisecond,
-	}
+func main() {
+	endpoints, interval, count, clearScreen := parsePollFlags()
+	client := &http.Client{Timeout: 600 * time.Millisecond}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	ticker := time.NewTicker(*intervalFlag)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	fmt.Printf("Polling %d node(s) every %v (Press Ctrl+C to stop)\n", len(endpoints), *intervalFlag)
+	fmt.Printf("Polling %d node(s) every %v (Press Ctrl+C to stop)\n", len(endpoints), interval)
 	iteration := 0
 
 	pollAndPrint := func() {
 		iteration++
 		results := pollNodes(client, endpoints)
-		printTable(iteration, results, *clearScreenFlag)
+		printTable(iteration, results, clearScreen)
 	}
 
-	// First immediate poll
 	pollAndPrint()
 
 	for {
-		if *countFlag > 0 && iteration >= *countFlag {
+		if count > 0 && iteration >= count {
 			return
 		}
-
 		select {
 		case <-sigCh:
 			fmt.Println("\nStopped status polling.")
@@ -85,6 +85,30 @@ func main() {
 	}
 }
 
+func fetchNodeStatus(client *http.Client, url string) NodeResult {
+	res := NodeResult{Endpoint: url}
+	resp, err := client.Get(url)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		res.Err = fmt.Errorf("HTTP %d", resp.StatusCode)
+		return res
+	}
+
+	var status NodeStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		res.Err = fmt.Errorf("invalid json: %w", err)
+		return res
+	}
+
+	res.Status = &status
+	return res
+}
+
 func pollNodes(client *http.Client, endpoints []string) []NodeResult {
 	results := make([]NodeResult, len(endpoints))
 	var wg sync.WaitGroup
@@ -93,37 +117,16 @@ func pollNodes(client *http.Client, endpoints []string) []NodeResult {
 		wg.Add(1)
 		go func(idx int, url string) {
 			defer wg.Done()
-			res := NodeResult{Endpoint: url}
-
-			resp, err := client.Get(url)
-			if err != nil {
-				res.Err = err
-				results[idx] = res
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				res.Err = fmt.Errorf("HTTP %d", resp.StatusCode)
-				results[idx] = res
-				return
-			}
-
-			var status NodeStatus
-			if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-				res.Err = fmt.Errorf("invalid json: %w", err)
-				results[idx] = res
-				return
-			}
-
-			res.Status = &status
-			results[idx] = res
+			results[idx] = fetchNodeStatus(client, url)
 		}(i, ep)
 	}
 
 	wg.Wait()
+	sortNodeResults(results)
+	return results
+}
 
-	// Sort results primarily by Node ID if available, otherwise by endpoint
+func sortNodeResults(results []NodeResult) {
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Status != nil && results[j].Status != nil {
 			return results[i].Status.ID < results[j].Status.ID
@@ -136,8 +139,6 @@ func pollNodes(client *http.Client, endpoints []string) []NodeResult {
 		}
 		return results[i].Endpoint < results[j].Endpoint
 	})
-
-	return results
 }
 
 func printTable(iteration int, results []NodeResult, clearScreen bool) {
@@ -183,4 +184,3 @@ func truncate(s string, maxLen int) string {
 	}
 	return s
 }
-

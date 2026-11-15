@@ -139,4 +139,3 @@ func (el *EventLog) Clear() {
 	el.head = 0
 	el.count = 0
 }
-

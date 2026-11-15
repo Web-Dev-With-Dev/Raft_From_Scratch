@@ -116,7 +116,6 @@ func (p *ClientPool) GetLogger() *slog.Logger {
 	return p.logger
 }
 
-
 // SetRetryPolicy updates the default retry policy for subsequent dials.
 func (p *ClientPool) SetRetryPolicy(policy RetryPolicy) {
 	p.mu.Lock()
@@ -169,6 +168,37 @@ func (p *ClientPool) Connect(id NodeID, address string, opts ...grpc.DialOption)
 	return p.ConnectWithRetry(context.Background(), id, address, policy, opts...)
 }
 
+func probePeerAddress(ctx context.Context, address string, timeout time.Duration) error {
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
+}
+
+func (p *ClientPool) waitDialRetry(ctx context.Context, id NodeID, address string, attempt int, maxRetries int, err error, policy RetryPolicy) error {
+	if attempt >= maxRetries {
+		return nil
+	}
+	backoffDur := policy.BackoffForAttempt(attempt)
+	p.GetLogger().Debug("peer dial attempt failed, retrying with backoff",
+		"peer_id", int(id),
+		"address", address,
+		"attempt", attempt+1,
+		"max_retries", maxRetries,
+		"backoff", backoffDur,
+		"error", err,
+	)
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("context cancelled during dial retry for peer %d at %s: %w", id, address, ctx.Err())
+	case <-time.After(backoffDur):
+		return nil
+	}
+}
+
 // ConnectWithRetry dials the peer at address with explicit retry/backoff parameters.
 func (p *ClientPool) ConnectWithRetry(
 	ctx context.Context,
@@ -180,41 +210,20 @@ func (p *ClientPool) ConnectWithRetry(
 	var lastErr error
 
 	for attempt := 0; attempt <= policy.MaxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return nil, fmt.Errorf("context cancelled during dial to peer %d at %s: %w", id, address, ctx.Err())
-		default:
 		}
 
-		// Optional TCP probe to verify address is accepting connections
 		if policy.ProbeTCP && address != "" {
-			dialer := net.Dialer{Timeout: policy.DialTimeout}
-			probeConn, err := dialer.DialContext(ctx, "tcp", address)
-			if err != nil {
+			if err := probePeerAddress(ctx, address, policy.DialTimeout); err != nil {
 				lastErr = err
-				if attempt < policy.MaxRetries {
-					backoffDur := policy.BackoffForAttempt(attempt)
-					p.GetLogger().Debug("peer probe dial failed, retrying with backoff",
-						"peer_id", int(id),
-						"address", address,
-						"attempt", attempt+1,
-						"max_retries", policy.MaxRetries,
-						"backoff", backoffDur,
-						"error", err,
-					)
-					select {
-					case <-ctx.Done():
-						return nil, fmt.Errorf("context cancelled during dial retry for peer %d at %s: %w", id, address, ctx.Err())
-					case <-time.After(backoffDur):
-						continue
-					}
+				if retryErr := p.waitDialRetry(ctx, id, address, attempt, policy.MaxRetries, err, policy); retryErr != nil {
+					return nil, retryErr
 				}
 				continue
 			}
-			_ = probeConn.Close()
 		}
 
-		// Establish persistent gRPC connection
 		client, err := p.connectDirect(id, address, opts...)
 		if err == nil {
 			p.GetLogger().Info("connected to peer", "peer_id", int(id), "address", address)
@@ -222,37 +231,15 @@ func (p *ClientPool) ConnectWithRetry(
 		}
 
 		lastErr = err
-		if attempt < policy.MaxRetries {
-			backoffDur := policy.BackoffForAttempt(attempt)
-			p.GetLogger().Debug("gRPC dial failed, retrying with backoff",
-				"peer_id", int(id),
-				"address", address,
-				"attempt", attempt+1,
-				"max_retries", policy.MaxRetries,
-				"backoff", backoffDur,
-				"error", err,
-			)
-			select {
-			case <-ctx.Done():
-				return nil, fmt.Errorf("context cancelled during dial retry for peer %d at %s: %w", id, address, ctx.Err())
-			case <-time.After(backoffDur):
-			}
+		if retryErr := p.waitDialRetry(ctx, id, address, attempt, policy.MaxRetries, err, policy); retryErr != nil {
+			return nil, retryErr
 		}
 	}
 
 	return nil, fmt.Errorf("failed to dial peer %d at %s after %d retries: %w", id, address, policy.MaxRetries, lastErr)
 }
 
-// connectDirect establishes and stores the persistent gRPC ClientConn and client stub.
-func (p *ClientPool) connectDirect(id NodeID, address string, opts ...grpc.DialOption) (raftpb.RaftServiceClient, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Close existing connection if one is present
-	if oldConn, exists := p.conns[id]; exists {
-		_ = oldConn.Close()
-	}
-
+func buildDialOptions(policy RetryPolicy, opts ...grpc.DialOption) []grpc.DialOption {
 	dialOpts := make([]grpc.DialOption, 0, len(opts)+3)
 	dialOpts = append(dialOpts, opts...)
 
@@ -260,10 +247,7 @@ func (p *ClientPool) connectDirect(id NodeID, address string, opts ...grpc.DialO
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	// Persistent keepalive & backoff configuration
-	policy := p.retryPolicy
-
-	dialOpts = append(dialOpts,
+	return append(dialOpts,
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                10 * time.Second,
 			Timeout:             3 * time.Second,
@@ -277,7 +261,19 @@ func (p *ClientPool) connectDirect(id NodeID, address string, opts ...grpc.DialO
 			},
 		}),
 	)
+}
 
+// connectDirect establishes and stores the persistent gRPC ClientConn and client stub.
+func (p *ClientPool) connectDirect(id NodeID, address string, opts ...grpc.DialOption) (raftpb.RaftServiceClient, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Close existing connection if one is present
+	if oldConn, exists := p.conns[id]; exists {
+		_ = oldConn.Close()
+	}
+
+	dialOpts := buildDialOptions(p.retryPolicy, opts...)
 	conn, err := grpc.NewClient(address, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gRPC client for peer %d at %s: %w", id, address, err)
@@ -410,4 +406,3 @@ func (p *ClientPool) Peers() []NodeID {
 	}
 	return peers
 }
-

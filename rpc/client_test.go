@@ -287,4 +287,3 @@ func TestIsTimeout_Helper(t *testing.T) {
 		t.Fatalf("expected IsTimeout(otherErr) to be false")
 	}
 }
-

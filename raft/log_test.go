@@ -176,4 +176,3 @@ func TestPersistentState_LastLogInfo(t *testing.T) {
 		t.Fatalf("expected (4, 3) for populated log, got (%d, %d)", index, term)
 	}
 }
-

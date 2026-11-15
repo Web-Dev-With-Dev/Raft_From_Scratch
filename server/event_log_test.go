@@ -178,4 +178,3 @@ func TestEventLog_Concurrency(t *testing.T) {
 		}
 	}
 }
-

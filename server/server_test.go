@@ -1858,7 +1858,7 @@ func (s *spyStorage) Load() (*raft.PersistentState, error) {
 
 func (s *spyStorage) SaveSnapshot(snapshot []byte) error { return nil }
 func (s *spyStorage) LoadSnapshot() ([]byte, error)      { return nil, nil }
-func (s *spyStorage) Close() error                      { return nil }
+func (s *spyStorage) Close() error                       { return nil }
 
 func (s *spyStorage) PersistCount() int {
 	s.mu.Lock()
@@ -4112,14 +4112,3 @@ func TestCluster_PauseLeader_RemainingNodesElectNewLeader(t *testing.T) {
 		t.Fatalf("expected resumed old leader to step down to Follower on seeing higher term, got %s", leaderNode.GetState())
 	}
 }
-
-
-
-
-
-
-
-
-
-
-

@@ -266,8 +266,7 @@ func (n *Network) getDelayLocked(src, dst raft.NodeID) time.Duration {
 	return d
 }
 
-// sendRequestVote routes a RequestVote RPC from src to dst in-memory.
-func (n *Network) sendRequestVote(ctx context.Context, src, dst raft.NodeID, req *raftpb.RequestVoteArgs) (*raftpb.RequestVoteReply, error) {
+func (n *Network) prepareOutboundRPC(ctx context.Context, src, dst raft.NodeID, msgType RPCMessageType, msg any) (*Server, error) {
 	n.totalSent.Add(1)
 
 	n.mu.RLock()
@@ -277,9 +276,8 @@ func (n *Network) sendRequestVote(ctx context.Context, src, dst raft.NodeID, req
 	targetNode := n.nodes[dst]
 	n.mu.RUnlock()
 
-	// Evaluate custom filters
 	for _, f := range filters {
-		if f(src, dst, RPCRequestVote, req) {
+		if f(src, dst, msgType, msg) {
 			blocked = true
 			break
 		}
@@ -303,103 +301,68 @@ func (n *Network) sendRequestVote(ctx context.Context, src, dst raft.NodeID, req
 		return nil, status.Errorf(codes.Unavailable, "network: target node %d is unavailable or killed", dst)
 	}
 
-	// Deep-copy request to ensure true wire memory isolation
-	clonedReq := proto.Clone(req).(*raftpb.RequestVoteArgs)
+	return targetNode, nil
+}
 
+func (n *Network) prepareInboundReply(ctx context.Context, dst, src raft.NodeID) error {
+	n.mu.RLock()
+	returnBlocked := n.partitions[dst] != nil && n.partitions[dst][src]
+	returnDelay := n.getDelayLocked(dst, src)
+	n.mu.RUnlock()
+
+	if returnBlocked {
+		n.totalDropped.Add(1)
+		return status.Errorf(codes.Unavailable, "network: reply dropped by partition (node %d to %d)", dst, src)
+	}
+
+	if returnDelay > 0 {
+		select {
+		case <-time.After(returnDelay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// sendRequestVote routes a RequestVote RPC from src to dst in-memory.
+func (n *Network) sendRequestVote(ctx context.Context, src, dst raft.NodeID, req *raftpb.RequestVoteArgs) (*raftpb.RequestVoteReply, error) {
+	targetNode, err := n.prepareOutboundRPC(ctx, src, dst, RPCRequestVote, req)
+	if err != nil {
+		return nil, err
+	}
+
+	clonedReq := proto.Clone(req).(*raftpb.RequestVoteArgs)
 	reply, err := targetNode.RequestVote(ctx, clonedReq)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check if return path is partitioned
-	n.mu.RLock()
-	returnBlocked := n.partitions[dst] != nil && n.partitions[dst][src]
-	returnDelay := n.getDelayLocked(dst, src)
-	n.mu.RUnlock()
-
-	if returnBlocked {
-		n.totalDropped.Add(1)
-		return nil, status.Errorf(codes.Unavailable, "network: reply dropped by partition (node %d to %d)", dst, src)
+	if err := n.prepareInboundReply(ctx, dst, src); err != nil {
+		return nil, err
 	}
 
-	if returnDelay > 0 {
-		select {
-		case <-time.After(returnDelay):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	// Deep-copy reply
-	clonedReply := proto.Clone(reply).(*raftpb.RequestVoteReply)
-	return clonedReply, nil
+	return proto.Clone(reply).(*raftpb.RequestVoteReply), nil
 }
 
 // sendAppendEntries routes an AppendEntries RPC from src to dst in-memory.
 func (n *Network) sendAppendEntries(ctx context.Context, src, dst raft.NodeID, req *raftpb.AppendEntriesArgs) (*raftpb.AppendEntriesReply, error) {
-	n.totalSent.Add(1)
-
-	n.mu.RLock()
-	blocked := n.isBlockedLocked(src, dst)
-	delay := n.getDelayLocked(src, dst)
-	filters := n.filters
-	targetNode := n.nodes[dst]
-	n.mu.RUnlock()
-
-	for _, f := range filters {
-		if f(src, dst, RPCAppendEntries, req) {
-			blocked = true
-			break
-		}
+	targetNode, err := n.prepareOutboundRPC(ctx, src, dst, RPCAppendEntries, req)
+	if err != nil {
+		return nil, err
 	}
 
-	if blocked {
-		n.totalDropped.Add(1)
-		return nil, status.Errorf(codes.Unavailable, "network: message dropped (node %d to %d)", src, dst)
-	}
-
-	if delay > 0 {
-		n.totalDelayed.Add(1)
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	if targetNode == nil || targetNode.IsKilled() {
-		return nil, status.Errorf(codes.Unavailable, "network: target node %d is unavailable or killed", dst)
-	}
-
-	// Deep-copy request
 	clonedReq := proto.Clone(req).(*raftpb.AppendEntriesArgs)
-
 	reply, err := targetNode.AppendEntries(ctx, clonedReq)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check if return path is partitioned
-	n.mu.RLock()
-	returnBlocked := n.partitions[dst] != nil && n.partitions[dst][src]
-	returnDelay := n.getDelayLocked(dst, src)
-	n.mu.RUnlock()
-
-	if returnBlocked {
-		n.totalDropped.Add(1)
-		return nil, status.Errorf(codes.Unavailable, "network: reply dropped by partition (node %d to %d)", dst, src)
+	if err := n.prepareInboundReply(ctx, dst, src); err != nil {
+		return nil, err
 	}
 
-	if returnDelay > 0 {
-		select {
-		case <-time.After(returnDelay):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	clonedReply := proto.Clone(reply).(*raftpb.AppendEntriesReply)
-	return clonedReply, nil
+	return proto.Clone(reply).(*raftpb.AppendEntriesReply), nil
 }
 
 // inMemoryPeerClient implements raftpb.RaftServiceClient routing calls through the Network.
@@ -483,8 +446,80 @@ func WithAutoStart(autoStart bool) ClusterOption {
 	}
 }
 
-// NewCluster builds an in-process Raft cluster of n nodes with an in-memory fake network.
-func NewCluster(t testing.TB, n int, opts ...ClusterOption) *Cluster {
+func buildPeerList(nodeIDs []raft.NodeID, selfID raft.NodeID) []Peer {
+	peers := make([]Peer, 0, len(nodeIDs)-1)
+	for _, peerID := range nodeIDs {
+		if peerID != selfID {
+			peers = append(peers, Peer{
+				ID:      peerID,
+				Address: fmt.Sprintf("in-memory://node-%d", peerID),
+			})
+		}
+	}
+	return peers
+}
+
+func configureServerOptions(srv *Server, options clusterOptions) {
+	srv.SetHeartbeatInterval(options.heartbeatInterval)
+	srv.SetRPCTimeout(options.rpcTimeout)
+	if srv.GetElectionTimer() != nil {
+		srv.GetElectionTimer().SetRange(options.minTimeout, options.maxTimeout)
+		srv.ResetElectionTimeout()
+	}
+	if options.checkQuorum {
+		srv.SetCheckQuorum(true)
+		if options.checkQuorumInterval > 0 {
+			srv.SetCheckQuorumInterval(options.checkQuorumInterval)
+		}
+	}
+}
+
+func registerPeerClients(net *Network, srv *Server, srcID raft.NodeID, peers []Peer) {
+	for _, peer := range peers {
+		client := &inMemoryPeerClient{
+			net:   net,
+			srcID: srcID,
+			dstID: peer.ID,
+		}
+		srv.ClientPool().Register(peer.ID, client)
+	}
+}
+
+func restoreStorageState(oldSrv *Server, id raft.NodeID, t testing.TB) (*raft.PersistentState, store.Storage) {
+	if oldSrv == nil {
+		memStorage := store.NewMemoryStorage()
+		state := &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}
+		_ = memStorage.Persist(state)
+		return state, memStorage
+	}
+
+	memStorage := oldSrv.Storage
+	var loadedState *raft.PersistentState
+	if memStorage != nil {
+		var err error
+		loadedState, err = memStorage.Load()
+		if err != nil && t != nil {
+			t.Logf("warning: failed to load storage for node %d: %v", id, err)
+		}
+	}
+	if loadedState == nil && oldSrv.PersistentState != nil {
+		loadedState = &raft.PersistentState{
+			CurrentTerm: oldSrv.PersistentState.CurrentTerm,
+			VotedFor:    oldSrv.PersistentState.VotedFor,
+			Log:         append([]raft.LogEntry(nil), oldSrv.PersistentState.Log...),
+		}
+	}
+	if loadedState == nil {
+		loadedState = &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}
+	}
+	if memStorage == nil {
+		memStorage = store.NewMemoryStorage()
+		_ = memStorage.Persist(loadedState)
+	}
+	return loadedState, memStorage
+}
+
+func resolveClusterOptions(opts ...ClusterOption) clusterOptions {
 	options := clusterOptions{
 		minTimeout:        100 * time.Millisecond,
 		maxTimeout:        200 * time.Millisecond,
@@ -495,60 +530,31 @@ func NewCluster(t testing.TB, n int, opts ...ClusterOption) *Cluster {
 	for _, opt := range opts {
 		opt(&options)
 	}
+	return options
+}
 
-	net := NewNetwork()
-	nodeIDs := make([]raft.NodeID, n)
-	servers := make(map[raft.NodeID]*Server, n)
-
-	// Step 1: Create all server instances with full mesh peer metadata
-	for i := 1; i <= n; i++ {
-		id := raft.NodeID(i)
-		nodeIDs[i-1] = id
-
-		peers := make([]Peer, 0, n-1)
-		for j := 1; j <= n; j++ {
-			if i != j {
-				peers = append(peers, Peer{
-					ID:      raft.NodeID(j),
-					Address: fmt.Sprintf("in-memory://node-%d", j),
-				})
-			}
-		}
-
+func initClusterNodes(net *Network, nodeIDs []raft.NodeID, options clusterOptions) map[raft.NodeID]*Server {
+	servers := make(map[raft.NodeID]*Server, len(nodeIDs))
+	for _, id := range nodeIDs {
+		peers := buildPeerList(nodeIDs, id)
 		srv := NewServer(id, peers, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
-		srv.SetHeartbeatInterval(options.heartbeatInterval)
-		srv.SetRPCTimeout(options.rpcTimeout)
-		if srv.GetElectionTimer() != nil {
-			srv.GetElectionTimer().SetRange(options.minTimeout, options.maxTimeout)
-			srv.ResetElectionTimeout()
-		}
-		if options.checkQuorum {
-			srv.SetCheckQuorum(true)
-			if options.checkQuorumInterval > 0 {
-				srv.SetCheckQuorumInterval(options.checkQuorumInterval)
-			}
-		}
-
+		configureServerOptions(srv, options)
 		servers[id] = srv
 		net.RegisterNode(id, srv)
+		registerPeerClients(net, srv, id, peers)
 	}
+	return servers
+}
 
-	// Step 2: Register in-memory fake clients in each node's RPCClientPool
+// NewCluster builds an in-process Raft cluster of n nodes with an in-memory fake network.
+func NewCluster(t testing.TB, n int, opts ...ClusterOption) *Cluster {
+	options := resolveClusterOptions(opts...)
+	net := NewNetwork()
+	nodeIDs := make([]raft.NodeID, n)
 	for i := 1; i <= n; i++ {
-		srcID := raft.NodeID(i)
-		srcServer := servers[srcID]
-		for j := 1; j <= n; j++ {
-			if i != j {
-				dstID := raft.NodeID(j)
-				client := &inMemoryPeerClient{
-					net:   net,
-					srcID: srcID,
-					dstID: dstID,
-				}
-				srcServer.ClientPool().Register(dstID, client)
-			}
-		}
+		nodeIDs[i-1] = raft.NodeID(i)
 	}
+	servers := initClusterNodes(net, nodeIDs, options)
 
 	c := &Cluster{
 		t:       t,
@@ -563,12 +569,9 @@ func NewCluster(t testing.TB, n int, opts ...ClusterOption) *Cluster {
 			c.Stop()
 		})
 	}
-
-	// Step 3: Start event loops if autoStart is true
 	if options.autoStart {
 		c.Start()
 	}
-
 	return c
 }
 
@@ -637,71 +640,19 @@ func (c *Cluster) Restart(id raft.NodeID) *Server {
 		oldSrv.Kill()
 	}
 
-	var loadedState *raft.PersistentState
-	var memStorage store.Storage
-	if oldSrv != nil {
-		memStorage = oldSrv.Storage
-		if memStorage != nil {
-			var err error
-			loadedState, err = memStorage.Load()
-			if err != nil && c.t != nil {
-				c.t.Logf("warning: failed to load storage for node %d: %v", id, err)
-			}
-		}
-		if loadedState == nil && oldSrv.PersistentState != nil {
-			loadedState = &raft.PersistentState{
-				CurrentTerm: oldSrv.PersistentState.CurrentTerm,
-				VotedFor:    oldSrv.PersistentState.VotedFor,
-				Log:         append([]raft.LogEntry(nil), oldSrv.PersistentState.Log...),
-			}
-		}
-	}
-	if loadedState == nil {
-		loadedState = &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}
-	}
-	if memStorage == nil {
-		memStorage = store.NewMemoryStorage()
-		_ = memStorage.Persist(loadedState)
-	}
+	loadedState, memStorage := restoreStorageState(oldSrv, id, c.t)
 
 	var peers []Peer
 	if oldSrv != nil {
 		peers = oldSrv.Peers
 	} else {
-		peers = make([]Peer, 0, len(c.nodeIDs)-1)
-		for _, peerID := range c.nodeIDs {
-			if peerID != id {
-				peers = append(peers, Peer{
-					ID:      peerID,
-					Address: fmt.Sprintf("in-memory://node-%d", peerID),
-				})
-			}
-		}
+		peers = buildPeerList(c.nodeIDs, id)
 	}
 
 	newSrv := NewServer(id, peers, loadedState, nil)
 	newSrv.Storage = memStorage
-	newSrv.SetHeartbeatInterval(c.options.heartbeatInterval)
-	newSrv.SetRPCTimeout(c.options.rpcTimeout)
-	if newSrv.GetElectionTimer() != nil {
-		newSrv.GetElectionTimer().SetRange(c.options.minTimeout, c.options.maxTimeout)
-		newSrv.ResetElectionTimeout()
-	}
-	if c.options.checkQuorum {
-		newSrv.SetCheckQuorum(true)
-		if c.options.checkQuorumInterval > 0 {
-			newSrv.SetCheckQuorumInterval(c.options.checkQuorumInterval)
-		}
-	}
-
-	for _, peer := range peers {
-		client := &inMemoryPeerClient{
-			net:   c.Network,
-			srcID: id,
-			dstID: peer.ID,
-		}
-		newSrv.ClientPool().Register(peer.ID, client)
-	}
+	configureServerOptions(newSrv, c.options)
+	registerPeerClients(c.Network, newSrv, id, peers)
 
 	c.servers[id] = newSrv
 	c.Network.RegisterNode(id, newSrv)

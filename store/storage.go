@@ -141,4 +141,3 @@ func (m *MemoryStorage) LoadSnapshot() ([]byte, error) {
 func (m *MemoryStorage) Close() error {
 	return nil
 }
-

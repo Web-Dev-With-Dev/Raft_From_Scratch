@@ -27,7 +27,7 @@ var (
 	RandomElectionTimeout = raft.RandomElectionTimeout
 	NewElectionTimer      = raft.NewElectionTimer
 )
-	
+
 type RequestVoteArgs = raft.RequestVoteArgs
 type RequestVoteReply = raft.RequestVoteReply
 type AppendEntriesArgs = raft.AppendEntriesArgs

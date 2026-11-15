@@ -233,4 +233,3 @@ func TestStress_RandomKillsRestarts_AtMostOneLeaderPerTerm(t *testing.T) {
 	t.Logf("Invariant Result:          PASSED — AT MOST ONE LEADER PER TERM MAINTAINED 100%%")
 	t.Logf("================================================================================")
 }
-
