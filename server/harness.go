@@ -398,10 +398,18 @@ type clusterOptions struct {
 	checkQuorum         bool
 	checkQuorumInterval time.Duration
 	autoStart           bool
+	clock               raft.Clock
 }
 
 // ClusterOption configures test cluster parameters.
 type ClusterOption func(*clusterOptions)
+
+// WithClock sets a custom Clock interface for cluster nodes.
+func WithClock(clk raft.Clock) ClusterOption {
+	return func(o *clusterOptions) {
+		o.clock = clk
+	}
+}
 
 // WithElectionTimeout configures the election timer range for all nodes.
 func WithElectionTimeout(min, max time.Duration) ClusterOption {
@@ -460,6 +468,9 @@ func buildPeerList(nodeIDs []raft.NodeID, selfID raft.NodeID) []Peer {
 }
 
 func configureServerOptions(srv *Server, options clusterOptions) {
+	if options.clock != nil {
+		srv.SetClock(options.clock)
+	}
 	srv.SetHeartbeatInterval(options.heartbeatInterval)
 	srv.SetRPCTimeout(options.rpcTimeout)
 	if srv.GetElectionTimer() != nil {

@@ -132,12 +132,15 @@ type Server struct {
 	VolatileState       *raft.VolatileState       `json:"volatile_state"`
 	VolatileStateLeader *raft.VolatileStateLeader `json:"volatile_state_leader,omitempty"`
 
-	// ElectionTimer manages the randomized election timeout backed by time.Timer.
+	// ElectionTimer manages the randomized election timeout backed by Clock and Timer interfaces.
 	ElectionTimer *raft.ElectionTimer `json:"-"`
 
+	// Clock abstracts time operations for the server and timers.
+	clock raft.Clock
+
 	// Leader-only heartbeat ticker (fires every heartbeatInterval, e.g. 50ms)
-	heartbeatTicker   *time.Ticker
-	heartbeatTimer    *time.Timer
+	heartbeatTicker   raft.Ticker
+	heartbeatTimer    raft.Timer
 	heartbeatInterval time.Duration
 	heartbeatsSent    atomic.Uint64
 
@@ -199,7 +202,7 @@ type Server struct {
 	// checkQuorum controls (§6.2): leader steps down if it loses contact with a majority
 	checkQuorum         bool
 	checkQuorumInterval time.Duration
-	checkQuorumTimer    *time.Timer
+	checkQuorumTimer    raft.Timer
 	heartbeatAcks       map[raft.NodeID]bool
 }
 
@@ -241,17 +244,19 @@ func NewServer(
 		_ = memStorage.Persist(persistentState)
 	}
 
+	clk := raft.NewRealClock()
 	srv := &Server{
 		ID:                id,
+		clock:             clk,
 		Peers:             peers,
 		PersistentState:   persistentState,
 		Storage:           memStorage,
 		State:             raft.Follower,
 		VolatileState:     &raft.VolatileState{CommitIndex: 0, LastApplied: 0},
-		ElectionTimer:     raft.NewElectionTimer(raft.DefaultMinElectionTimeout, raft.DefaultMaxElectionTimeout),
+		ElectionTimer:     raft.NewElectionTimerWithClock(clk, raft.DefaultMinElectionTimeout, raft.DefaultMaxElectionTimeout),
 		RPCClientPool:     rpcClientPool,
 		Logger:            nodeLogger,
-		lastHeartbeat:     time.Now(),
+		lastHeartbeat:     clk.Now(),
 		heartbeatInterval: raft.DefaultHeartbeatInterval,
 		votesReceived:     make(map[raft.NodeID]bool),
 		stopCh:            stopCh,
@@ -560,6 +565,33 @@ func (s *Server) SetState(state raft.RaftState) {
 	s.GetLogger().Info("transitioned consensus state", "from", old.String(), "to", state.String())
 }
 
+func (s *Server) getClockLocked() raft.Clock {
+	if s.clock == nil {
+		s.clock = raft.NewRealClock()
+	}
+	return s.clock
+}
+
+// Clock returns the Clock used by the server.
+func (s *Server) Clock() raft.Clock {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getClockLocked()
+}
+
+// SetClock configures a custom Clock interface for the server and election timer.
+func (s *Server) SetClock(clk raft.Clock) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if clk == nil {
+		clk = raft.NewRealClock()
+	}
+	s.clock = clk
+	if s.ElectionTimer != nil {
+		s.ElectionTimer.SetClock(clk)
+	}
+}
+
 // GetElectionTimer returns the server's election timer.
 func (s *Server) GetElectionTimer() *raft.ElectionTimer {
 	s.mu.RLock()
@@ -568,7 +600,7 @@ func (s *Server) GetElectionTimer() *raft.ElectionTimer {
 }
 
 // GetHeartbeatTicker returns the leader's heartbeat ticker, or nil if not running.
-func (s *Server) GetHeartbeatTicker() *time.Ticker {
+func (s *Server) GetHeartbeatTicker() raft.Ticker {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.heartbeatTicker
@@ -645,7 +677,7 @@ func (s *Server) resetCheckQuorumTimerLocked() {
 			interval = raft.DefaultMinElectionTimeout
 		}
 	}
-	s.checkQuorumTimer = time.NewTimer(interval)
+	s.checkQuorumTimer = s.getClockLocked().NewTimer(interval)
 }
 
 func (s *Server) handleCheckQuorumTimeoutLocked() {
@@ -1912,12 +1944,13 @@ func (s *Server) startLeaderTimersLocked() {
 	if s.heartbeatTicker != nil {
 		s.heartbeatTicker.Stop()
 	}
-	s.heartbeatTicker = time.NewTicker(s.heartbeatInterval)
+	clk := s.getClockLocked()
+	s.heartbeatTicker = clk.NewTicker(s.heartbeatInterval)
 
 	if s.heartbeatTimer != nil {
 		s.heartbeatTimer.Stop()
 	}
-	s.heartbeatTimer = time.NewTimer(s.heartbeatInterval)
+	s.heartbeatTimer = clk.NewTimer(s.heartbeatInterval)
 
 	s.heartbeatAcks = make(map[raft.NodeID]bool)
 	if s.checkQuorum {
@@ -2432,15 +2465,15 @@ func (s *Server) selectActiveTimerChannels() (<-chan time.Time, <-chan time.Time
 	var heartbeatCh <-chan time.Time
 	if s.State == raft.Leader {
 		if s.heartbeatTicker != nil {
-			heartbeatCh = s.heartbeatTicker.C
+			heartbeatCh = s.heartbeatTicker.C()
 		} else if s.heartbeatTimer != nil {
-			heartbeatCh = s.heartbeatTimer.C
+			heartbeatCh = s.heartbeatTimer.C()
 		}
 	}
 
 	var checkQuorumCh <-chan time.Time
 	if s.State == raft.Leader && s.checkQuorum && s.checkQuorumTimer != nil {
-		checkQuorumCh = s.checkQuorumTimer.C
+		checkQuorumCh = s.checkQuorumTimer.C()
 	}
 	return timerCh, heartbeatCh, checkQuorumCh
 }

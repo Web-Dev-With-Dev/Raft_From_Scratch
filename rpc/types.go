@@ -12,6 +12,10 @@ type VolatileState = raft.VolatileState
 type VolatileStateLeader = raft.VolatileStateLeader
 type RaftState = raft.RaftState
 type ElectionTimer = raft.ElectionTimer
+type Clock = raft.Clock
+type Timer = raft.Timer
+type Ticker = raft.Ticker
+type RealClock = raft.RealClock
 
 const (
 	Follower  = raft.Follower
@@ -26,6 +30,7 @@ const (
 var (
 	RandomElectionTimeout = raft.RandomElectionTimeout
 	NewElectionTimer      = raft.NewElectionTimer
+	NewRealClock          = raft.NewRealClock
 )
 
 type RequestVoteArgs = raft.RequestVoteArgs

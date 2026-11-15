@@ -29,12 +29,13 @@ func RandomElectionTimeout(min, max time.Duration) time.Duration {
 	return min + time.Duration(rand.Int64N(int64(delta)+1))
 }
 
-// ElectionTimer manages an election timeout backed by time.Timer.
+// ElectionTimer manages an election timeout backed by Clock and Timer interfaces.
 // It provides safe resetting with randomized durations in [min, max]
 // to prevent split votes during leader election.
 type ElectionTimer struct {
 	mu         sync.Mutex
-	timer      *time.Timer
+	clock      Clock
+	timer      Timer
 	minTimeout time.Duration
 	maxTimeout time.Duration
 	duration   time.Duration
@@ -42,10 +43,23 @@ type ElectionTimer struct {
 	stopped    bool
 }
 
-// NewElectionTimer creates a new ElectionTimer initialized with a randomized
-// timeout within [min, max] using time.NewTimer.
-// If min <= 0 or max <= 0, the default range [150ms, 300ms] is applied.
+func (et *ElectionTimer) getClockLocked() Clock {
+	if et.clock == nil {
+		et.clock = NewRealClock()
+	}
+	return et.clock
+}
+
+// NewElectionTimer creates a new ElectionTimer using RealClock.
 func NewElectionTimer(min, max time.Duration) *ElectionTimer {
+	return NewElectionTimerWithClock(NewRealClock(), min, max)
+}
+
+// NewElectionTimerWithClock creates a new ElectionTimer backed by the provided Clock interface.
+func NewElectionTimerWithClock(clock Clock, min, max time.Duration) *ElectionTimer {
+	if clock == nil {
+		clock = NewRealClock()
+	}
 	if min <= 0 || max <= 0 {
 		min = DefaultMinElectionTimeout
 		max = DefaultMaxElectionTimeout
@@ -56,15 +70,33 @@ func NewElectionTimer(min, max time.Duration) *ElectionTimer {
 
 	d := RandomElectionTimeout(min, max)
 	return &ElectionTimer{
-		timer:      time.NewTimer(d),
+		clock:      clock,
+		timer:      clock.NewTimer(d),
 		minTimeout: min,
 		maxTimeout: max,
 		duration:   d,
-		lastReset:  time.Now(),
+		lastReset:  clock.Now(),
 	}
 }
 
-// C returns the underlying time.Timer channel that receives the current time
+// Clock returns the Clock interface used by the election timer.
+func (et *ElectionTimer) Clock() Clock {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+	return et.getClockLocked()
+}
+
+// SetClock configures a custom Clock interface for the election timer.
+func (et *ElectionTimer) SetClock(clock Clock) {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+	if clock == nil {
+		clock = NewRealClock()
+	}
+	et.clock = clock
+}
+
+// C returns the underlying Timer channel that receives the current time
 // when the election timeout expires.
 func (et *ElectionTimer) C() <-chan time.Time {
 	et.mu.Lock()
@@ -72,7 +104,7 @@ func (et *ElectionTimer) C() <-chan time.Time {
 	if et.timer == nil {
 		return nil
 	}
-	return et.timer.C
+	return et.timer.C()
 }
 
 // Reset resets the election timer with a newly selected randomized duration
@@ -83,25 +115,24 @@ func (et *ElectionTimer) Reset() time.Duration {
 	et.mu.Lock()
 	defer et.mu.Unlock()
 
+	clk := et.getClockLocked()
+	d := RandomElectionTimeout(et.minTimeout, et.maxTimeout)
+	et.duration = d
+	et.lastReset = clk.Now()
+
 	if et.timer == nil {
-		d := RandomElectionTimeout(et.minTimeout, et.maxTimeout)
-		et.duration = d
-		et.timer = time.NewTimer(d)
+		et.timer = clk.NewTimer(d)
 		et.stopped = false
 		return d
 	}
 
-	// Safely stop and drain the timer channel if already fired
 	if !et.timer.Stop() {
 		select {
-		case <-et.timer.C:
+		case <-et.timer.C():
 		default:
 		}
 	}
 
-	d := RandomElectionTimeout(et.minTimeout, et.maxTimeout)
-	et.duration = d
-	et.lastReset = time.Now()
 	et.timer.Reset(d)
 	et.stopped = false
 	return d
@@ -113,23 +144,23 @@ func (et *ElectionTimer) ResetWithTimeout(d time.Duration) time.Duration {
 	et.mu.Lock()
 	defer et.mu.Unlock()
 
+	clk := et.getClockLocked()
+	et.duration = d
+	et.lastReset = clk.Now()
+
 	if et.timer == nil {
-		et.duration = d
-		et.lastReset = time.Now()
-		et.timer = time.NewTimer(d)
+		et.timer = clk.NewTimer(d)
 		et.stopped = false
 		return d
 	}
 
 	if !et.timer.Stop() {
 		select {
-		case <-et.timer.C:
+		case <-et.timer.C():
 		default:
 		}
 	}
 
-	et.duration = d
-	et.lastReset = time.Now()
 	et.timer.Reset(d)
 	et.stopped = false
 	return d
