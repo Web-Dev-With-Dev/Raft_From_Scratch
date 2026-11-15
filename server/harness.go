@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -401,10 +403,18 @@ type clusterOptions struct {
 	autoStart           bool
 	clock               raft.Clock
 	simNetwork          *SimNetwork
+	randSeed            int64
 }
 
 // ClusterOption configures test cluster parameters.
 type ClusterOption func(*clusterOptions)
+
+// WithRandSeed configures a deterministic pseudo-random seed for election timeouts across nodes.
+func WithRandSeed(seed int64) ClusterOption {
+	return func(o *clusterOptions) {
+		o.randSeed = seed
+	}
+}
 
 // WithSimNetwork configures a SimNetwork instance as the cluster transport.
 func WithSimNetwork(simNet *SimNetwork) ClusterOption {
@@ -479,6 +489,16 @@ func buildPeerList(nodeIDs []raft.NodeID, selfID raft.NodeID) []Peer {
 func configureServerOptions(srv *Server, options clusterOptions) {
 	if options.clock != nil {
 		srv.SetClock(options.clock)
+	}
+	if options.randSeed != 0 {
+		nodeRng := rand.New(rand.NewSource(options.randSeed + int64(srv.ID)*1000))
+		srv.SetRandFn(func(min, max time.Duration) time.Duration {
+			if min >= max {
+				return min
+			}
+			delta := int64(max - min)
+			return min + time.Duration(nodeRng.Int63n(delta+1))
+		})
 	}
 	srv.SetHeartbeatInterval(options.heartbeatInterval)
 	srv.SetRPCTimeout(options.rpcTimeout)
@@ -794,8 +814,74 @@ func (c *Cluster) Leader() (*Server, raft.Term) {
 	return nil, 0
 }
 
+// FakeClock returns the cluster's FakeClock if one was configured, or nil.
+func (c *Cluster) FakeClock() *raft.FakeClock {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if fc, ok := c.options.clock.(*raft.FakeClock); ok {
+		return fc
+	}
+	return nil
+}
+
+// Advance advances the cluster's fake clock by duration d and yields to event loops.
+func (c *Cluster) Advance(d time.Duration) time.Time {
+	fc := c.FakeClock()
+	if fc == nil {
+		return time.Now()
+	}
+	now := fc.Advance(d)
+	for i := 0; i < 5; i++ {
+		runtime.Gosched()
+	}
+	return now
+}
+
+// AdvanceUntil advances the cluster's fake clock until condition returns true or budget is exhausted.
+func (c *Cluster) AdvanceUntil(budget time.Duration, condition func() bool) bool {
+	if condition() {
+		return true
+	}
+	fc := c.FakeClock()
+	if fc == nil {
+		return false
+	}
+
+	step := 5 * time.Millisecond
+	elapsed := time.Duration(0)
+	for elapsed < budget {
+		fc.Advance(step)
+		elapsed += step
+		for i := 0; i < 5; i++ {
+			if condition() {
+				return true
+			}
+			runtime.Gosched()
+		}
+	}
+	return condition()
+}
+
 // WaitLeader polls until exactly one node in the cluster is in Leader state.
 func (c *Cluster) WaitLeader(timeout time.Duration) (*Server, raft.Term, error) {
+	if c.FakeClock() != nil {
+		var leader *Server
+		var leaderTerm raft.Term
+		success := c.AdvanceUntil(timeout, func() bool {
+			l, term := c.Leader()
+			if l != nil {
+				leader = l
+				leaderTerm = term
+				return true
+			}
+			return false
+		})
+		if success && leader != nil {
+			return leader, leaderTerm, nil
+		}
+		return nil, 0, fmt.Errorf("no unique leader elected within simulated %v", timeout)
+	}
+
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if leader, term := c.Leader(); leader != nil {
@@ -808,17 +894,32 @@ func (c *Cluster) WaitLeader(timeout time.Duration) (*Server, raft.Term, error) 
 
 // Partition disconnects all nodes in set1 from set2 bidirectionally.
 func (c *Cluster) Partition(set1, set2 []raft.NodeID) {
-	c.Network.Partition(set1, set2)
+	if c.SimNetwork != nil {
+		c.SimNetwork.Partition(set1, set2)
+	}
+	if c.Network != nil {
+		c.Network.Partition(set1, set2)
+	}
 }
 
 // Heal removes all network partitions in the cluster.
 func (c *Cluster) Heal() {
-	c.Network.Heal()
+	if c.SimNetwork != nil {
+		c.SimNetwork.Heal()
+	}
+	if c.Network != nil {
+		c.Network.Heal()
+	}
 }
 
 // Drop drops all messages from src to dst.
 func (c *Cluster) Drop(src, dst raft.NodeID) {
-	c.Network.Drop(src, dst)
+	if c.SimNetwork != nil {
+		c.SimNetwork.Drop(src, dst)
+	}
+	if c.Network != nil {
+		c.Network.Drop(src, dst)
+	}
 }
 
 // SetDelay configures latency delay between src and dst.

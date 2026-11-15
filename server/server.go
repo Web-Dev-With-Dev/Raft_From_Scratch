@@ -587,8 +587,18 @@ func (s *Server) SetClock(clk raft.Clock) {
 		clk = raft.NewRealClock()
 	}
 	s.clock = clk
+	s.lastHeartbeat = clk.Now()
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.SetClock(clk)
+	}
+}
+
+// SetRandFn configures a custom random duration generator on the election timer.
+func (s *Server) SetRandFn(fn func(min, max time.Duration) time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ElectionTimer != nil {
+		s.ElectionTimer.SetRandFn(fn)
 	}
 }
 
@@ -806,7 +816,7 @@ func (s *Server) handleHeartbeatDirectLocked(leaderID raft.NodeID, term raft.Ter
 		)
 	}
 
-	s.lastHeartbeat = time.Now()
+	s.lastHeartbeat = s.getClockLocked().Now()
 	var newTimeout time.Duration
 	if s.ElectionTimer != nil {
 		newTimeout = s.ElectionTimer.Reset()
@@ -1536,7 +1546,7 @@ func (s *Server) HeartbeatsReceived() uint64 {
 // timeout window to collect majority votes and establish leadership (by sending heartbeats),
 // significantly reducing the likelihood of split votes.
 func (s *Server) resetElectionTimerOnGrantingVoteLocked(candidateID int64, term uint64) time.Duration {
-	s.lastHeartbeat = time.Now()
+	s.lastHeartbeat = s.getClockLocked().Now()
 	var newTimeout time.Duration
 	if s.ElectionTimer != nil {
 		newTimeout = s.ElectionTimer.Reset()
@@ -1637,7 +1647,7 @@ func (s *Server) recordVoteGrantOrDenyLocked(req *raftpb.RequestVoteArgs, curren
 	})
 	if steppedDown {
 		_ = s.persistLocked()
-		s.lastHeartbeat = time.Now()
+		s.lastHeartbeat = s.getClockLocked().Now()
 		if s.ElectionTimer != nil {
 			s.ElectionTimer.Reset()
 		}
@@ -1681,7 +1691,7 @@ func (s *Server) applyAppendEntriesRoleAndTimer(req *raftpb.AppendEntriesArgs, c
 	} else if s.State == raft.Candidate {
 		s.becomeFollowerLocked(raft.Term(req.Term))
 	} else {
-		s.lastHeartbeat = time.Now()
+		s.lastHeartbeat = s.getClockLocked().Now()
 		if s.ElectionTimer != nil {
 			newTimeout := s.ElectionTimer.Reset()
 			s.GetLogger().Debug("reset election timer on valid heartbeat/AppendEntries",
@@ -1797,7 +1807,7 @@ func (s *Server) becomeFollowerLocked(term raft.Term) {
 
 	s.stopHeartbeatTickerLocked()
 
-	s.lastHeartbeat = time.Now()
+	s.lastHeartbeat = s.getClockLocked().Now()
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Reset()
 	}

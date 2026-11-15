@@ -41,6 +41,21 @@ type ElectionTimer struct {
 	duration   time.Duration
 	lastReset  time.Time
 	stopped    bool
+	randFn     func(min, max time.Duration) time.Duration
+}
+
+// SetRandFn configures a custom pseudo-random duration generator.
+func (et *ElectionTimer) SetRandFn(fn func(min, max time.Duration) time.Duration) {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+	et.randFn = fn
+}
+
+func (et *ElectionTimer) randomTimeoutLocked() time.Duration {
+	if et.randFn != nil {
+		return et.randFn(et.minTimeout, et.maxTimeout)
+	}
+	return RandomElectionTimeout(et.minTimeout, et.maxTimeout)
 }
 
 func (et *ElectionTimer) getClockLocked() Clock {
@@ -93,7 +108,13 @@ func (et *ElectionTimer) SetClock(clock Clock) {
 	if clock == nil {
 		clock = NewRealClock()
 	}
-	et.clock = clock
+	if et.clock != clock {
+		if et.timer != nil {
+			et.timer.Stop()
+			et.timer = nil
+		}
+		et.clock = clock
+	}
 }
 
 // C returns the underlying Timer channel that receives the current time
@@ -116,7 +137,7 @@ func (et *ElectionTimer) Reset() time.Duration {
 	defer et.mu.Unlock()
 
 	clk := et.getClockLocked()
-	d := RandomElectionTimeout(et.minTimeout, et.maxTimeout)
+	d := et.randomTimeoutLocked()
 	et.duration = d
 	et.lastReset = clk.Now()
 

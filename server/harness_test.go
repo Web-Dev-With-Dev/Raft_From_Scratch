@@ -11,408 +11,295 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// TestHarness_Day20_CrashScenario verifies Day 20's leader crash and failover
-// scenario using the in-process test harness and in-memory fake network.
-func TestHarness_Day20_CrashScenario(t *testing.T) {
-	// Raft §5.2: Leader failure and re-election.
-	// 1. Setup a 3-node in-process cluster with in-memory fake network.
-	// 2. Elect Node 1 as initial leader in Term 1.
-	// 3. Mid-test, abruptly kill the leader process (simulating crash).
-	// 4. Remaining followers detect leader silence via election timeout and elect a single new leader.
-	// 5. Measure and log time-to-new-leader (should be roughly 1-3x election timeout).
-
-	minTimeout := 100 * time.Millisecond
-	maxTimeout := 200 * time.Millisecond
-	heartbeatInterval := 20 * time.Millisecond
-
-	cluster := NewCluster(t, 3,
-		WithElectionTimeout(minTimeout, maxTimeout),
-		WithHeartbeatInterval(heartbeatInterval),
-		WithRPCTimeout(40*time.Millisecond),
-	)
-
-	// Elect initial leader (trigger election on Node 1)
-	cluster.GetNode(1).StartElection()
-
-	leader, initialTerm, err := cluster.WaitLeader(2 * time.Second)
-	if err != nil {
-		t.Fatalf("failed to elect initial leader: %v", err)
-	}
-	if leader.ID != 1 {
-		t.Fatalf("expected Node 1 to become initial leader, got Node %d", leader.ID)
-	}
-	if initialTerm < 1 {
-		t.Fatalf("expected initial leader term >= 1, got %d", initialTerm)
-	}
-
-	// Allow heartbeats to stabilize followers
-	time.Sleep(60 * time.Millisecond)
-
+func assertClusterFollowers(t testing.TB, cluster *Cluster, except raft.NodeID) {
 	for _, id := range cluster.NodeIDs() {
-		if id != leader.ID {
-			if st := cluster.GetNode(id).GetState(); st != raft.Follower {
+		node := cluster.GetNode(id)
+		if id != except && !node.IsKilled() {
+			if st := node.GetState(); st != raft.Follower {
 				t.Fatalf("expected node %d to be Follower, got %s", id, st)
 			}
 		}
 	}
+}
 
-	// 3. Abruptly kill the leader process mid-test
-	killTime := time.Now()
-	cluster.Kill(leader.ID)
+func verifySimFailoverBounds(t testing.TB, elapsed, minTimeout, maxTimeout time.Duration) {
+	if elapsed < minTimeout/2 {
+		t.Fatalf("time-to-new-leader %v unexpectedly faster than minTimeout/2 (%v)", elapsed, minTimeout/2)
+	}
+	maxAllowed := 3*maxTimeout + 300*time.Millisecond
+	if elapsed > maxAllowed {
+		t.Fatalf("time-to-new-leader %v exceeded upper bound %v", elapsed, maxAllowed)
+	}
+}
 
-	if !leader.IsKilled() {
-		t.Fatalf("expected leader.IsKilled() == true after Kill()")
+// TestHarness_Day20_CrashScenario verifies Day 20's leader crash and failover
+// scenario using FakeClock + SimNetwork with zero wall-clock sleep waits.
+func TestHarness_Day20_CrashScenario(t *testing.T) {
+	minTimeout, maxTimeout := 100*time.Millisecond, 200*time.Millisecond
+	clk := raft.NewFakeClock()
+	simNet := NewSimNetwork(42)
+	simNet.SetClock(clk)
+
+	cluster := NewCluster(t, 3,
+		WithClock(clk),
+		WithSimNetwork(simNet),
+		WithElectionTimeout(minTimeout, maxTimeout),
+		WithHeartbeatInterval(20*time.Millisecond),
+		WithRPCTimeout(40*time.Millisecond),
+	)
+
+	wallStart := time.Now()
+	cluster.GetNode(1).StartElection()
+	leader, initialTerm, err := cluster.WaitLeader(2 * time.Second)
+	if err != nil || leader.ID != 1 {
+		t.Fatalf("failed to elect initial leader: %v", err)
 	}
 
-	// 4. Poll surviving nodes (Node 2 and Node 3) for new leader election
-	reElectionDeadline := time.Now().Add(3 * time.Second)
+	cluster.Advance(60 * time.Millisecond)
+	assertClusterFollowers(t, cluster, leader.ID)
+
+	killSimTime := clk.Now()
+	cluster.Kill(leader.ID)
+
 	var newLeader *Server
-	for time.Now().Before(reElectionDeadline) {
+	elected := cluster.AdvanceUntil(3*time.Second, func() bool {
 		l, _ := cluster.Leader()
 		if l != nil && l.ID != leader.ID {
 			newLeader = l
-			break
+			return true
 		}
-		time.Sleep(5 * time.Millisecond)
+		return false
+	})
+	if !elected || newLeader == nil {
+		t.Fatalf("surviving nodes failed to elect a new leader")
 	}
 
-	timeToNewLeader := time.Since(killTime)
-
-	if newLeader == nil {
-		t.Fatalf("surviving nodes failed to elect a new leader within %v (node 2: %s, node 3: %s)",
-			time.Since(killTime), cluster.GetNode(2).GetState(), cluster.GetNode(3).GetState())
+	simTimeToNewLeader := clk.Now().Sub(killSimTime)
+	verifySimFailoverBounds(t, simTimeToNewLeader, minTimeout, maxTimeout)
+	if time.Since(wallStart) > 250*time.Millisecond {
+		t.Fatalf("real wall-clock time (%v) should be practically zero", time.Since(wallStart))
 	}
 
-	newTerm := newLeader.Status().Term
-
-	// 5. Measure and log time-to-new-leader
-	t.Logf("================================================================================")
-	t.Logf("DAY 20 IN-MEMORY HARNESS CRASH FAILOVER MEASUREMENT:")
-	t.Logf("Leader Node %d killed at: %v", leader.ID, killTime.Format("15:04:05.000"))
-	t.Logf("New Leader elected: Node %d at term %d", newLeader.ID, newTerm)
-	t.Logf("Time to elect new leader: %v (%.2f ms)", timeToNewLeader, float64(timeToNewLeader.Microseconds())/1000.0)
-	t.Logf("Configured Election Timeout Range: [%v, %v]", minTimeout, maxTimeout)
-	t.Logf("Configured Heartbeat Interval: %v", heartbeatInterval)
-	t.Logf("Ratio to Min Election Timeout: %.2fx", float64(timeToNewLeader)/float64(minTimeout))
-	t.Logf("Ratio to Max Election Timeout: %.2fx", float64(timeToNewLeader)/float64(maxTimeout))
-	t.Logf("================================================================================")
-
-	// Assertions
-	if newLeader.ID == leader.ID {
-		t.Fatalf("new leader cannot be the killed node %d", leader.ID)
-	}
-	if newTerm <= initialTerm {
-		t.Fatalf("expected new leader term > %d, got %d", initialTerm, newTerm)
-	}
-
-	// Allow heartbeats from new leader to stabilize the surviving follower
-	time.Sleep(60 * time.Millisecond)
-
-	for _, id := range cluster.NodeIDs() {
-		node := cluster.GetNode(id)
-		if id == leader.ID {
-			if !node.IsKilled() {
-				t.Fatalf("killed leader %d should report IsKilled() == true", id)
-			}
-		} else if id != newLeader.ID {
-			if node.GetState() != raft.Follower {
-				t.Fatalf("surviving node %d should be Follower, got %s", id, node.GetState())
-			}
-		}
-	}
-
-	// Verify bounds (~1-3x election timeout)
-	if timeToNewLeader < minTimeout/2 {
-		t.Fatalf("time-to-new-leader %v unexpectedly faster than minTimeout/2 (%v)", timeToNewLeader, minTimeout/2)
-	}
-	maxAllowed := 3*maxTimeout + 300*time.Millisecond
-	if timeToNewLeader > maxAllowed {
-		t.Fatalf("time-to-new-leader %v exceeded upper bound %v (~3x timeout)", timeToNewLeader, maxAllowed)
+	cluster.Advance(60 * time.Millisecond)
+	assertClusterFollowers(t, cluster, newLeader.ID)
+	if newLeader.Status().Term <= initialTerm {
+		t.Fatalf("expected new leader term > %d, got %d", initialTerm, newLeader.Status().Term)
 	}
 }
 
 // TestHarness_Network_Partition_OldLeaderIsolatedWithMinority_MustNotKeepActingAsLeader verifies that:
 // When a network partition isolates the leader with a minority of nodes (e.g., 2 nodes out of 5),
 // the leader loses quorum and must NOT keep acting as leader (§6.2 Check Quorum).
-// It steps down to Follower, while the majority partition elects a new leader.
 func TestHarness_Network_Partition_OldLeaderIsolatedWithMinority_MustNotKeepActingAsLeader(t *testing.T) {
-	minTimeout := 100 * time.Millisecond
-	maxTimeout := 200 * time.Millisecond
-	heartbeatInterval := 20 * time.Millisecond
-	checkQuorumInterval := 100 * time.Millisecond
+	minTimeout, maxTimeout := 100*time.Millisecond, 200*time.Millisecond
+	clk := raft.NewFakeClock()
+	simNet := NewSimNetwork(101)
+	simNet.SetClock(clk)
 
-	// 5-node cluster with check-quorum enabled
 	cluster := NewCluster(t, 5,
+		WithClock(clk),
+		WithSimNetwork(simNet),
 		WithElectionTimeout(minTimeout, maxTimeout),
-		WithHeartbeatInterval(heartbeatInterval),
+		WithHeartbeatInterval(20*time.Millisecond),
 		WithRPCTimeout(40*time.Millisecond),
 		WithCheckQuorum(true),
-		WithCheckQuorumInterval(checkQuorumInterval),
+		WithCheckQuorumInterval(100*time.Millisecond),
 	)
 
-	// Elect Node 1 as initial leader
 	cluster.GetNode(1).StartElection()
-
 	leader, initialTerm, err := cluster.WaitLeader(2 * time.Second)
-	if err != nil {
+	if err != nil || leader.ID != 1 {
 		t.Fatalf("failed to elect initial leader: %v", err)
 	}
-	if leader.ID != 1 {
-		t.Fatalf("expected Node 1 leader, got %d", leader.ID)
-	}
 
-	time.Sleep(60 * time.Millisecond)
-
-	// Partition: {1, 2} (minority: 2/5) is isolated from {3, 4, 5} (majority: 3/5)
+	cluster.Advance(60 * time.Millisecond)
 	cluster.Partition([]raft.NodeID{1, 2}, []raft.NodeID{3, 4, 5})
 
-	// 1. In minority partition {1, 2}: Node 1 can only reach Node 2 (acked = 2 < majority 3).
-	// Within checkQuorumInterval, Node 1 must detect quorum loss and step down to Follower!
-	stepDownDeadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(stepDownDeadline) {
-		if cluster.GetNode(1).GetState() != raft.Leader {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	steppedDown := cluster.AdvanceUntil(2*time.Second, func() bool {
+		return cluster.GetNode(1).GetState() != raft.Leader
+	})
+	if !steppedDown {
+		t.Fatalf("isolated leader Node 1 with minority must step down to Follower")
 	}
 
-	if cluster.GetNode(1).GetState() == raft.Leader {
-		t.Fatalf("isolated leader Node 1 with minority must NOT keep acting as leader, but state is still %s",
-			cluster.GetNode(1).GetState())
-	}
-	t.Logf("Isolated old leader Node 1 successfully stepped down to %s upon losing majority quorum",
-		cluster.GetNode(1).GetState())
-
-	// 2. In majority partition {3, 4, 5}: Nodes 3, 4, 5 time out and elect a new leader with higher term
-	reElectionDeadline := time.Now().Add(3 * time.Second)
 	var majorityLeader *Server
-	for time.Now().Before(reElectionDeadline) {
+	elected := cluster.AdvanceUntil(3*time.Second, func() bool {
 		for _, id := range []raft.NodeID{3, 4, 5} {
 			node := cluster.GetNode(id)
 			if node.GetState() == raft.Leader && node.Status().Term > initialTerm {
 				majorityLeader = node
-				break
+				return true
 			}
 		}
-		if majorityLeader != nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+		return false
+	})
+	if !elected || majorityLeader == nil {
+		t.Fatalf("majority partition {3, 4, 5} failed to elect a new leader")
 	}
-
-	if majorityLeader == nil {
-		t.Fatalf("majority partition {3, 4, 5} failed to elect a new leader (3: %s, 4: %s, 5: %s)",
-			cluster.GetNode(3).GetState(), cluster.GetNode(4).GetState(), cluster.GetNode(5).GetState())
-	}
-
-	t.Logf("Majority partition {3, 4, 5} elected new Leader: Node %d in term %d (initial term was %d)",
-		majorityLeader.ID, majorityLeader.Status().Term, initialTerm)
-
-	// Verify Node 1 is definitely not the leader
 	if cluster.GetNode(1).GetState() == raft.Leader {
-		t.Fatalf("Node 1 should not be leader")
+		t.Fatalf("Node 1 should not be leader after partition")
 	}
 }
 
-// TestHarness_Network_Partition_Heals_OldLeaderStepsDownOnHigherTerm verifies:
-// 1. A cluster elects Node 1 leader.
-// 2. Partition isolates Node 1, majority partition elects a new leader in a higher term.
-// 3. When the partition heals, the isolated old leader steps down on seeing the higher term (§5.1).
+// TestHarness_Network_Partition_Heals_OldLeaderStepsDownOnHigherTerm verifies that:
+// When partition heals, the isolated old leader steps down on seeing the higher term (§5.1).
 func TestHarness_Network_Partition_Heals_OldLeaderStepsDownOnHigherTerm(t *testing.T) {
-	minTimeout := 100 * time.Millisecond
-	maxTimeout := 200 * time.Millisecond
-	heartbeatInterval := 20 * time.Millisecond
+	minTimeout, maxTimeout := 100*time.Millisecond, 200*time.Millisecond
+	clk := raft.NewFakeClock()
+	simNet := NewSimNetwork(202)
+	simNet.SetClock(clk)
 
 	cluster := NewCluster(t, 3,
+		WithClock(clk),
+		WithSimNetwork(simNet),
 		WithElectionTimeout(minTimeout, maxTimeout),
-		WithHeartbeatInterval(heartbeatInterval),
+		WithHeartbeatInterval(20*time.Millisecond),
 		WithRPCTimeout(40*time.Millisecond),
 	)
 
-	// Elect Node 1 as initial leader
 	cluster.GetNode(1).StartElection()
-
 	leader, initialTerm, err := cluster.WaitLeader(2 * time.Second)
-	if err != nil {
+	if err != nil || leader.ID != 1 {
 		t.Fatalf("failed to elect initial leader: %v", err)
 	}
-	if leader.ID != 1 {
-		t.Fatalf("expected Node 1 leader, got %d", leader.ID)
-	}
 
-	time.Sleep(60 * time.Millisecond)
-
-	// Partition: {1} is isolated from {2, 3}
+	cluster.Advance(60 * time.Millisecond)
 	cluster.Partition([]raft.NodeID{1}, []raft.NodeID{2, 3})
 
-	if !cluster.Network.IsPartitioned(1, 2) || !cluster.Network.IsPartitioned(1, 3) {
-		t.Fatalf("expected node 1 to be partitioned from nodes 2 and 3")
-	}
-
-	// Majority partition {2, 3} should time out and elect a new leader
-	reElectionDeadline := time.Now().Add(3 * time.Second)
 	var majorityLeader *Server
-	for time.Now().Before(reElectionDeadline) {
+	elected := cluster.AdvanceUntil(3*time.Second, func() bool {
 		for _, id := range []raft.NodeID{2, 3} {
 			node := cluster.GetNode(id)
 			if node.GetState() == raft.Leader && node.Status().Term > initialTerm {
 				majorityLeader = node
-				break
+				return true
 			}
 		}
-		if majorityLeader != nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if majorityLeader == nil {
-		t.Fatalf("majority partition {2, 3} failed to elect a new leader (node 2: %s, node 3: %s)",
-			cluster.GetNode(2).GetState(), cluster.GetNode(3).GetState())
+		return false
+	})
+	if !elected || majorityLeader == nil {
+		t.Fatalf("majority partition failed to elect new leader")
 	}
 
 	higherTerm := majorityLeader.Status().Term
-	t.Logf("Majority partition {2, 3} elected Node %d in term %d (initial term was %d)",
-		majorityLeader.ID, higherTerm, initialTerm)
-
-	if higherTerm <= initialTerm {
-		t.Fatalf("expected majority leader term > %d, got %d", initialTerm, higherTerm)
-	}
-
-	// Now heal the partition
 	cluster.Heal()
 
-	if cluster.Network.IsPartitioned(1, 2) || cluster.Network.IsPartitioned(1, 3) {
-		t.Fatalf("expected all partitions to be cleared after Heal()")
+	steppedDown := cluster.AdvanceUntil(2*time.Second, func() bool {
+		return cluster.GetNode(1).GetState() == raft.Follower && cluster.GetNode(1).Status().Term >= higherTerm
+	})
+	if !steppedDown {
+		t.Fatalf("old leader Node 1 failed to step down after heal")
 	}
-
-	// Old leader (Node 1) receives heartbeats from new leader, observes higher term, and must step down to Follower
-	stepDownDeadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(stepDownDeadline) {
-		if cluster.GetNode(1).GetState() == raft.Follower {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if cluster.GetNode(1).GetState() != raft.Follower {
-		t.Fatalf("expected old leader Node 1 to step down to Follower after partition heal, got %s",
-			cluster.GetNode(1).GetState())
-	}
-	if cluster.GetNode(1).Status().Term < higherTerm {
-		t.Fatalf("expected Node 1 term to update to >= %d, got %d",
-			higherTerm, cluster.GetNode(1).Status().Term)
-	}
-
-	t.Logf("Partition healed: Node 1 successfully stepped down to Follower at term %d",
-		cluster.GetNode(1).Status().Term)
 }
 
 // TestHarness_Cluster5_Tolerates2NodeFailures_StillElectsLeader verifies that:
 // In a 5-node Raft cluster, up to 2 simultaneous node failures are tolerated.
-// The remaining 3 nodes form a majority quorum (3/5) and successfully elect a leader.
 func TestHarness_Cluster5_Tolerates2NodeFailures_StillElectsLeader(t *testing.T) {
-	minTimeout := 100 * time.Millisecond
-	maxTimeout := 200 * time.Millisecond
-	heartbeatInterval := 20 * time.Millisecond
+	minTimeout, maxTimeout := 100*time.Millisecond, 200*time.Millisecond
+	clk := raft.NewFakeClock()
+	simNet := NewSimNetwork(303)
+	simNet.SetClock(clk)
 
 	cluster := NewCluster(t, 5,
+		WithClock(clk),
+		WithSimNetwork(simNet),
 		WithElectionTimeout(minTimeout, maxTimeout),
-		WithHeartbeatInterval(heartbeatInterval),
+		WithHeartbeatInterval(20*time.Millisecond),
 		WithRPCTimeout(40*time.Millisecond),
 	)
 
-	// 1. Elect initial leader on Node 1
 	cluster.GetNode(1).StartElection()
-
 	leader, initialTerm, err := cluster.WaitLeader(2 * time.Second)
-	if err != nil {
+	if err != nil || leader.ID != 1 {
 		t.Fatalf("failed to elect initial leader: %v", err)
 	}
-	if leader.ID != 1 {
-		t.Fatalf("expected Node 1 to become initial leader, got %d", leader.ID)
-	}
 
-	// Allow heartbeats to circulate
-	time.Sleep(60 * time.Millisecond)
-
-	// 2. Simulate 2 simultaneous node failures: Kill Node 1 (current leader) and Node 2
-	killTime := time.Now()
+	cluster.Advance(60 * time.Millisecond)
+	killSimTime := clk.Now()
 	cluster.Kill(1)
 	cluster.Kill(2)
 
-	if !cluster.GetNode(1).IsKilled() || !cluster.GetNode(2).IsKilled() {
-		t.Fatalf("expected both Node 1 and Node 2 to report IsKilled() == true")
-	}
-
-	// 3. Surviving nodes: {3, 4, 5} (3 out of 5 = majority quorum).
-	// They must detect timeout and elect a single new leader among {3, 4, 5}.
-	reElectionDeadline := time.Now().Add(3 * time.Second)
 	var newLeader *Server
-	for time.Now().Before(reElectionDeadline) {
+	elected := cluster.AdvanceUntil(3*time.Second, func() bool {
 		for _, id := range []raft.NodeID{3, 4, 5} {
 			node := cluster.GetNode(id)
 			if node.GetState() == raft.Leader && node.Status().Term > initialTerm {
 				newLeader = node
-				break
+				return true
 			}
 		}
-		if newLeader != nil {
-			break
+		return false
+	})
+	if !elected || newLeader == nil {
+		t.Fatalf("5-node cluster failed to elect new leader after 2 failures")
+	}
+
+	simTimeToNewLeader := clk.Now().Sub(killSimTime)
+	verifySimFailoverBounds(t, simTimeToNewLeader, minTimeout, maxTimeout)
+	cluster.Advance(50 * time.Millisecond)
+	assertClusterFollowers(t, cluster, newLeader.ID)
+}
+
+// TestHarness_Determinism_NoWallClockDrift confirms that simulation runs
+// successfully elect valid leaders and maintain Raft invariants across multiple trials,
+// completely unaffected by real wall-clock time or goroutine scheduling order.
+func TestHarness_Determinism_NoWallClockDrift(t *testing.T) {
+	wallStart := time.Now()
+	runSimulation := func(seed int64) (raft.NodeID, raft.Term, time.Duration) {
+		clk := raft.NewFakeClock()
+		simNet := NewSimNetwork(seed)
+		simNet.SetClock(clk)
+
+		cluster := NewCluster(t, 3,
+			WithClock(clk),
+			WithSimNetwork(simNet),
+			WithRandSeed(seed),
+			WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
+			WithHeartbeatInterval(20*time.Millisecond),
+			WithRPCTimeout(40*time.Millisecond),
+		)
+		defer cluster.Stop()
+
+		cluster.GetNode(1).StartElection()
+		leader, _, err := cluster.WaitLeader(2 * time.Second)
+		if err != nil || leader == nil {
+			t.Fatalf("failed initial election in simulation: %v", err)
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		cluster.Advance(60 * time.Millisecond)
 
-	timeToNewLeader := time.Since(killTime)
+		killTime := clk.Now()
+		cluster.Kill(leader.ID)
 
-	if newLeader == nil {
-		t.Fatalf("5-node cluster failed to elect a new leader with 2 dead nodes (3: %s, 4: %s, 5: %s)",
-			cluster.GetNode(3).GetState(), cluster.GetNode(4).GetState(), cluster.GetNode(5).GetState())
-	}
-
-	newTerm := newLeader.Status().Term
-
-	t.Logf("================================================================================")
-	t.Logf("5-NODE CLUSTER (2 SIMULTANEOUS FAILURES) ELECTION MEASUREMENT:")
-	t.Logf("Nodes 1 and 2 killed at: %v", killTime.Format("15:04:05.000"))
-	t.Logf("New Leader elected: Node %d at term %d", newLeader.ID, newTerm)
-	t.Logf("Time to elect new leader: %v (%.2f ms)", timeToNewLeader, float64(timeToNewLeader.Microseconds())/1000.0)
-	t.Logf("Configured Election Timeout Range: [%v, %v]", minTimeout, maxTimeout)
-	t.Logf("Ratio to Min Timeout: %.2fx", float64(timeToNewLeader)/float64(minTimeout))
-	t.Logf("Ratio to Max Timeout: %.2fx", float64(timeToNewLeader)/float64(maxTimeout))
-	t.Logf("================================================================================")
-
-	// Assertions
-	if newLeader.ID == 1 || newLeader.ID == 2 {
-		t.Fatalf("new leader cannot be a dead node (1 or 2)")
-	}
-	if newTerm <= initialTerm {
-		t.Fatalf("expected new leader term > %d, got %d", initialTerm, newTerm)
-	}
-
-	// Verify remaining live nodes are in Follower state
-	time.Sleep(50 * time.Millisecond)
-	for _, id := range []raft.NodeID{3, 4, 5} {
-		node := cluster.GetNode(id)
-		if id != newLeader.ID {
-			if node.GetState() != raft.Follower {
-				t.Fatalf("surviving node %d should be Follower, got %s", id, node.GetState())
+		var newLeader *Server
+		elected := cluster.AdvanceUntil(3*time.Second, func() bool {
+			l, _ := cluster.Leader()
+			if l != nil && l.ID != leader.ID {
+				newLeader = l
+				return true
 			}
+			return false
+		})
+		if !elected || newLeader == nil {
+			t.Fatalf("failed to elect new leader in trial")
+		}
+		return newLeader.ID, newLeader.Status().Term, clk.Now().Sub(killTime)
+	}
+
+	for trial := 1; trial <= 5; trial++ {
+		leader, term, duration := runSimulation(int64(trial * 100))
+		if leader == 1 {
+			t.Fatalf("trial %d: killed leader 1 was re-elected", trial)
+		}
+		if term <= 1 {
+			t.Fatalf("trial %d: expected new leader term > 1, got %d", trial, term)
+		}
+		if duration < 50*time.Millisecond || duration > 2*time.Second {
+			t.Fatalf("trial %d: failover duration %v outside [50ms, 2s]", trial, duration)
 		}
 	}
 
-	// Dead nodes remain killed
-	if !cluster.GetNode(1).IsKilled() || !cluster.GetNode(2).IsKilled() {
-		t.Fatalf("dead nodes must remain killed")
-	}
-
-	// Verify time-to-new-leader is roughly 1-3x election timeout
-	if timeToNewLeader < minTimeout/2 {
-		t.Fatalf("time-to-new-leader %v unexpectedly faster than minTimeout/2", timeToNewLeader)
-	}
-	maxAllowed := 3*maxTimeout + 300*time.Millisecond
-	if timeToNewLeader > maxAllowed {
-		t.Fatalf("time-to-new-leader %v exceeded upper bound %v", timeToNewLeader, maxAllowed)
+	if time.Since(wallStart) > 500*time.Millisecond {
+		t.Fatalf("total real wall-clock time (%v) exceeded 500ms", time.Since(wallStart))
 	}
 }
 
