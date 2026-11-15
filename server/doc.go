@@ -69,4 +69,3 @@
 //   - HTTP Debug Endpoints: Serves `/status` (JSON cluster state, counters, recent events)
 //     and `/events` (full chronological event history array) via HTTP.
 package server
-

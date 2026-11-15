@@ -21,4 +21,3 @@
 //   - RequestVote: Candidate election campaigning.
 //   - AppendEntries: Leader heartbeats and log replication.
 package rpc
-
