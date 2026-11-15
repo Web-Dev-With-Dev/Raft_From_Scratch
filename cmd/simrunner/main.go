@@ -183,4 +183,3 @@ func main() {
 
 	os.Exit(runBatchCLI(cfg))
 }
-

@@ -16,6 +16,7 @@ This implementation prioritizes correctness, formal protocol invariants, and det
 - [Building and Running](#building-and-running)
 - [Cluster Observability and Monitoring](#cluster-observability-and-monitoring)
 - [Testing and Verification](#testing-and-verification)
+- [Deterministic Simulation & Reproducing Failures](#deterministic-simulation--reproducing-failures)
 - [Protocol Conformance and Roadmap](#protocol-conformance-and-roadmap)
 - [References](#references)
 
@@ -313,6 +314,128 @@ go test -race -count=1 ./...
 ### Goroutine Leak Verification
 
 A dedicated leak test (`TestServer_NoGoroutineLeak` in `server/server_test.go`) initializes and tears down gRPC listeners, HTTP servers, and internal event loops across multiple cycles, asserting via `runtime.NumGoroutine()` that all goroutines terminate cleanly without lingering tasks.
+
+---
+
+## Deterministic Simulation & Reproducing Failures
+
+The cluster includes a fully deterministic discrete-event simulation engine driven by `FakeClock` and `SimNetwork`. All node election timers, randomized timeout jitter, message delays, and network packet drops are derived from a single integer seed.
+
+Because execution is free from real wall-clock timing variations, **any failure discovered during parallel fuzzing can be reproduced with 100% bit-for-bit fidelity**.
+
+### Running Simulation Scenarios (`simrunner` CLI)
+
+Run scenario sweeps across thousands of seeds in parallel using the `simrunner` CLI:
+
+```bash
+# Run 1,000 seeds on the basic election scenario in parallel
+go run ./cmd/simrunner -scenario election -n 1000
+
+# Run a specific seed range with custom worker concurrency
+go run ./cmd/simrunner -scenario crash -from 1 -to 500 -workers 8
+
+# List available scenarios (election, crash, partition)
+go run ./cmd/simrunner -list
+```
+
+#### CLI Flags Reference
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `-scenario` | `election` | Target scenario: `election`, `crash`, `partition` |
+| `-n` | `1000` | Number of seeds to evaluate starting from `-from` |
+| `-from` | `1` | First seed in the test sequence |
+| `-to` | `0` | Optional explicit upper-bound seed (overrides `-n`) |
+| `-workers` | `runtime.NumCPU()` | Number of parallel worker goroutines |
+| `-trace-dir` | `./traces` | Directory where failure traces are saved |
+| `-seed` | `0` | Run a single seed in verbose mode with event logging |
+| `-replay` | `""` | Path to a trace JSON file to replay |
+| `-list` | `false` | Display all registered scenarios |
+
+### Failure Detection and Trace Generation
+
+When an invariant violation or unexpected condition occurs (such as an election safety violation where multiple leaders are elected in the same term, or a failover timeout), the runner:
+
+1. Immediately outputs the failing seed number, scenario name, and error description.
+2. Emits the exact replay command for instant reproduction.
+3. Serializes a comprehensive diagnostic trace to `./traces/<scenario>_seed_<seed>.json`.
+
+Example failure output:
+```text
+[FAIL] Seed: 472 | Error: election safety violated: multiple leaders in term 2 (nodes 1 and 3)
+       Trace:  ./traces/election_seed_472.json
+       Replay: go run ./cmd/simrunner -scenario election -seed 472
+```
+
+#### Trace File Structure
+
+Saved trace files (`./traces/*.json`) contain:
+- Execution metadata (scenario name, seed, duration, status, error).
+- Final node statuses (`ID`, `State`, `Term`, `VotedFor`, `IsKilled`).
+- Complete chronological consensus event history from each node's `EventLog` ring buffer.
+- The exact CLI command to replay the trial.
+
+### Reproducing a Failure
+
+There are three ways to reproduce and diagnose a failing seed:
+
+#### 1. Replay by Seed via CLI (Recommended)
+
+Run `simrunner` with the `-seed` flag. This executes the scenario deterministically for that single seed and prints the full post-mortem consensus event log for every node:
+
+```bash
+go run ./cmd/simrunner -scenario election -seed 472
+```
+
+Sample output:
+```text
+=== Running Scenario "election" (Seed: 472) ===
+[FAIL] Seed 472 failed: election safety violated: multiple leaders in term 2 (nodes 1 and 3)
+
+--- Node 1 [Leader] (Term=2, VotedFor=1, Events=4) ---
+  [18:00:00.120] Term=0 server_started     server node 1 initialized
+  [18:00:00.135] Term=1 election_started   started election for term 1
+  [18:00:00.150] Term=2 election_started   started election for term 2
+  [18:00:00.165] Term=2 state_transition   transitioned to Leader for term 2
+
+--- Node 2 [Follower] (Term=2, VotedFor=1, Events=3) ---
+  [18:00:00.120] Term=0 server_started     server node 2 initialized
+  [18:00:00.155] Term=2 vote_granted       granted vote to candidate 1 for term 2
+
+--- Node 3 [Leader] (Term=2, VotedFor=3, Events=4) ---
+  [18:00:00.120] Term=0 server_started     server node 3 initialized
+  [18:00:00.150] Term=2 election_started   started election for term 2
+  [18:00:00.165] Term=2 state_transition   transitioned to Leader for term 2
+```
+
+#### 2. Replay from a Trace File
+
+If a failure was captured during automated CI runs, download the trace JSON and replay it directly:
+
+```bash
+go run ./cmd/simrunner -replay ./traces/election_seed_472.json
+```
+
+#### 3. Reproduce in a Go Unit Test
+
+You can write or invoke a targeted Go test with the specific seed in `server/scenario_test.go`:
+
+```go
+func TestReproduce_Seed472(t *testing.T) {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    trace, err := server.RunScenario(ctx, "election", 472, "./traces")
+    if err != nil {
+        t.Fatalf("seed 472 failed as expected: %v (trace saved to %s)", err, trace.ReplayCmd)
+    }
+}
+```
+
+Run with standard Go testing tools and debugger support:
+```bash
+go test -v -run TestReproduce_Seed472 ./server
+```
 
 ---
 
