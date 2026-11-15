@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"runtime"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"raft/logger"
 	raftpb "raft/proto"
 	"raft/raft"
 	"raft/store"
@@ -404,10 +406,18 @@ type clusterOptions struct {
 	clock               raft.Clock
 	simNetwork          *SimNetwork
 	randSeed            int64
+	quiet               bool
 }
 
 // ClusterOption configures test cluster parameters.
 type ClusterOption func(*clusterOptions)
+
+// WithQuiet silences node terminal logging while preserving in-memory EventLog.
+func WithQuiet(quiet bool) ClusterOption {
+	return func(o *clusterOptions) {
+		o.quiet = quiet
+	}
+}
 
 // WithRandSeed configures a deterministic pseudo-random seed for election timeouts across nodes.
 func WithRandSeed(seed int64) ClusterOption {
@@ -487,6 +497,9 @@ func buildPeerList(nodeIDs []raft.NodeID, selfID raft.NodeID) []Peer {
 }
 
 func configureServerOptions(srv *Server, options clusterOptions) {
+	if options.quiet {
+		srv.SetLogger(logger.NewNodeLogger(srv.ID, io.Discard, nil))
+	}
 	if options.clock != nil {
 		srv.SetClock(options.clock)
 	}
