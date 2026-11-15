@@ -10,6 +10,7 @@ import (
 
 	raftpb "raft/proto"
 	"raft/raft"
+	"raft/store"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -626,6 +627,145 @@ func (c *Cluster) Kill(id raft.NodeID) {
 	}
 }
 
+// Restart restarts a previously killed node process, restoring its persistent state from storage.
+func (c *Cluster) Restart(id raft.NodeID) *Server {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	oldSrv := c.servers[id]
+	if oldSrv != nil && !oldSrv.IsKilled() {
+		oldSrv.Kill()
+	}
+
+	var loadedState *raft.PersistentState
+	var memStorage store.Storage
+	if oldSrv != nil {
+		memStorage = oldSrv.Storage
+		if memStorage != nil {
+			var err error
+			loadedState, err = memStorage.Load()
+			if err != nil && c.t != nil {
+				c.t.Logf("warning: failed to load storage for node %d: %v", id, err)
+			}
+		}
+		if loadedState == nil && oldSrv.PersistentState != nil {
+			loadedState = &raft.PersistentState{
+				CurrentTerm: oldSrv.PersistentState.CurrentTerm,
+				VotedFor:    oldSrv.PersistentState.VotedFor,
+				Log:         append([]raft.LogEntry(nil), oldSrv.PersistentState.Log...),
+			}
+		}
+	}
+	if loadedState == nil {
+		loadedState = &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}
+	}
+	if memStorage == nil {
+		memStorage = store.NewMemoryStorage()
+		_ = memStorage.Persist(loadedState)
+	}
+
+	var peers []Peer
+	if oldSrv != nil {
+		peers = oldSrv.Peers
+	} else {
+		peers = make([]Peer, 0, len(c.nodeIDs)-1)
+		for _, peerID := range c.nodeIDs {
+			if peerID != id {
+				peers = append(peers, Peer{
+					ID:      peerID,
+					Address: fmt.Sprintf("in-memory://node-%d", peerID),
+				})
+			}
+		}
+	}
+
+	newSrv := NewServer(id, peers, loadedState, nil)
+	newSrv.Storage = memStorage
+	newSrv.SetHeartbeatInterval(c.options.heartbeatInterval)
+	newSrv.SetRPCTimeout(c.options.rpcTimeout)
+	if newSrv.GetElectionTimer() != nil {
+		newSrv.GetElectionTimer().SetRange(c.options.minTimeout, c.options.maxTimeout)
+		newSrv.ResetElectionTimeout()
+	}
+	if c.options.checkQuorum {
+		newSrv.SetCheckQuorum(true)
+		if c.options.checkQuorumInterval > 0 {
+			newSrv.SetCheckQuorumInterval(c.options.checkQuorumInterval)
+		}
+	}
+
+	for _, peer := range peers {
+		client := &inMemoryPeerClient{
+			net:   c.Network,
+			srcID: id,
+			dstID: peer.ID,
+		}
+		newSrv.ClientPool().Register(peer.ID, client)
+	}
+
+	c.servers[id] = newSrv
+	c.Network.RegisterNode(id, newSrv)
+
+	newSrv.StartEventLoop()
+	return newSrv
+}
+
+// LiveNodes returns a slice of all currently running (non-killed) nodes in the cluster.
+func (c *Cluster) LiveNodes() []*Server {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var live []*Server
+	for _, id := range c.nodeIDs {
+		srv := c.servers[id]
+		if srv != nil && !srv.IsKilled() {
+			live = append(live, srv)
+		}
+	}
+	return live
+}
+
+// KilledNodeIDs returns a slice of all currently killed node IDs in the cluster.
+func (c *Cluster) KilledNodeIDs() []raft.NodeID {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var killed []raft.NodeID
+	for _, id := range c.nodeIDs {
+		srv := c.servers[id]
+		if srv == nil || srv.IsKilled() {
+			killed = append(killed, id)
+		}
+	}
+	return killed
+}
+
+// LeaderInfo describes a currently elected leader node and its term.
+type LeaderInfo struct {
+	NodeID raft.NodeID
+	Term   raft.Term
+}
+
+// Leaders returns a slice of all live nodes currently claiming leadership along with their terms.
+func (c *Cluster) Leaders() []LeaderInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var leaders []LeaderInfo
+	for _, id := range c.nodeIDs {
+		srv := c.servers[id]
+		if srv != nil && !srv.IsKilled() {
+			if term, isLeader := srv.LeaderTerm(); isLeader {
+				leaders = append(leaders, LeaderInfo{
+					NodeID: id,
+					Term:   term,
+				})
+			}
+		}
+	}
+	return leaders
+}
+
 // Pause pauses the node's event loop (simulating SIGSTOP / freeze).
 func (c *Cluster) Pause(id raft.NodeID) {
 	node := c.GetNode(id)
@@ -648,16 +788,20 @@ func (c *Cluster) Leader() (*Server, raft.Term) {
 	defer c.mu.RUnlock()
 
 	var leader *Server
+	var leaderTerm raft.Term
 	for _, srv := range c.servers {
-		if !srv.IsKilled() && srv.GetState() == raft.Leader {
-			if leader != nil {
-				return nil, 0 // split-brain or transient multiple leaders
+		if !srv.IsKilled() {
+			if term, isLeader := srv.LeaderTerm(); isLeader {
+				if leader != nil {
+					return nil, 0 // split-brain or transient multiple leaders
+				}
+				leader = srv
+				leaderTerm = term
 			}
-			leader = srv
 		}
 	}
 	if leader != nil {
-		return leader, leader.Status().Term
+		return leader, leaderTerm
 	}
 	return nil, 0
 }

@@ -285,6 +285,17 @@ func (s *Server) GetState() raft.RaftState {
 	return s.State
 }
 
+// LeaderTerm returns (term, true) if the node is currently in Leader state,
+// captured atomically under a single s.mu.RLock(). Returns (0, false) otherwise.
+func (s *Server) LeaderTerm() (raft.Term, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.State == raft.Leader && s.PersistentState != nil {
+		return s.PersistentState.CurrentTerm, true
+	}
+	return 0, false
+}
+
 // VotesReceived returns a copy of the candidate's recorded votes.
 func (s *Server) VotesReceived() map[raft.NodeID]bool {
 	s.mu.RLock()
