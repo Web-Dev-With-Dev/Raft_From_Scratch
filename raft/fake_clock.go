@@ -336,4 +336,3 @@ func drainTickerChan(ch chan time.Time) {
 		}
 	}
 }
-

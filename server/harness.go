@@ -382,12 +382,13 @@ func (c *inMemoryPeerClient) AppendEntries(ctx context.Context, in *raftpb.Appen
 
 // Cluster manages a group of N in-process Raft nodes interconnected by an in-memory Network.
 type Cluster struct {
-	t       testing.TB
-	Network *Network
-	servers map[raft.NodeID]*Server
-	nodeIDs []raft.NodeID
-	options clusterOptions
-	mu      sync.RWMutex
+	t          testing.TB
+	Network    *Network
+	SimNetwork *SimNetwork
+	servers    map[raft.NodeID]*Server
+	nodeIDs    []raft.NodeID
+	options    clusterOptions
+	mu         sync.RWMutex
 }
 
 type clusterOptions struct {
@@ -399,10 +400,18 @@ type clusterOptions struct {
 	checkQuorumInterval time.Duration
 	autoStart           bool
 	clock               raft.Clock
+	simNetwork          *SimNetwork
 }
 
 // ClusterOption configures test cluster parameters.
 type ClusterOption func(*clusterOptions)
+
+// WithSimNetwork configures a SimNetwork instance as the cluster transport.
+func WithSimNetwork(simNet *SimNetwork) ClusterOption {
+	return func(o *clusterOptions) {
+		o.simNetwork = simNet
+	}
+}
 
 // WithClock sets a custom Clock interface for cluster nodes.
 func WithClock(clk raft.Clock) ClusterOption {
@@ -544,15 +553,26 @@ func resolveClusterOptions(opts ...ClusterOption) clusterOptions {
 	return options
 }
 
-func initClusterNodes(net *Network, nodeIDs []raft.NodeID, options clusterOptions) map[raft.NodeID]*Server {
+func registerSimPeerClients(simNet *SimNetwork, srv *Server, srcID raft.NodeID, peers []Peer) {
+	for _, peer := range peers {
+		srv.ClientPool().Register(peer.ID, simNet.Client(srcID, peer.ID))
+	}
+}
+
+func initClusterNodes(net *Network, simNet *SimNetwork, nodeIDs []raft.NodeID, options clusterOptions) map[raft.NodeID]*Server {
 	servers := make(map[raft.NodeID]*Server, len(nodeIDs))
 	for _, id := range nodeIDs {
 		peers := buildPeerList(nodeIDs, id)
 		srv := NewServer(id, peers, &raft.PersistentState{CurrentTerm: 0, VotedFor: -1}, nil)
 		configureServerOptions(srv, options)
 		servers[id] = srv
-		net.RegisterNode(id, srv)
-		registerPeerClients(net, srv, id, peers)
+		if simNet != nil {
+			simNet.RegisterNode(id, srv)
+			registerSimPeerClients(simNet, srv, id, peers)
+		} else {
+			net.RegisterNode(id, srv)
+			registerPeerClients(net, srv, id, peers)
+		}
 	}
 	return servers
 }
@@ -565,14 +585,15 @@ func NewCluster(t testing.TB, n int, opts ...ClusterOption) *Cluster {
 	for i := 1; i <= n; i++ {
 		nodeIDs[i-1] = raft.NodeID(i)
 	}
-	servers := initClusterNodes(net, nodeIDs, options)
+	servers := initClusterNodes(net, options.simNetwork, nodeIDs, options)
 
 	c := &Cluster{
-		t:       t,
-		Network: net,
-		servers: servers,
-		nodeIDs: nodeIDs,
-		options: options,
+		t:          t,
+		Network:    net,
+		SimNetwork: options.simNetwork,
+		servers:    servers,
+		nodeIDs:    nodeIDs,
+		options:    options,
 	}
 
 	if t != nil {
@@ -663,10 +684,15 @@ func (c *Cluster) Restart(id raft.NodeID) *Server {
 	newSrv := NewServer(id, peers, loadedState, nil)
 	newSrv.Storage = memStorage
 	configureServerOptions(newSrv, c.options)
-	registerPeerClients(c.Network, newSrv, id, peers)
+	if c.SimNetwork != nil {
+		c.SimNetwork.RegisterNode(id, newSrv)
+		registerSimPeerClients(c.SimNetwork, newSrv, id, peers)
+	} else {
+		c.Network.RegisterNode(id, newSrv)
+		registerPeerClients(c.Network, newSrv, id, peers)
+	}
 
 	c.servers[id] = newSrv
-	c.Network.RegisterNode(id, newSrv)
 
 	newSrv.StartEventLoop()
 	return newSrv
