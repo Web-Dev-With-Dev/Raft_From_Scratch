@@ -201,6 +201,50 @@ func FromProtoAppendEntriesReply(pb *raftpb.AppendEntriesReply) *AppendEntriesRe
 	}
 }
 
+// ToProtoTimeoutNowArgs converts a domain TimeoutNowArgs to a protobuf TimeoutNowArgs.
+func ToProtoTimeoutNowArgs(args *TimeoutNowArgs) *raftpb.TimeoutNowArgs {
+	if args == nil {
+		return nil
+	}
+	return &raftpb.TimeoutNowArgs{
+		Term:     uint64(args.Term),
+		LeaderId: int64(args.LeaderID),
+	}
+}
+
+// FromProtoTimeoutNowArgs converts a protobuf TimeoutNowArgs to a domain TimeoutNowArgs.
+func FromProtoTimeoutNowArgs(pb *raftpb.TimeoutNowArgs) *TimeoutNowArgs {
+	if pb == nil {
+		return nil
+	}
+	return &TimeoutNowArgs{
+		Term:     raft.Term(pb.Term),
+		LeaderID: raft.NodeID(pb.LeaderId),
+	}
+}
+
+// ToProtoTimeoutNowReply converts a domain TimeoutNowReply to a protobuf TimeoutNowReply.
+func ToProtoTimeoutNowReply(reply *TimeoutNowReply) *raftpb.TimeoutNowReply {
+	if reply == nil {
+		return nil
+	}
+	return &raftpb.TimeoutNowReply{
+		Term:    uint64(reply.Term),
+		Success: reply.Success,
+	}
+}
+
+// FromProtoTimeoutNowReply converts a protobuf TimeoutNowReply to a domain TimeoutNowReply.
+func FromProtoTimeoutNowReply(pb *raftpb.TimeoutNowReply) *TimeoutNowReply {
+	if pb == nil {
+		return nil
+	}
+	return &TimeoutNowReply{
+		Term:    raft.Term(pb.Term),
+		Success: pb.Success,
+	}
+}
+
 // SendRequestVote sends a RequestVote RPC to the specified client stub with domain arguments.
 // If ctx does not have a deadline, DefaultRPCTimeout (150ms) is automatically enforced.
 func SendRequestVote(ctx context.Context, client raftpb.RaftServiceClient, args *RequestVoteArgs) (*RequestVoteReply, error) {
@@ -247,6 +291,28 @@ func SendAppendEntries(ctx context.Context, client raftpb.RaftServiceClient, arg
 	}
 
 	return FromProtoAppendEntriesReply(pbReply), nil
+}
+
+// SendTimeoutNow sends a TimeoutNow RPC to the specified client stub with domain arguments.
+// If ctx does not have a deadline, DefaultRPCTimeout (150ms) is automatically enforced.
+func SendTimeoutNow(ctx context.Context, client raftpb.RaftServiceClient, args *TimeoutNowArgs) (*TimeoutNowReply, error) {
+	if client == nil {
+		return nil, fmt.Errorf("client is nil")
+	}
+	if args == nil {
+		return nil, fmt.Errorf("args is nil")
+	}
+
+	callCtx, cancel := withRPCTimeout(ctx, DefaultRPCTimeout)
+	defer cancel()
+
+	pbArgs := ToProtoTimeoutNowArgs(args)
+	pbReply, err := client.TimeoutNow(callCtx, pbArgs)
+	if err != nil {
+		return nil, err
+	}
+
+	return FromProtoTimeoutNowReply(pbReply), nil
 }
 
 // SendRequestVote sends a RequestVote RPC to the specified peer using the client pool.
@@ -311,4 +377,36 @@ func (p *ClientPool) sendAppendEntries(peer Peer, args *AppendEntriesArgs) (*App
 	ctx, cancel := context.WithTimeout(context.Background(), p.RPCTimeout())
 	defer cancel()
 	return p.SendAppendEntries(ctx, peer, args)
+}
+
+// SendTimeoutNow sends a TimeoutNow RPC to the specified peer using the client pool.
+// If ctx has no deadline, the pool's RPCTimeout is automatically enforced.
+func (p *ClientPool) SendTimeoutNow(ctx context.Context, peer Peer, args *TimeoutNowArgs) (*TimeoutNowReply, error) {
+	if p == nil {
+		return nil, fmt.Errorf("client pool is nil")
+	}
+
+	callCtx, cancel := withRPCTimeout(ctx, p.RPCTimeout())
+	defer cancel()
+
+	client, exists := p.Get(peer.ID)
+	if !exists {
+		if peer.Address == "" {
+			return nil, fmt.Errorf("peer %d not connected and no address provided", peer.ID)
+		}
+		var err error
+		client, err = p.Connect(peer.ID, peer.Address)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to peer %d at %s: %w", peer.ID, peer.Address, err)
+		}
+	}
+
+	return SendTimeoutNow(callCtx, client, args)
+}
+
+// sendTimeoutNow is a convenience stub matching the Raft paper convention, using the pool's RPCTimeout.
+func (p *ClientPool) sendTimeoutNow(peer Peer, args *TimeoutNowArgs) (*TimeoutNowReply, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), p.RPCTimeout())
+	defer cancel()
+	return p.SendTimeoutNow(ctx, peer, args)
 }

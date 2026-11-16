@@ -28,6 +28,7 @@ type RPCMessageType string
 const (
 	RPCRequestVote   RPCMessageType = "RequestVote"
 	RPCAppendEntries RPCMessageType = "AppendEntries"
+	RPCTimeoutNow    RPCMessageType = "TimeoutNow"
 )
 
 // MessageFilter is a hook function that can inspect, modify, or drop messages.
@@ -371,6 +372,26 @@ func (n *Network) sendAppendEntries(ctx context.Context, src, dst raft.NodeID, r
 	return proto.Clone(reply).(*raftpb.AppendEntriesReply), nil
 }
 
+// sendTimeoutNow routes a TimeoutNow RPC from src to dst in-memory.
+func (n *Network) sendTimeoutNow(ctx context.Context, src, dst raft.NodeID, req *raftpb.TimeoutNowArgs) (*raftpb.TimeoutNowReply, error) {
+	targetNode, err := n.prepareOutboundRPC(ctx, src, dst, RPCTimeoutNow, req)
+	if err != nil {
+		return nil, err
+	}
+
+	clonedReq := proto.Clone(req).(*raftpb.TimeoutNowArgs)
+	reply, err := targetNode.TimeoutNow(ctx, clonedReq)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := n.prepareInboundReply(ctx, dst, src); err != nil {
+		return nil, err
+	}
+
+	return proto.Clone(reply).(*raftpb.TimeoutNowReply), nil
+}
+
 // inMemoryPeerClient implements raftpb.RaftServiceClient routing calls through the Network.
 type inMemoryPeerClient struct {
 	net   *Network
@@ -384,6 +405,10 @@ func (c *inMemoryPeerClient) RequestVote(ctx context.Context, in *raftpb.Request
 
 func (c *inMemoryPeerClient) AppendEntries(ctx context.Context, in *raftpb.AppendEntriesArgs, opts ...grpc.CallOption) (*raftpb.AppendEntriesReply, error) {
 	return c.net.sendAppendEntries(ctx, c.srcID, c.dstID, in)
+}
+
+func (c *inMemoryPeerClient) TimeoutNow(ctx context.Context, in *raftpb.TimeoutNowArgs, opts ...grpc.CallOption) (*raftpb.TimeoutNowReply, error) {
+	return c.net.sendTimeoutNow(ctx, c.srcID, c.dstID, in)
 }
 
 // Cluster manages a group of N in-process Raft nodes interconnected by an in-memory Network.
@@ -941,6 +966,15 @@ func (c *Cluster) Leader() (*Server, raft.Term) {
 		return leader, leaderTerm
 	}
 	return nil, 0
+}
+
+// Transfer initiates leadership transfer to the target node from the current leader.
+func (c *Cluster) Transfer(target raft.NodeID) error {
+	leader, _ := c.Leader()
+	if leader == nil {
+		return fmt.Errorf("no unique leader found in cluster")
+	}
+	return leader.Transfer(target)
 }
 
 // FakeClock returns the cluster's FakeClock if one was configured, or nil.

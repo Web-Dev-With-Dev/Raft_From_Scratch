@@ -491,6 +491,9 @@ func (n *SimNetwork) dispatchRPCDuplicate(target *Server, req proto.Message) {
 	case *raftpb.AppendEntriesArgs:
 		cloned := proto.Clone(r).(*raftpb.AppendEntriesArgs)
 		go func() { _, _ = target.AppendEntries(context.Background(), cloned) }()
+	case *raftpb.TimeoutNowArgs:
+		cloned := proto.Clone(r).(*raftpb.TimeoutNowArgs)
+		go func() { _, _ = target.TimeoutNow(context.Background(), cloned) }()
 	}
 }
 
@@ -538,6 +541,27 @@ func (n *SimNetwork) SendAppendEntries(ctx context.Context, src, dst raft.NodeID
 	return proto.Clone(reply).(*raftpb.AppendEntriesReply), nil
 }
 
+// SendTimeoutNow routes a TimeoutNow RPC through the simulated lossy network.
+func (n *SimNetwork) SendTimeoutNow(ctx context.Context, src, dst raft.NodeID, req *raftpb.TimeoutNowArgs) (*raftpb.TimeoutNowReply, error) {
+	targetNode, err := n.prepareOutbound(ctx, src, dst, req)
+	if err != nil {
+		return nil, err
+	}
+
+	clonedReq := proto.Clone(req).(*raftpb.TimeoutNowArgs)
+	reply, err := targetNode.TimeoutNow(ctx, clonedReq)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := n.prepareInbound(ctx, dst, src); err != nil {
+		return nil, err
+	}
+
+	n.totalDelivered.Add(1)
+	return proto.Clone(reply).(*raftpb.TimeoutNowReply), nil
+}
+
 // Client returns a gRPC client stub for RPCs between src and dst.
 func (n *SimNetwork) Client(src, dst raft.NodeID) raftpb.RaftServiceClient {
 	return &simPeerClient{net: n, srcID: src, dstID: dst}
@@ -555,6 +579,10 @@ func (c *simPeerClient) RequestVote(ctx context.Context, in *raftpb.RequestVoteA
 
 func (c *simPeerClient) AppendEntries(ctx context.Context, in *raftpb.AppendEntriesArgs, opts ...grpc.CallOption) (*raftpb.AppendEntriesReply, error) {
 	return c.net.SendAppendEntries(ctx, c.srcID, c.dstID, in)
+}
+
+func (c *simPeerClient) TimeoutNow(ctx context.Context, in *raftpb.TimeoutNowArgs, opts ...grpc.CallOption) (*raftpb.TimeoutNowReply, error) {
+	return c.net.SendTimeoutNow(ctx, c.srcID, c.dstID, in)
 }
 
 // TotalSent returns total number of messages sent into SimNetwork.

@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	RaftService_RequestVote_FullMethodName   = "/raft.RaftService/RequestVote"
 	RaftService_AppendEntries_FullMethodName = "/raft.RaftService/AppendEntries"
+	RaftService_TimeoutNow_FullMethodName    = "/raft.RaftService/TimeoutNow"
 )
 
 // RaftServiceClient is the client API for RaftService service.
@@ -33,6 +34,8 @@ type RaftServiceClient interface {
 	RequestVote(ctx context.Context, in *RequestVoteArgs, opts ...grpc.CallOption) (*RequestVoteReply, error)
 	// AppendEntries is invoked by the leader to replicate log entries and send heartbeats.
 	AppendEntries(ctx context.Context, in *AppendEntriesArgs, opts ...grpc.CallOption) (*AppendEntriesReply, error)
+	// TimeoutNow is invoked by the leader to force a follower to start an election immediately for leadership transfer.
+	TimeoutNow(ctx context.Context, in *TimeoutNowArgs, opts ...grpc.CallOption) (*TimeoutNowReply, error)
 }
 
 type raftServiceClient struct {
@@ -63,6 +66,16 @@ func (c *raftServiceClient) AppendEntries(ctx context.Context, in *AppendEntries
 	return out, nil
 }
 
+func (c *raftServiceClient) TimeoutNow(ctx context.Context, in *TimeoutNowArgs, opts ...grpc.CallOption) (*TimeoutNowReply, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TimeoutNowReply)
+	err := c.cc.Invoke(ctx, RaftService_TimeoutNow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RaftServiceServer is the server API for RaftService service.
 // All implementations must embed UnimplementedRaftServiceServer
 // for forward compatibility.
@@ -73,6 +86,8 @@ type RaftServiceServer interface {
 	RequestVote(context.Context, *RequestVoteArgs) (*RequestVoteReply, error)
 	// AppendEntries is invoked by the leader to replicate log entries and send heartbeats.
 	AppendEntries(context.Context, *AppendEntriesArgs) (*AppendEntriesReply, error)
+	// TimeoutNow is invoked by the leader to force a follower to start an election immediately for leadership transfer.
+	TimeoutNow(context.Context, *TimeoutNowArgs) (*TimeoutNowReply, error)
 	mustEmbedUnimplementedRaftServiceServer()
 }
 
@@ -88,6 +103,9 @@ func (UnimplementedRaftServiceServer) RequestVote(context.Context, *RequestVoteA
 }
 func (UnimplementedRaftServiceServer) AppendEntries(context.Context, *AppendEntriesArgs) (*AppendEntriesReply, error) {
 	return nil, status.Error(codes.Unimplemented, "method AppendEntries not implemented")
+}
+func (UnimplementedRaftServiceServer) TimeoutNow(context.Context, *TimeoutNowArgs) (*TimeoutNowReply, error) {
+	return nil, status.Error(codes.Unimplemented, "method TimeoutNow not implemented")
 }
 func (UnimplementedRaftServiceServer) mustEmbedUnimplementedRaftServiceServer() {}
 func (UnimplementedRaftServiceServer) testEmbeddedByValue()                     {}
@@ -146,6 +164,24 @@ func _RaftService_AppendEntries_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftService_TimeoutNow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TimeoutNowArgs)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServiceServer).TimeoutNow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftService_TimeoutNow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServiceServer).TimeoutNow(ctx, req.(*TimeoutNowArgs))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RaftService_ServiceDesc is the grpc.ServiceDesc for RaftService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -160,6 +196,10 @@ var RaftService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AppendEntries",
 			Handler:    _RaftService_AppendEntries_Handler,
+		},
+		{
+			MethodName: "TimeoutNow",
+			Handler:    _RaftService_TimeoutNow_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

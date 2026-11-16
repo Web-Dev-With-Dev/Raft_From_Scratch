@@ -37,6 +37,8 @@ type RequestVoteArgs = raft.RequestVoteArgs
 type RequestVoteReply = raft.RequestVoteReply
 type AppendEntriesArgs = raft.AppendEntriesArgs
 type AppendEntriesReply = raft.AppendEntriesReply
+type TimeoutNowArgs = raft.TimeoutNowArgs
+type TimeoutNowReply = raft.TimeoutNowReply
 
 type ClientRequest struct {
 	Op    string `json:"op"`

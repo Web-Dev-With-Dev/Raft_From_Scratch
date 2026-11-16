@@ -118,6 +118,16 @@ type AppendEntriesReply struct {
 	ConflictTerm  Term     `json:"conflict_term"`
 }
 
+type TimeoutNowArgs struct {
+	Term     Term   `json:"term"`
+	LeaderID NodeID `json:"leader_id"`
+}
+
+type TimeoutNowReply struct {
+	Term    Term `json:"term"`
+	Success bool `json:"success"`
+}
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      any

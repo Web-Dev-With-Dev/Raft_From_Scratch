@@ -80,6 +80,12 @@ type AppendEntriesEvent struct {
 	ResCh chan<- *raftpb.AppendEntriesReply
 }
 
+// TimeoutNowEvent packages an incoming TimeoutNow RPC with a response channel.
+type TimeoutNowEvent struct {
+	Args  *raftpb.TimeoutNowArgs
+	ResCh chan<- *raftpb.TimeoutNowReply
+}
+
 // RequestVoteResult represents the outcome of an asynchronous RequestVote RPC sent to a peer.
 type RequestVoteResult struct {
 	PeerID       raft.NodeID
@@ -165,6 +171,7 @@ type Server struct {
 	stopOnce          sync.Once
 	requestVoteCh     chan RequestVoteEvent
 	appendEntriesCh   chan AppendEntriesEvent
+	timeoutNowCh      chan TimeoutNowEvent
 	voteResultCh      chan RequestVoteResult
 	heartbeatResultCh chan HeartbeatResult
 	stateActionCh     chan stateAction
@@ -246,6 +253,7 @@ func NewServer(
 	stopCh := make(chan struct{})
 	requestVoteCh := make(chan RequestVoteEvent, 64)
 	appendEntriesCh := make(chan AppendEntriesEvent, 64)
+	timeoutNowCh := make(chan TimeoutNowEvent, 64)
 	voteResultCh := make(chan RequestVoteResult, 64)
 	heartbeatResultCh := make(chan HeartbeatResult, 64)
 	stateActionCh := make(chan stateAction, 64)
@@ -283,6 +291,7 @@ func NewServer(
 		stopCh:            stopCh,
 		requestVoteCh:     requestVoteCh,
 		appendEntriesCh:   appendEntriesCh,
+		timeoutNowCh:      timeoutNowCh,
 		voteResultCh:      voteResultCh,
 		heartbeatResultCh: heartbeatResultCh,
 		stateActionCh:     stateActionCh,
@@ -977,17 +986,20 @@ func (s *Server) PeerIDs() []raft.NodeID {
 	return ids
 }
 
-// GetPeer retrieves peer information for a specific node ID.
-func (s *Server) GetPeer(id raft.NodeID) (Peer, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *Server) getPeerLocked(id raft.NodeID) (Peer, bool) {
 	for _, p := range s.Peers {
 		if p.ID == id {
 			return p, true
 		}
 	}
 	return Peer{}, false
+}
+
+// GetPeer retrieves peer information for a specific node ID.
+func (s *Server) GetPeer(id raft.NodeID) (Peer, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getPeerLocked(id)
 }
 
 // AddPeer appends a new peer to the peer list if it does not already exist.
@@ -1520,6 +1532,34 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesArg
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.processAppendEntries(req), nil
+}
+
+// TimeoutNow handles an incoming TimeoutNow RPC from the current leader (§3.10).
+// It instructs the server to start an election immediately, bypassing leader stickiness.
+func (s *Server) TimeoutNow(ctx context.Context, req *raftpb.TimeoutNowArgs) (*raftpb.TimeoutNowReply, error) {
+	if s.loopRunning.Load() {
+		resCh := make(chan *raftpb.TimeoutNowReply, 1)
+		select {
+		case s.timeoutNowCh <- TimeoutNowEvent{Args: req, ResCh: resCh}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.stopCh:
+			return nil, fmt.Errorf("server %d stopped", s.ID)
+		}
+
+		select {
+		case reply := <-resCh:
+			return reply, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.stopCh:
+			return nil, fmt.Errorf("server %d stopped", s.ID)
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.processTimeoutNow(req), nil
 }
 
 // LastLogInfo returns the (index, term) of the receiver's last log entry.
@@ -2491,15 +2531,58 @@ func (s *Server) startElectionInTermLocked(term raft.Term) {
 	s.broadcastRequestVotesLocked()
 }
 
+// processTimeoutNow handles a TimeoutNow RPC for leadership transfer (§3.10).
+// The target follower starts an election immediately, bypassing leader stickiness.
+func (s *Server) processTimeoutNow(req *raftpb.TimeoutNowArgs) *raftpb.TimeoutNowReply {
+	s.GetLogger().Info("received TimeoutNow RPC",
+		"leader_id", req.LeaderId,
+		"term", req.Term,
+	)
+
+	var currentTerm uint64
+	if s.PersistentState != nil {
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	if req.Term < currentTerm {
+		s.GetLogger().Warn("rejected TimeoutNow from stale leader",
+			"leader_id", req.LeaderId,
+			"req_term", req.Term,
+			"current_term", currentTerm,
+		)
+		return &raftpb.TimeoutNowReply{Term: currentTerm, Success: false}
+	}
+
+	if req.Term > currentTerm {
+		s.becomeFollowerLocked(raft.Term(req.Term))
+	}
+
+	// Target starts an election immediately, bypassing stickiness (§3.10)
+	s.startElectionWithTransferLocked(true)
+
+	var newTerm uint64
+	if s.PersistentState != nil {
+		newTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+	return &raftpb.TimeoutNowReply{
+		Term:    newTerm,
+		Success: true,
+	}
+}
+
 // startElectionLocked begins an election cycle:
 // 1. Transitions to Candidate, increments term, votes for self, persists state, resets timer (§5.2)
 // 2. Sends RequestVote RPCs in parallel to all peers using goroutines + results channel
 func (s *Server) startElectionLocked() {
-	s.becomeCandidateLocked()
-	s.broadcastRequestVotesLocked()
+	s.startElectionWithTransferLocked(false)
 }
 
-func (s *Server) sendVoteRequestToPeer(peer Peer, term raft.Term, lastLogIndex raft.LogIndex, lastLogTerm raft.Term, timeout time.Duration) {
+func (s *Server) startElectionWithTransferLocked(isTransfer bool) {
+	s.becomeCandidateLocked()
+	s.broadcastRequestVotesWithTransferLocked(isTransfer)
+}
+
+func (s *Server) sendVoteRequestToPeer(peer Peer, term raft.Term, lastLogIndex raft.LogIndex, lastLogTerm raft.Term, timeout time.Duration, isTransfer bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -2514,10 +2597,11 @@ func (s *Server) sendVoteRequestToPeer(peer Peer, term raft.Term, lastLogIndex r
 	defer close(stopDone)
 
 	reply, err := s.SendRequestVote(ctx, peer, &raft.RequestVoteArgs{
-		Term:         term,
-		CandidateID:  s.ID,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  lastLogTerm,
+		Term:               term,
+		CandidateID:        s.ID,
+		LastLogIndex:       lastLogIndex,
+		LastLogTerm:        lastLogTerm,
+		LeadershipTransfer: isTransfer,
 	})
 
 	select {
@@ -2534,6 +2618,10 @@ func (s *Server) sendVoteRequestToPeer(peer Peer, term raft.Term, lastLogIndex r
 // broadcastRequestVotesLocked sends RequestVote RPCs in parallel to all peers using goroutines,
 // streaming results back onto s.voteResultCh.
 func (s *Server) broadcastRequestVotesLocked() {
+	s.broadcastRequestVotesWithTransferLocked(false)
+}
+
+func (s *Server) broadcastRequestVotesWithTransferLocked(isTransfer bool) {
 	if s.State != raft.Candidate || len(s.Peers) == 0 {
 		return
 	}
@@ -2548,11 +2636,12 @@ func (s *Server) broadcastRequestVotesLocked() {
 		"term", uint64(term),
 		"peers_count", len(s.Peers),
 		"timeout_ms", timeout.Milliseconds(),
+		"leadership_transfer", isTransfer,
 	)
 
 	for _, peer := range s.Peers {
 		if peer.ID != id {
-			go s.sendVoteRequestToPeer(peer, term, lastLogIndex, lastLogTerm, timeout)
+			go s.sendVoteRequestToPeer(peer, term, lastLogIndex, lastLogTerm, timeout, isTransfer)
 		}
 	}
 }
@@ -2960,6 +3049,20 @@ func (s *Server) handleAppendEntriesEvent(ev AppendEntriesEvent) bool {
 	return false
 }
 
+func (s *Server) handleTimeoutNowEvent(ev TimeoutNowEvent) bool {
+	s.mu.Lock()
+	reply := s.processTimeoutNow(ev.Args)
+	s.mu.Unlock()
+	if ev.ResCh != nil {
+		select {
+		case ev.ResCh <- reply:
+		case <-s.stopCh:
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleStateActionEvent(act stateAction) bool {
 	s.mu.Lock()
 	act.fn()
@@ -3007,6 +3110,8 @@ func (s *Server) processEventLoopCycle(timerCh, heartbeatCh, checkQuorumCh <-cha
 		return s.handleRequestVoteEvent(ev)
 	case ev := <-s.appendEntriesCh:
 		return s.handleAppendEntriesEvent(ev)
+	case ev := <-s.timeoutNowCh:
+		return s.handleTimeoutNowEvent(ev)
 	case act := <-s.stateActionCh:
 		return s.handleStateActionEvent(act)
 	}
@@ -3145,6 +3250,81 @@ func (s *Server) SendAppendEntriesToNode(ctx context.Context, id raft.NodeID, ar
 		return nil, fmt.Errorf("peer %d not found in server peer list", id)
 	}
 	return s.SendAppendEntries(ctx, peer, args)
+}
+
+// SendTimeoutNow sends a TimeoutNow RPC to a peer using the server's RPC client pool.
+func (s *Server) SendTimeoutNow(ctx context.Context, peer Peer, args *raft.TimeoutNowArgs) (*raft.TimeoutNowReply, error) {
+	if s.RPCClientPool == nil {
+		return nil, fmt.Errorf("server %d RPCClientPool is nil", s.ID)
+	}
+	if peer.Address == "" {
+		if p, ok := s.GetPeer(peer.ID); ok {
+			peer = p
+		}
+	}
+
+	s.GetLogger().Debug("sending TimeoutNow", "peer_id", int(peer.ID), "term", uint64(args.Term))
+	reply, err := s.RPCClientPool.SendTimeoutNow(ctx, peer, args)
+	if err != nil {
+		s.GetLogger().Warn("failed to send TimeoutNow", "peer_id", int(peer.ID), "error", err, "is_timeout", rpc.IsTimeout(err))
+		return nil, err
+	}
+	return reply, nil
+}
+
+// SendTimeoutNowToNode sends a TimeoutNow RPC to a peer identified by NodeID.
+func (s *Server) SendTimeoutNowToNode(ctx context.Context, id raft.NodeID, args *raft.TimeoutNowArgs) (*raft.TimeoutNowReply, error) {
+	peer, ok := s.GetPeer(id)
+	if !ok {
+		return nil, fmt.Errorf("peer %d not found in server peer list", id)
+	}
+	return s.SendTimeoutNow(ctx, peer, args)
+}
+
+// Transfer initiates leadership transfer to the target node per Raft §3.10.
+// Note: full transfer needs log catch-up, which is scheduled for Month 3; this triggers the immediate election.
+func (s *Server) Transfer(target raft.NodeID) error {
+	return s.TransferWithContext(context.Background(), target)
+}
+
+// TransferWithContext initiates leadership transfer to the target node with a context.
+func (s *Server) TransferWithContext(ctx context.Context, target raft.NodeID) error {
+	s.mu.RLock()
+	if s.State != raft.Leader {
+		s.mu.RUnlock()
+		return fmt.Errorf("cannot transfer leadership: server %d is not the leader", s.ID)
+	}
+	if target == s.ID {
+		s.mu.RUnlock()
+		return nil
+	}
+	peer, ok := s.getPeerLocked(target)
+	var curTerm raft.Term
+	if s.PersistentState != nil {
+		curTerm = s.PersistentState.CurrentTerm
+	}
+	s.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("target node %d not found in peer list", target)
+	}
+
+	args := &raft.TimeoutNowArgs{
+		Term:     curTerm,
+		LeaderID: s.ID,
+	}
+
+	reply, err := s.SendTimeoutNow(ctx, peer, args)
+	if err != nil {
+		return fmt.Errorf("failed to send TimeoutNow to target %d: %w", target, err)
+	}
+
+	if !reply.Success {
+		return fmt.Errorf("target %d rejected TimeoutNow (term %d)", target, reply.Term)
+	}
+
+	s.checkReplyTerm(reply.Term)
+	return nil
 }
 
 // SetRPCTimeout configures the default RPC timeout for peer calls.

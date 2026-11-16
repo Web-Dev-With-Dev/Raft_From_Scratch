@@ -84,15 +84,15 @@ func (x *LogEntry) GetCommand() []byte {
 
 // RequestVoteArgs contains the candidate's metadata to request a vote.
 type RequestVoteArgs struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
-	CandidateId   int64                  `protobuf:"varint,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
-	LastLogIndex  uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
-	LastLogTerm   uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	Term               uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	CandidateId        int64                  `protobuf:"varint,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
+	LastLogIndex       uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastLogTerm        uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
 	PreVote            bool                   `protobuf:"varint,5,opt,name=pre_vote,json=preVote,proto3" json:"pre_vote,omitempty"`
 	LeadershipTransfer bool                   `protobuf:"varint,6,opt,name=leadership_transfer,json=leadershipTransfer,proto3" json:"leadership_transfer,omitempty"`
 	unknownFields      protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *RequestVoteArgs) Reset() {
@@ -374,6 +374,112 @@ func (x *AppendEntriesReply) GetConflictTerm() uint64 {
 	return 0
 }
 
+// TimeoutNowArgs contains the leadership transfer initiation request.
+type TimeoutNowArgs struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId      int64                  `protobuf:"varint,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TimeoutNowArgs) Reset() {
+	*x = TimeoutNowArgs{}
+	mi := &file_proto_raft_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TimeoutNowArgs) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TimeoutNowArgs) ProtoMessage() {}
+
+func (x *TimeoutNowArgs) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TimeoutNowArgs.ProtoReflect.Descriptor instead.
+func (*TimeoutNowArgs) Descriptor() ([]byte, []int) {
+	return file_proto_raft_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *TimeoutNowArgs) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *TimeoutNowArgs) GetLeaderId() int64 {
+	if x != nil {
+		return x.LeaderId
+	}
+	return 0
+}
+
+// TimeoutNowReply contains the target node's decision.
+type TimeoutNowReply struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	Success       bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TimeoutNowReply) Reset() {
+	*x = TimeoutNowReply{}
+	mi := &file_proto_raft_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TimeoutNowReply) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TimeoutNowReply) ProtoMessage() {}
+
+func (x *TimeoutNowReply) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TimeoutNowReply.ProtoReflect.Descriptor instead.
+func (*TimeoutNowReply) Descriptor() ([]byte, []int) {
+	return file_proto_raft_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *TimeoutNowReply) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *TimeoutNowReply) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
 var File_proto_raft_proto protoreflect.FileDescriptor
 
 const file_proto_raft_proto_rawDesc = "" +
@@ -382,12 +488,14 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\bLogEntry\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\x04R\x05index\x12\x18\n" +
-	"\acommand\x18\x03 \x01(\fR\acommand\"\x92\x01\n" +
+	"\acommand\x18\x03 \x01(\fR\acommand\"\xde\x01\n" +
 	"\x0fRequestVoteArgs\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fcandidate_id\x18\x02 \x01(\x03R\vcandidateId\x12$\n" +
 	"\x0elast_log_index\x18\x03 \x01(\x04R\flastLogIndex\x12\"\n" +
-	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\"I\n" +
+	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\x12\x19\n" +
+	"\bpre_vote\x18\x05 \x01(\bR\apreVote\x12/\n" +
+	"\x13leadership_transfer\x18\x06 \x01(\bR\x12leadershipTransfer\"I\n" +
 	"\x10RequestVoteReply\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"\xdd\x01\n" +
@@ -402,10 +510,18 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\x12%\n" +
 	"\x0econflict_index\x18\x03 \x01(\x04R\rconflictIndex\x12#\n" +
-	"\rconflict_term\x18\x04 \x01(\x04R\fconflictTerm2\x8f\x01\n" +
+	"\rconflict_term\x18\x04 \x01(\x04R\fconflictTerm\"A\n" +
+	"\x0eTimeoutNowArgs\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
+	"\tleader_id\x18\x02 \x01(\x03R\bleaderId\"?\n" +
+	"\x0fTimeoutNowReply\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess2\xca\x01\n" +
 	"\vRaftService\x12<\n" +
 	"\vRequestVote\x12\x15.raft.RequestVoteArgs\x1a\x16.raft.RequestVoteReply\x12B\n" +
-	"\rAppendEntries\x12\x17.raft.AppendEntriesArgs\x1a\x18.raft.AppendEntriesReplyB\x13Z\x11raft/proto;raftpbb\x06proto3"
+	"\rAppendEntries\x12\x17.raft.AppendEntriesArgs\x1a\x18.raft.AppendEntriesReply\x129\n" +
+	"\n" +
+	"TimeoutNow\x12\x14.raft.TimeoutNowArgs\x1a\x15.raft.TimeoutNowReplyB\x13Z\x11raft/proto;raftpbb\x06proto3"
 
 var (
 	file_proto_raft_proto_rawDescOnce sync.Once
@@ -419,22 +535,26 @@ func file_proto_raft_proto_rawDescGZIP() []byte {
 	return file_proto_raft_proto_rawDescData
 }
 
-var file_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_proto_raft_proto_goTypes = []any{
 	(*LogEntry)(nil),           // 0: raft.LogEntry
 	(*RequestVoteArgs)(nil),    // 1: raft.RequestVoteArgs
 	(*RequestVoteReply)(nil),   // 2: raft.RequestVoteReply
 	(*AppendEntriesArgs)(nil),  // 3: raft.AppendEntriesArgs
 	(*AppendEntriesReply)(nil), // 4: raft.AppendEntriesReply
+	(*TimeoutNowArgs)(nil),     // 5: raft.TimeoutNowArgs
+	(*TimeoutNowReply)(nil),    // 6: raft.TimeoutNowReply
 }
 var file_proto_raft_proto_depIdxs = []int32{
 	0, // 0: raft.AppendEntriesArgs.entries:type_name -> raft.LogEntry
 	1, // 1: raft.RaftService.RequestVote:input_type -> raft.RequestVoteArgs
 	3, // 2: raft.RaftService.AppendEntries:input_type -> raft.AppendEntriesArgs
-	2, // 3: raft.RaftService.RequestVote:output_type -> raft.RequestVoteReply
-	4, // 4: raft.RaftService.AppendEntries:output_type -> raft.AppendEntriesReply
-	3, // [3:5] is the sub-list for method output_type
-	1, // [1:3] is the sub-list for method input_type
+	5, // 3: raft.RaftService.TimeoutNow:input_type -> raft.TimeoutNowArgs
+	2, // 4: raft.RaftService.RequestVote:output_type -> raft.RequestVoteReply
+	4, // 5: raft.RaftService.AppendEntries:output_type -> raft.AppendEntriesReply
+	6, // 6: raft.RaftService.TimeoutNow:output_type -> raft.TimeoutNowReply
+	4, // [4:7] is the sub-list for method output_type
+	1, // [1:4] is the sub-list for method input_type
 	1, // [1:1] is the sub-list for extension type_name
 	1, // [1:1] is the sub-list for extension extendee
 	0, // [0:1] is the sub-list for field type_name
@@ -451,7 +571,7 @@ func file_proto_raft_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_raft_proto_rawDesc), len(file_proto_raft_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
