@@ -74,6 +74,11 @@ func TestDisruptiveServer_Regression(t *testing.T) {
 	}
 }
 
+// TestDay15_DisruptiveServer verifies Day 15's disruptive server prevention (§4.2.3, §9.6).
+func TestDay15_DisruptiveServer(t *testing.T) {
+	TestDisruptiveServer_Regression(t)
+}
+
 // TestDisruptiveServer_WithoutPreVote_StepsDown verifies why standard Raft Figure 2 suffers from
 // the disruptive server vulnerability when Pre-Vote is not active.
 func TestDisruptiveServer_WithoutPreVote_StepsDown(t *testing.T) {

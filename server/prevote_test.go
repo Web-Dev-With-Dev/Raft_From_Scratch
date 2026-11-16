@@ -195,3 +195,56 @@ func TestPreVote_StartsRealElectionOnlyOnMajority(t *testing.T) {
 		t.Fatalf("expected votedFor 1 after starting real election, got %d", srv.Status().VotedFor)
 	}
 }
+
+func runElectionAndFailover(t *testing.T, preVote bool) {
+	t.Helper()
+	clk := raft.NewFakeClock()
+	simNet := NewSimNetwork(42)
+	simNet.SetClock(clk)
+
+	cluster := NewCluster(t, 3,
+		WithClock(clk),
+		WithSimNetwork(simNet),
+		WithRandSeed(42),
+		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
+		WithHeartbeatInterval(20*time.Millisecond),
+		WithRPCTimeout(40*time.Millisecond),
+		WithPreVote(preVote),
+	)
+
+	cluster.GetNode(1).StartElection()
+	leader, initialTerm, err := cluster.WaitLeader(2 * time.Second)
+	if err != nil || leader == nil || leader.ID != 1 {
+		t.Fatalf("failed to elect initial leader (preVote=%v): %v", preVote, err)
+	}
+
+	cluster.Advance(60 * time.Millisecond)
+
+	cluster.Kill(leader.ID)
+	var newLeader *Server
+	elected := cluster.AdvanceUntil(3*time.Second, func() bool {
+		l, _ := cluster.Leader()
+		if l != nil && l.ID != leader.ID {
+			newLeader = l
+			return true
+		}
+		return false
+	})
+	if !elected || newLeader == nil {
+		t.Fatalf("failover election failed (preVote=%v)", preVote)
+	}
+	if newLeader.Status().Term <= initialTerm {
+		t.Fatalf("expected new leader term > %d, got %d", initialTerm, newLeader.Status().Term)
+	}
+}
+
+// TestRegression_NormalElections_PreVoteOnAndOff verifies that normal leader election
+// and failover re-election operate seamlessly with PreVote enabled or disabled.
+func TestRegression_NormalElections_PreVoteOnAndOff(t *testing.T) {
+	t.Run("PreVote_Off", func(t *testing.T) {
+		runElectionAndFailover(t, false)
+	})
+	t.Run("PreVote_On", func(t *testing.T) {
+		runElectionAndFailover(t, true)
+	})
+}
