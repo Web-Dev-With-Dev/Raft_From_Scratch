@@ -308,3 +308,51 @@ func TestSimNetwork_ContextCancellation(t *testing.T) {
 		t.Fatalf("expected context timeout error, got nil")
 	}
 }
+
+// TestSimNetwork_HeavyDuplicationAndReordering_ElectionSafety simulates leader election
+// under 30% message duplication and heavy reordering, verifying election safety
+// and the votedFor invariant across nodes.
+func TestSimNetwork_HeavyDuplicationAndReordering_ElectionSafety(t *testing.T) {
+	clk := raft.NewFakeClock()
+	simNet := NewSimNetwork(888)
+	simNet.SetClock(clk)
+	simNet.SetDuplicationProbability(0.30)
+	simNet.SetReorderProbability(0.60)
+	simNet.SetDelayRange(5*time.Millisecond, 25*time.Millisecond)
+	simNet.SetReorderDelayRange(20*time.Millisecond, 70*time.Millisecond)
+
+	cluster := NewCluster(t, 3,
+		WithClock(clk),
+		WithSimNetwork(simNet),
+		WithRandSeed(888),
+		WithQuiet(true),
+		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
+		WithHeartbeatInterval(20*time.Millisecond),
+		WithRPCTimeout(40*time.Millisecond),
+	)
+
+	termHist := make(map[raft.Term]raft.NodeID)
+	leader, err := advanceUntilLeader(context.Background(), clk, cluster, 4*time.Second, termHist)
+	if err != nil {
+		t.Fatalf("election failed under 30%% duplication and heavy reordering: %v", err)
+	}
+	if leader == nil || leader.Status().Term < 1 {
+		t.Fatalf("expected valid leader with term >= 1")
+	}
+
+	// Advance clock further so leader dispatches multiple heartbeat rounds through SimNetwork
+	for i := 0; i < 30; i++ {
+		advanceClockStep(clk, 20*time.Millisecond)
+	}
+
+	if simNet.TotalDuplicated() == 0 {
+		t.Fatalf("expected non-zero duplicated packets, got 0 (sent=%d)", simNet.TotalSent())
+	}
+	if simNet.TotalReordered() == 0 {
+		t.Fatalf("expected non-zero reordered packets, got 0")
+	}
+
+	if err := verifyVotedForInvariantAcrossNodes(cluster); err != nil {
+		t.Fatalf("votedFor invariant check failed: %v", err)
+	}
+}

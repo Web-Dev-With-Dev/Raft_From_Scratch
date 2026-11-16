@@ -1654,41 +1654,65 @@ func (s *Server) stepDownOnHigherTermLocked(term uint64) (uint64, raft.NodeID, b
 }
 
 func (s *Server) recordVoteGrantOrDenyLocked(req *raftpb.RequestVoteArgs, currentTerm uint64, votedFor raft.NodeID, steppedDown bool) bool {
-	canVote := (votedFor == -1 || votedFor == raft.NodeID(req.CandidateId))
-	logOk := s.isLogUpToDateLocked(req.LastLogIndex, req.LastLogTerm)
-
-	if canVote && logOk {
-		s.votesGranted.Add(1)
-		s.recordEventLocked(EventVoteGranted, fmt.Sprintf("granted vote to candidate %d for term %d", req.CandidateId, currentTerm), map[string]interface{}{
+	// Invariant: never grant votes to two different candidates in the same term (§5.2).
+	if votedFor != -1 && votedFor != raft.NodeID(req.CandidateId) {
+		s.votesDenied.Add(1)
+		s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d (already voted for %d)", req.CandidateId, currentTerm, votedFor), map[string]interface{}{
 			"candidate_id": req.CandidateId,
 			"term":         currentTerm,
+			"voted_for":    int(votedFor),
+			"reason":       "already_voted_other",
 		})
-		if s.PersistentState != nil {
-			s.PersistentState.VotedFor = raft.NodeID(req.CandidateId)
+		s.GetLogger().Info("denied vote: already voted for another candidate in this term",
+			"candidate_id", req.CandidateId,
+			"term", currentTerm,
+			"voted_for", int(votedFor),
+		)
+		return false
+	}
+
+	// Per Raft Figure 2 Rule 2: candidate's log must be at least as up-to-date as receiver's log.
+	if !s.isLogUpToDateLocked(req.LastLogIndex, req.LastLogTerm) {
+		s.votesDenied.Add(1)
+		s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d (stale log)", req.CandidateId, currentTerm), map[string]interface{}{
+			"candidate_id": req.CandidateId,
+			"term":         currentTerm,
+			"reason":       "stale_log",
+		})
+		if steppedDown {
+			_ = s.persistLocked()
+			s.lastHeartbeat = s.getClockLocked().Now()
+			if s.ElectionTimer != nil {
+				s.ElectionTimer.Reset()
+			}
 		}
-		_ = s.persistLocked()
+		s.GetLogger().Info("denied vote to candidate (stale log)", "candidate_id", req.CandidateId, "term", currentTerm)
+		return false
+	}
+
+	// Idempotent retry: candidate already holds this node's vote for this term.
+	if votedFor == raft.NodeID(req.CandidateId) {
 		s.resetElectionTimerOnGrantingVoteLocked(req.CandidateId, req.Term)
-		s.GetLogger().Info("granted vote to candidate", "candidate_id", req.CandidateId, "term", currentTerm)
+		s.GetLogger().Debug("re-granted vote to candidate (idempotent duplicate request)",
+			"candidate_id", req.CandidateId,
+			"term", currentTerm,
+		)
 		return true
 	}
 
-	s.votesDenied.Add(1)
-	s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d", req.CandidateId, currentTerm), map[string]interface{}{
+	// Fresh vote grant for this term (votedFor == -1):
+	s.votesGranted.Add(1)
+	s.recordEventLocked(EventVoteGranted, fmt.Sprintf("granted vote to candidate %d for term %d", req.CandidateId, currentTerm), map[string]interface{}{
 		"candidate_id": req.CandidateId,
 		"term":         currentTerm,
-		"can_vote":     canVote,
-		"log_ok":       logOk,
-		"voted_for":    int(votedFor),
 	})
-	if steppedDown {
-		_ = s.persistLocked()
-		s.lastHeartbeat = s.getClockLocked().Now()
-		if s.ElectionTimer != nil {
-			s.ElectionTimer.Reset()
-		}
+	if s.PersistentState != nil {
+		s.PersistentState.VotedFor = raft.NodeID(req.CandidateId)
 	}
-	s.GetLogger().Info("denied vote to candidate", "candidate_id", req.CandidateId, "term", currentTerm, "voted_for", int(votedFor), "can_vote", canVote, "log_ok", logOk)
-	return false
+	_ = s.persistLocked()
+	s.resetElectionTimerOnGrantingVoteLocked(req.CandidateId, req.Term)
+	s.GetLogger().Info("granted vote to candidate", "candidate_id", req.CandidateId, "term", currentTerm)
+	return true
 }
 
 // processRequestVote evaluates an incoming RequestVote RPC exactly per Raft paper Figure 2 rules 1-2.

@@ -352,12 +352,85 @@ func RunVariedLogsElectionScenario(ctx context.Context, seed int64) (*Cluster, e
 	return cluster, nil
 }
 
+func verifyVotedForInvariantAcrossNodes(cluster *Cluster) error {
+	for _, node := range cluster.Nodes() {
+		if node.EventLog() == nil {
+			continue
+		}
+		grantsByTerm := make(map[raft.Term]int64)
+		for _, ev := range node.EventLog().Entries() {
+			if ev.Type != EventVoteGranted {
+				continue
+			}
+			candID := extractCandidateIDFromEvent(ev)
+			if prior, exists := grantsByTerm[ev.Term]; exists && prior != candID {
+				return fmt.Errorf("votedFor invariant violated on node %d term %d: granted to %d and %d",
+					node.ID, ev.Term, prior, candID)
+			}
+			grantsByTerm[ev.Term] = candID
+		}
+	}
+	return nil
+}
+
+func extractCandidateIDFromEvent(ev Event) int64 {
+	if c, ok := ev.Details["candidate_id"].(int64); ok {
+		return c
+	}
+	if c, ok := ev.Details["candidate_id"].(float64); ok {
+		return int64(c)
+	}
+	if c, ok := ev.Details["candidate_id"].(int); ok {
+		return int64(c)
+	}
+	return -1
+}
+
+// RunDuplicationReorderScenario runs an election simulation under 30% message duplication
+// and heavy network reordering, asserting election safety (§5.2) and the votedFor invariant.
+func RunDuplicationReorderScenario(ctx context.Context, seed int64) (*Cluster, error) {
+	clk := raft.NewFakeClock()
+	simNet := NewSimNetwork(seed)
+	simNet.SetClock(clk)
+	simNet.SetDuplicationProbability(0.30)
+	simNet.SetReorderProbability(0.60)
+	simNet.SetDelayRange(5*time.Millisecond, 25*time.Millisecond)
+	simNet.SetReorderDelayRange(20*time.Millisecond, 70*time.Millisecond)
+
+	cluster := NewCluster(nil, 3,
+		WithClock(clk),
+		WithSimNetwork(simNet),
+		WithRandSeed(seed),
+		WithQuiet(true),
+		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
+		WithHeartbeatInterval(20*time.Millisecond),
+		WithRPCTimeout(40*time.Millisecond),
+	)
+
+	termHistory := make(map[raft.Term]raft.NodeID)
+	leader, err := advanceUntilLeader(ctx, clk, cluster, 4*time.Second, termHistory)
+	if err != nil {
+		return cluster, fmt.Errorf("leader election failed under duplication/reordering: %w", err)
+	}
+	if leader.Status().Term < 1 {
+		return cluster, fmt.Errorf("leader term must be >= 1, got %d", leader.Status().Term)
+	}
+	if err := verifyVotedForInvariantAcrossNodes(cluster); err != nil {
+		return cluster, err
+	}
+	if err := verifyStability(clk, cluster, 20, termHistory); err != nil {
+		return cluster, err
+	}
+	return cluster, nil
+}
+
 // Scenarios maps scenario names to their execution functions.
 var Scenarios = map[string]func(ctx context.Context, seed int64) (*Cluster, error){
 	"election":    RunBasicElectionScenario,
 	"crash":       RunCrashScenario,
 	"partition":   RunPartitionScenario,
 	"varied_logs": RunVariedLogsElectionScenario,
+	"duplication": RunDuplicationReorderScenario,
 }
 
 // RunScenario executes a scenario by name with the given seed, returning the trace and any error.

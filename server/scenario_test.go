@@ -181,3 +181,33 @@ func TestScenario_VariedLogs_Batch(t *testing.T) {
 		t.Fatalf("expected 0 failures across 25 seeds, got %d failing seeds: %v", res.Failed, res.FailingSeeds)
 	}
 }
+
+func TestScenario_DuplicationAndReordering(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	trace, err := RunScenario(ctx, "duplication", 555, "")
+	if err != nil {
+		t.Fatalf("duplication scenario failed: %v", err)
+	}
+	if trace.Status != "PASS" {
+		t.Fatalf("expected status PASS, got %s", trace.Status)
+	}
+}
+
+func TestScenario_Duplication_Batch(t *testing.T) {
+	cfg := BatchConfig{
+		Scenario:  "duplication",
+		StartSeed: 1,
+		EndSeed:   20,
+		Workers:   4,
+	}
+
+	res, err := RunBatch(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("unexpected batch error: %v", err)
+	}
+	if res.Failed > 0 {
+		t.Fatalf("expected 0 failures across 20 seeds, got %d failing seeds: %v", res.Failed, res.FailingSeeds)
+	}
+}
