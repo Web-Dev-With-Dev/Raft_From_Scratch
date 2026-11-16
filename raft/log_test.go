@@ -1,6 +1,11 @@
 package raft
 
-import "testing"
+import (
+	"errors"
+	"reflect"
+	"sync"
+	"testing"
+)
 
 func TestIsLogUpToDate_TableDriven_RaftPaperCases(t *testing.T) {
 	// The Raft paper (§5.4.1 Election restriction):
@@ -174,5 +179,262 @@ func TestPersistentState_LastLogInfo(t *testing.T) {
 	index, term = populatedState.LastLogInfo()
 	if index != 4 || term != 3 {
 		t.Fatalf("expected (4, 3) for populated log, got (%d, %d)", index, term)
+	}
+}
+
+func TestLog_EmptyAndSentinel(t *testing.T) {
+	log := NewMemoryLog()
+
+	if log.LastIndex() != 0 || log.LastTerm() != 0 {
+		t.Fatalf("expected LastIndex=0, LastTerm=0; got %d, %d", log.LastIndex(), log.LastTerm())
+	}
+
+	term, err := log.TermAt(0)
+	if err != nil || term != 0 {
+		t.Fatalf("expected TermAt(0) = (0, nil); got (%d, %v)", term, err)
+	}
+
+	if _, err := log.TermAt(1); !errors.Is(err, ErrIndexOutOfBounds) {
+		t.Fatalf("expected ErrIndexOutOfBounds for TermAt(1); got %v", err)
+	}
+
+	if err := log.TruncateFrom(0); !errors.Is(err, ErrCannotTruncateSentinel) {
+		t.Fatalf("expected ErrCannotTruncateSentinel for TruncateFrom(0); got %v", err)
+	}
+
+	if err := log.TruncateFrom(1); err != nil {
+		t.Fatalf("expected nil for TruncateFrom(1) on empty log; got %v", err)
+	}
+
+	if err := log.TruncateFrom(2); !errors.Is(err, ErrIndexOutOfBounds) {
+		t.Fatalf("expected ErrIndexOutOfBounds for TruncateFrom(2); got %v", err)
+	}
+}
+
+func TestLog_Append_TableDriven(t *testing.T) {
+	tests := []struct {
+		name         string
+		entries      []LogEntry
+		expectErr    error
+		wantLastIdx  LogIndex
+		wantLastTerm Term
+	}{
+		{"empty append", nil, nil, 0, 0},
+		{"auto-index", []LogEntry{{Term: 1, Command: "x"}}, nil, 1, 1},
+		{"explicit index", []LogEntry{{Index: 2, Term: 2, Command: "y"}}, nil, 2, 2},
+		{"mismatched index", []LogEntry{{Index: 99, Term: 2, Command: "bad"}}, ErrInvalidIndex, 0, 0},
+	}
+
+	log := NewMemoryLog()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := log.Append(tc.entries...)
+			if tc.expectErr != nil {
+				if !errors.Is(err, tc.expectErr) {
+					t.Fatalf("expected %v, got %v", tc.expectErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if log.LastIndex() != tc.wantLastIdx || log.LastTerm() != tc.wantLastTerm {
+				t.Fatalf("got (%d, %d); want (%d, %d)", log.LastIndex(), log.LastTerm(), tc.wantLastIdx, tc.wantLastTerm)
+			}
+		})
+	}
+}
+
+func TestLog_Append_Atomicity(t *testing.T) {
+	log := NewMemoryLog()
+	_ = log.Append(LogEntry{Term: 1, Command: "c1"})
+
+	batch := []LogEntry{
+		{Index: 2, Term: 1, Command: "c2"},
+		{Index: 5, Term: 1, Command: "c5"},
+	}
+	err := log.Append(batch...)
+	if !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("expected ErrInvalidIndex, got %v", err)
+	}
+
+	if log.LastIndex() != 1 {
+		t.Fatalf("expected LastIndex to remain 1 after failed batch; got %d", log.LastIndex())
+	}
+}
+
+func TestLog_TermAt_TableDriven(t *testing.T) {
+	log := NewMemoryLog()
+	_ = log.Append(
+		LogEntry{Term: 1, Command: "a"},
+		LogEntry{Term: 1, Command: "b"},
+		LogEntry{Term: 3, Command: "c"},
+	)
+
+	tests := []struct {
+		name      string
+		index     LogIndex
+		wantTerm  Term
+		expectErr error
+	}{
+		{"sentinel at 0", 0, 0, nil},
+		{"first entry at 1", 1, 1, nil},
+		{"second entry at 2", 2, 1, nil},
+		{"third entry at 3", 3, 3, nil},
+		{"out of bounds at 4", 4, 0, ErrIndexOutOfBounds},
+		{"far out of bounds at 50", 50, 0, ErrIndexOutOfBounds},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			term, err := log.TermAt(tc.index)
+			if tc.expectErr != nil {
+				if !errors.Is(err, tc.expectErr) {
+					t.Fatalf("expected %v, got %v", tc.expectErr, err)
+				}
+				return
+			}
+			if err != nil || term != tc.wantTerm {
+				t.Fatalf("got term=%d, err=%v; want term=%d, nil", term, err, tc.wantTerm)
+			}
+		})
+	}
+}
+
+func TestLog_TruncateFrom_TableDriven(t *testing.T) {
+	setupLog := func() *MemoryLog {
+		l := NewMemoryLog()
+		_ = l.Append(
+			LogEntry{Term: 1, Command: "1"},
+			LogEntry{Term: 1, Command: "2"},
+			LogEntry{Term: 2, Command: "3"},
+			LogEntry{Term: 3, Command: "4"},
+		)
+		return l
+	}
+
+	tests := []struct {
+		name         string
+		truncIdx     LogIndex
+		expectErr    error
+		wantLastIdx  LogIndex
+		wantLastTerm Term
+	}{
+		{"sentinel disallowed", 0, ErrCannotTruncateSentinel, 0, 0},
+		{"truncate beyond lastIndex+1", 6, ErrIndexOutOfBounds, 0, 0},
+		{"truncate at lastIndex+1 is noop", 5, nil, 4, 3},
+		{"truncate last element", 4, nil, 3, 2},
+		{"truncate from middle", 3, nil, 2, 1},
+		{"truncate all down to sentinel", 1, nil, 0, 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := setupLog()
+			err := l.TruncateFrom(tc.truncIdx)
+			if tc.expectErr != nil {
+				if !errors.Is(err, tc.expectErr) {
+					t.Fatalf("expected %v, got %v", tc.expectErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if l.LastIndex() != tc.wantLastIdx || l.LastTerm() != tc.wantLastTerm {
+				t.Fatalf("got (%d, %d); want (%d, %d)", l.LastIndex(), l.LastTerm(), tc.wantLastIdx, tc.wantLastTerm)
+			}
+		})
+	}
+}
+
+func TestLog_Slice_TableDriven(t *testing.T) {
+	l := NewMemoryLog()
+	_ = l.Append(
+		LogEntry{Term: 1, Command: "c1"},
+		LogEntry{Term: 2, Command: "c2"},
+		LogEntry{Term: 2, Command: "c3"},
+	)
+
+	tests := []struct {
+		name      string
+		low       LogIndex
+		high      LogIndex
+		expectErr error
+		wantLen   int
+		wantTerms []Term
+	}{
+		{"invalid range low > high", 3, 2, ErrInvalidIndex, 0, nil},
+		{"high exceeds lastIndex+1", 1, 5, ErrIndexOutOfBounds, 0, nil},
+		{"empty slice low == high", 2, 2, nil, 0, []Term{}},
+		{"sentinel only", 0, 1, nil, 1, []Term{0}},
+		{"all entries excluding sentinel", 1, 4, nil, 3, []Term{1, 2, 2}},
+		{"sub-slice middle", 2, 4, nil, 2, []Term{2, 2}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, err := l.Slice(tc.low, tc.high)
+			if tc.expectErr != nil {
+				if !errors.Is(err, tc.expectErr) {
+					t.Fatalf("expected %v, got %v", tc.expectErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(entries) != tc.wantLen {
+				t.Fatalf("got len %d, want %d", len(entries), tc.wantLen)
+			}
+			gotTerms := make([]Term, 0, len(entries))
+			for _, e := range entries {
+				gotTerms = append(gotTerms, e.Term)
+			}
+			if tc.wantTerms != nil && !reflect.DeepEqual(gotTerms, tc.wantTerms) {
+				t.Fatalf("got terms %v, want %v", gotTerms, tc.wantTerms)
+			}
+		})
+	}
+}
+
+func TestLog_Slice_Immutability(t *testing.T) {
+	l := NewMemoryLog()
+	_ = l.Append(LogEntry{Term: 1, Command: "original"})
+
+	slice, err := l.Slice(1, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	slice[0].Term = 99
+	slice[0].Command = "mutated"
+
+	term, _ := l.TermAt(1)
+	if term != 1 {
+		t.Fatalf("expected internal log term to remain 1, got %d", term)
+	}
+}
+
+func TestLog_Concurrent(t *testing.T) {
+	l := NewMemoryLog()
+	var wg sync.WaitGroup
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_ = l.Append(LogEntry{Term: Term(worker + 1), Command: j})
+				_ = l.LastIndex()
+				_ = l.LastTerm()
+				_, _ = l.TermAt(1)
+				_, _ = l.Slice(0, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if l.LastIndex() != 1000 {
+		t.Fatalf("expected LastIndex=1000 after concurrent appends, got %d", l.LastIndex())
 	}
 }
