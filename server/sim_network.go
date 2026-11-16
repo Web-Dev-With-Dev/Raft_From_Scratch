@@ -502,6 +502,7 @@ func (n *SimNetwork) SendRequestVote(ctx context.Context, src, dst raft.NodeID, 
 	}
 
 	clonedReq := proto.Clone(req).(*raftpb.RequestVoteArgs)
+	clonedReq.PreVote = req.PreVote
 	reply, err := targetNode.RequestVote(ctx, clonedReq)
 	if err != nil {
 		return nil, err

@@ -89,6 +89,7 @@ type RequestVoteArgs struct {
 	CandidateId   int64                  `protobuf:"varint,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
 	LastLogIndex  uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
 	LastLogTerm   uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	PreVote       bool                   `protobuf:"varint,5,opt,name=pre_vote,json=preVote,proto3" json:"pre_vote,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -149,6 +150,13 @@ func (x *RequestVoteArgs) GetLastLogTerm() uint64 {
 		return x.LastLogTerm
 	}
 	return 0
+}
+
+func (x *RequestVoteArgs) GetPreVote() bool {
+	if x != nil {
+		return x.PreVote
+	}
+	return false
 }
 
 // RequestVoteReply contains the voter's decision.

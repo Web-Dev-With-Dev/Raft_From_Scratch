@@ -337,6 +337,7 @@ func (n *Network) sendRequestVote(ctx context.Context, src, dst raft.NodeID, req
 	}
 
 	clonedReq := proto.Clone(req).(*raftpb.RequestVoteArgs)
+	clonedReq.PreVote = req.PreVote
 	reply, err := targetNode.RequestVote(ctx, clonedReq)
 	if err != nil {
 		return nil, err
@@ -404,6 +405,7 @@ type clusterOptions struct {
 	rpcTimeout          time.Duration
 	checkQuorum         bool
 	checkQuorumInterval time.Duration
+	preVote             bool
 	autoStart           bool
 	clock               raft.Clock
 	simNetwork          *SimNetwork
@@ -493,6 +495,13 @@ func WithCheckQuorumInterval(interval time.Duration) ClusterOption {
 	}
 }
 
+// WithPreVote enables or disables the Pre-Vote algorithm (§9.6) for all nodes in the cluster.
+func WithPreVote(enabled bool) ClusterOption {
+	return func(o *clusterOptions) {
+		o.preVote = enabled
+	}
+}
+
 // WithAutoStart controls whether event loops are automatically launched.
 func WithAutoStart(autoStart bool) ClusterOption {
 	return func(o *clusterOptions) {
@@ -541,6 +550,9 @@ func configureServerOptions(srv *Server, options clusterOptions) {
 		if options.checkQuorumInterval > 0 {
 			srv.SetCheckQuorumInterval(options.checkQuorumInterval)
 		}
+	}
+	if options.preVote {
+		srv.SetPreVote(true)
 	}
 }
 
@@ -1052,5 +1064,14 @@ func (c *Cluster) SetCheckQuorumInterval(interval time.Duration) {
 	defer c.mu.RUnlock()
 	for _, srv := range c.servers {
 		srv.SetCheckQuorumInterval(interval)
+	}
+}
+
+// SetPreVote enables or disables the Pre-Vote algorithm for all nodes in the cluster.
+func (c *Cluster) SetPreVote(enabled bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, srv := range c.servers {
+		srv.SetPreVote(enabled)
 	}
 }

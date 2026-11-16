@@ -51,6 +51,7 @@ func ToProtoRequestVoteArgs(args *RequestVoteArgs) *raftpb.RequestVoteArgs {
 		CandidateId:  int64(args.CandidateID),
 		LastLogIndex: uint64(args.LastLogIndex),
 		LastLogTerm:  uint64(args.LastLogTerm),
+		PreVote:      args.PreVote,
 	}
 }
 
@@ -64,6 +65,7 @@ func FromProtoRequestVoteArgs(pb *raftpb.RequestVoteArgs) *RequestVoteArgs {
 		CandidateID:  raft.NodeID(pb.CandidateId),
 		LastLogIndex: raft.LogIndex(pb.LastLogIndex),
 		LastLogTerm:  raft.Term(pb.LastLogTerm),
+		PreVote:      pb.PreVote,
 	}
 }
 

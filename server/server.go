@@ -84,6 +84,7 @@ type AppendEntriesEvent struct {
 type RequestVoteResult struct {
 	PeerID       raft.NodeID
 	ElectionTerm raft.Term
+	PreVote      bool
 	Reply        *raft.RequestVoteReply
 	Err          error
 }
@@ -207,6 +208,10 @@ type Server struct {
 	checkQuorumInterval time.Duration
 	checkQuorumTimer    raft.Timer
 	heartbeatAcks       map[raft.NodeID]bool
+
+	// preVote controls (§9.6): candidates gather majority pre-votes before incrementing term
+	preVote          bool
+	preVotesReceived map[raft.NodeID]bool
 }
 
 // NewServer creates and initializes a new Raft Server.
@@ -268,6 +273,7 @@ func NewServer(
 		lastHeartbeat:     clk.Now(),
 		heartbeatInterval: raft.DefaultHeartbeatInterval,
 		votesReceived:     make(map[raft.NodeID]bool),
+		preVotesReceived:  make(map[raft.NodeID]bool),
 		stopCh:            stopCh,
 		requestVoteCh:     requestVoteCh,
 		appendEntriesCh:   appendEntriesCh,
@@ -741,6 +747,42 @@ func (s *Server) HeartbeatsSent() uint64 {
 	return s.heartbeatsSent.Load()
 }
 
+// SetPreVote enables or disables the Pre-Vote algorithm (§9.6).
+func (s *Server) SetPreVote(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preVote = enabled
+}
+
+// PreVote returns whether the Pre-Vote algorithm is enabled.
+func (s *Server) PreVote() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.preVote
+}
+
+// PreVotesReceived returns a copy of recorded pre-votes.
+func (s *Server) PreVotesReceived() map[raft.NodeID]bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make(map[raft.NodeID]bool, len(s.preVotesReceived))
+	for k, v := range s.preVotesReceived {
+		res[k] = v
+	}
+	return res
+}
+
+func (s *Server) hasActiveLeaderLocked() bool {
+	if s.State == raft.Leader {
+		return true
+	}
+	if s.heartbeatsReceived == 0 || s.ElectionTimer == nil {
+		return false
+	}
+	minTimeout, _ := s.ElectionTimer.Range()
+	return s.getClockLocked().Now().Sub(s.lastHeartbeat) < minTimeout
+}
+
 // ResetElectionTimeout resets the election timer with a newly selected
 // randomized duration in [150ms, 300ms]. Returns the new timeout duration.
 // When the event loop is active, the mutation is executed on the single event-loop goroutine.
@@ -826,6 +868,7 @@ func (s *Server) handleHeartbeatDirectLocked(leaderID raft.NodeID, term raft.Ter
 		)
 	}
 
+	s.heartbeatsReceived++
 	s.lastHeartbeat = s.getClockLocked().Now()
 	var newTimeout time.Duration
 	if s.ElectionTimer != nil {
@@ -1715,8 +1758,54 @@ func (s *Server) recordVoteGrantOrDenyLocked(req *raftpb.RequestVoteArgs, curren
 	return true
 }
 
+// processPreVoteLocked evaluates an incoming PreVote RequestVote RPC per Ongaro §9.6.
+// Receivers answer based on what they would do, without changing term or votedFor.
+func (s *Server) processPreVoteLocked(req *raftpb.RequestVoteArgs) *raftpb.RequestVoteReply {
+	var currentTerm uint64
+	if s.PersistentState != nil {
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	s.GetLogger().Debug("received PreVote request",
+		"candidate_id", req.CandidateId,
+		"proposed_term", req.Term,
+		"current_term", currentTerm,
+		"last_log_index", req.LastLogIndex,
+		"last_log_term", req.LastLogTerm,
+	)
+
+	if s.requestVoteFilter != nil && !s.requestVoteFilter(req) {
+		s.votesDenied.Add(1)
+		return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
+	}
+
+	if req.Term < currentTerm || s.hasActiveLeaderLocked() {
+		s.votesDenied.Add(1)
+		return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
+	}
+
+	if !s.isLogUpToDateLocked(req.LastLogIndex, req.LastLogTerm) {
+		s.votesDenied.Add(1)
+		return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
+	}
+
+	if req.Term == currentTerm && s.PersistentState != nil {
+		if s.PersistentState.VotedFor != -1 && s.PersistentState.VotedFor != raft.NodeID(req.CandidateId) {
+			s.votesDenied.Add(1)
+			return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
+		}
+	}
+
+	s.votesGranted.Add(1)
+	return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: true}
+}
+
 // processRequestVote evaluates an incoming RequestVote RPC exactly per Raft paper Figure 2 rules 1-2.
 func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.RequestVoteReply {
+	if req.GetPreVote() {
+		return s.processPreVoteLocked(req)
+	}
+
 	s.GetLogger().Debug("received RequestVote",
 		"candidate_id", req.CandidateId,
 		"term", req.Term,
@@ -1747,7 +1836,7 @@ func (s *Server) applyAppendEntriesRoleAndTimer(req *raftpb.AppendEntriesArgs, c
 		if s.PersistentState != nil {
 			currentTerm = uint64(s.PersistentState.CurrentTerm)
 		}
-	} else if s.State == raft.Candidate {
+	} else if s.State == raft.Candidate || s.State == raft.PreCandidate {
 		s.becomeFollowerLocked(raft.Term(req.Term))
 	} else {
 		s.lastHeartbeat = s.getClockLocked().Now()
@@ -2069,10 +2158,16 @@ func (s *Server) becomeLeaderLocked() {
 // In Raft (§5.2):
 // The node transitions to Candidate, increments currentTerm, votes for itself,
 // and broadcasts RequestVote RPCs in parallel to all peers using goroutines + results channel.
+// With Pre-Vote (§9.6), it transitions to PreCandidate without incrementing term.
 func (s *Server) handleElectionTimeout(t time.Time) {
 	s.GetLogger().Info("election timeout fired", "node_id", int(s.ID), "state", s.State.String(), "time", t)
 
 	if s.State == raft.Leader {
+		return
+	}
+
+	if s.preVote {
+		s.startPreVoteLocked()
 		return
 	}
 
@@ -2087,7 +2182,7 @@ func (s *Server) StartElection() {
 		select {
 		case s.stateActionCh <- stateAction{
 			fn: func() {
-				s.startElectionLocked()
+				s.startElectionOrPreVoteLocked()
 			},
 			resCh: resCh,
 		}:
@@ -2103,7 +2198,149 @@ func (s *Server) StartElection() {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.startElectionOrPreVoteLocked()
+}
+
+func (s *Server) startElectionOrPreVoteLocked() {
+	if s.preVote {
+		s.startPreVoteLocked()
+		return
+	}
 	s.startElectionLocked()
+}
+
+// StartPreVote explicitly initiates a pre-vote round (§9.6).
+func (s *Server) StartPreVote() {
+	if s.loopRunning.Load() {
+		resCh := make(chan struct{}, 1)
+		select {
+		case s.stateActionCh <- stateAction{
+			fn: func() {
+				s.startPreVoteLocked()
+			},
+			resCh: resCh,
+		}:
+		case <-s.stopCh:
+			return
+		}
+		select {
+		case <-resCh:
+		case <-s.stopCh:
+		}
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startPreVoteLocked()
+}
+
+// startPreVoteLocked begins a speculative Pre-Vote round (§9.6):
+// 1. Transitions to PreCandidate without incrementing term or changing votedFor
+// 2. Broadcasts PreVote RPCs to all peers for proposed term currentTerm + 1
+func (s *Server) startPreVoteLocked() {
+	s.becomePreCandidateLocked()
+	s.broadcastPreVotesLocked()
+}
+
+func (s *Server) becomePreCandidateLocked() {
+	oldRole := s.State
+	s.State = raft.PreCandidate
+	s.stopHeartbeatTickerLocked()
+
+	if s.ElectionTimer != nil {
+		s.ElectionTimer.Reset()
+	}
+
+	s.preVotesReceived = make(map[raft.NodeID]bool)
+	s.preVotesReceived[s.ID] = true
+
+	var curTerm uint64
+	if s.PersistentState != nil {
+		curTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+
+	s.recordEventLocked(EventStateTransition, fmt.Sprintf("transitioned to PreCandidate for speculative term %d", curTerm+1), map[string]interface{}{
+		"previous_state":   oldRole.String(),
+		"current_term":     curTerm,
+		"speculative_term": curTerm + 1,
+	})
+
+	s.GetLogger().Info("transitioned to PreCandidate (started pre-vote phase)",
+		"node_id", int(s.ID),
+		"previous_state", oldRole.String(),
+		"current_term", curTerm,
+		"speculative_term", curTerm + 1,
+		"pre_votes_count", 1,
+	)
+
+	totalNodes := len(s.Peers) + 1
+	majority := (totalNodes / 2) + 1
+	if len(s.preVotesReceived) >= majority {
+		s.startElectionLocked()
+	}
+}
+
+func (s *Server) broadcastPreVotesLocked() {
+	if s.State != raft.PreCandidate || len(s.Peers) == 0 {
+		return
+	}
+
+	var currentTerm uint64
+	if s.PersistentState != nil {
+		currentTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+	proposedTerm := raft.Term(currentTerm + 1)
+	lastLogIndex, lastLogTerm := s.lastLogInfoLocked()
+	timeout := s.RPCTimeout()
+	id := s.ID
+
+	s.GetLogger().Info("broadcasting PreVote RPCs in parallel to all peers",
+		"node_id", int(id),
+		"proposed_term", uint64(proposedTerm),
+		"peers_count", len(s.Peers),
+		"timeout_ms", timeout.Milliseconds(),
+	)
+
+	for _, peer := range s.Peers {
+		if peer.ID != id {
+			go s.sendPreVoteRequestToPeer(peer, proposedTerm, lastLogIndex, lastLogTerm, timeout)
+		}
+	}
+}
+
+func (s *Server) sendPreVoteRequestToPeer(peer Peer, proposedTerm raft.Term, lastLogIndex raft.LogIndex, lastLogTerm raft.Term, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	stopDone := make(chan struct{})
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-stopDone:
+		}
+	}()
+	defer close(stopDone)
+
+	reply, err := s.SendRequestVote(ctx, peer, &raft.RequestVoteArgs{
+		Term:         proposedTerm,
+		CandidateID:  s.ID,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+		PreVote:      true,
+	})
+
+	select {
+	case s.voteResultCh <- RequestVoteResult{
+		PeerID:       peer.ID,
+		ElectionTerm: proposedTerm,
+		PreVote:      true,
+		Reply:        reply,
+		Err:          err,
+	}:
+	case <-s.stopCh:
+	}
 }
 
 // StartElectionInTerm forces the server to begin an election in a specific term (test hook).
@@ -2354,6 +2591,11 @@ func (s *Server) handleVoteResultLocked(res RequestVoteResult) {
 		return
 	}
 
+	if res.PreVote {
+		s.handlePreVoteResultLocked(res, currentTerm)
+		return
+	}
+
 	if res.Reply.Term != raft.Term(currentTerm) || res.ElectionTerm != raft.Term(currentTerm) || s.State != raft.Candidate {
 		s.GetLogger().Debug("ignored stale or mismatched RequestVote reply",
 			"node_id", int(s.ID),
@@ -2375,6 +2617,34 @@ func (s *Server) handleVoteResultLocked(res RequestVoteResult) {
 			"term", currentTerm,
 			"reply_term", res.Reply.Term,
 		)
+	}
+}
+
+func (s *Server) handlePreVoteResultLocked(res RequestVoteResult, currentTerm uint64) {
+	if s.State != raft.PreCandidate {
+		return
+	}
+	expectedTerm := raft.Term(currentTerm + 1)
+	if res.ElectionTerm != expectedTerm || !res.Reply.VoteGranted {
+		return
+	}
+
+	if s.preVotesReceived == nil {
+		s.preVotesReceived = make(map[raft.NodeID]bool)
+		s.preVotesReceived[s.ID] = true
+	}
+	s.preVotesReceived[res.PeerID] = true
+
+	totalNodes := len(s.Peers) + 1
+	majority := (totalNodes / 2) + 1
+	if len(s.preVotesReceived) >= majority {
+		s.GetLogger().Info("achieved majority pre-votes; initiating real election (§9.6)",
+			"node_id", int(s.ID),
+			"speculative_term", currentTerm+1,
+			"pre_votes_count", len(s.preVotesReceived),
+			"majority", majority,
+		)
+		s.startElectionLocked()
 	}
 }
 

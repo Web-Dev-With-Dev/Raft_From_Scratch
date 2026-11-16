@@ -70,6 +70,7 @@ const (
 	Follower RaftState = iota
 	Candidate
 	Leader
+	PreCandidate
 )
 
 func (s RaftState) String() string {
@@ -80,6 +81,8 @@ func (s RaftState) String() string {
 		return "Candidate"
 	case Leader:
 		return "Leader"
+	case PreCandidate:
+		return "PreCandidate"
 	default:
 		return "Unknown"
 	}
@@ -90,6 +93,7 @@ type RequestVoteArgs struct {
 	CandidateID  NodeID   `json:"candidate_id"`
 	LastLogIndex LogIndex `json:"last_log_index"`
 	LastLogTerm  Term     `json:"last_log_term"`
+	PreVote      bool     `json:"pre_vote"`
 }
 
 type RequestVoteReply struct {

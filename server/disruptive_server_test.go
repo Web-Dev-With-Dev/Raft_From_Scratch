@@ -7,7 +7,7 @@ import (
 	"raft/raft"
 )
 
-func setupDisruptiveCluster(t *testing.T) (*Cluster, *Server, raft.Term) {
+func setupDisruptiveCluster(t *testing.T, preVote bool) (*Cluster, *Server, raft.Term) {
 	t.Helper()
 	minTimeout, maxTimeout := 100*time.Millisecond, 200*time.Millisecond
 	clk := raft.NewFakeClock()
@@ -21,6 +21,7 @@ func setupDisruptiveCluster(t *testing.T) (*Cluster, *Server, raft.Term) {
 		WithElectionTimeout(minTimeout, maxTimeout),
 		WithHeartbeatInterval(20*time.Millisecond),
 		WithRPCTimeout(40*time.Millisecond),
+		WithPreVote(preVote),
 	)
 
 	cluster.GetNode(1).StartElection()
@@ -32,28 +33,23 @@ func setupDisruptiveCluster(t *testing.T) (*Cluster, *Server, raft.Term) {
 	return cluster, leader, initialTerm
 }
 
-func isolateAndInflateFollower(t *testing.T, cluster *Cluster, isolatedID raft.NodeID, initialTerm raft.Term) raft.Term {
-	t.Helper()
+// TestDisruptiveServer_Regression verifies the disruptive server problem (§4.2.3, §9.6):
+// 1. Follower times out repeatedly during partition. With Pre-Vote (§9.6), it cannot gather
+//    majority pre-votes and does NOT inflate its term.
+// 2. Partition heals; healthy leader maintaining active quorum is NOT forced to step down.
+func TestDisruptiveServer_Regression(t *testing.T) {
+	cluster, leader, initialTerm := setupDisruptiveCluster(t, true)
+	isolatedID := raft.NodeID(3)
+
 	cluster.Partition([]raft.NodeID{1, 2}, []raft.NodeID{isolatedID})
 	cluster.Advance(600 * time.Millisecond)
 
 	isolatedNode := cluster.GetNode(isolatedID)
 	isolatedTerm := isolatedNode.Status().Term
-	if isolatedTerm <= initialTerm+1 {
-		t.Fatalf("expected isolated follower to inflate term above %d, got %d", initialTerm+1, isolatedTerm)
+	if isolatedTerm != initialTerm {
+		t.Fatalf("expected isolated follower term NOT to inflate with Pre-Vote, got %d, want %d",
+			isolatedTerm, initialTerm)
 	}
-	return isolatedTerm
-}
-
-// TestDisruptiveServer_Regression verifies the disruptive server problem (§4.2.3, §9.6):
-// 1. Follower times out repeatedly during partition and inflates term.
-// 2. Partition heals; higher term forces the healthy leader to step down.
-// 3. Fails now in standard Raft; will pass later with Pre-Vote.
-func TestDisruptiveServer_Regression(t *testing.T) {
-	cluster, leader, initialTerm := setupDisruptiveCluster(t)
-	isolatedID := raft.NodeID(3)
-
-	isolatedTerm := isolateAndInflateFollower(t, cluster, isolatedID, initialTerm)
 
 	if leader.GetState() != raft.Leader || leader.Status().Term != initialTerm {
 		t.Fatalf("expected Node 1 to remain leader in term %d before heal, got %s term %d",
@@ -63,16 +59,41 @@ func TestDisruptiveServer_Regression(t *testing.T) {
 	cluster.Heal()
 	cluster.Advance(100 * time.Millisecond)
 
-	t.Logf("DISRUPTIVE SERVER TRACE: isolated follower %d inflated term to %d (initial term: %d)",
-		isolatedID, isolatedTerm, initialTerm)
+	t.Logf("DISRUPTIVE SERVER TRACE: isolated follower %d term after heal: %d (initial term: %d)",
+		isolatedID, isolatedNode.Status().Term, initialTerm)
 	t.Logf("DISRUPTIVE SERVER TRACE: healthy leader %d state after heal: %s (term: %d)",
 		leader.ID, leader.GetState(), leader.Status().Term)
 
-	// REGRESSION INVARIANT ('disruptive server'):
-	// Healthy leader maintaining active quorum must NOT be forced to step down by an isolated node.
-	// FAILS NOW (standard Raft steps down); PASSES LATER (Pre-Vote prevents term inflation).
+	// Invariant: Healthy leader maintaining active quorum must NOT be forced to step down by an isolated node.
 	if leader.GetState() != raft.Leader {
-		t.Fatalf("REGRESSION ('disruptive server'): healthy leader Node %d was forced to step down to %s by isolated follower Node %d with inflated term %d; expected leader to remain Leader (Pre-Vote required)",
-			leader.ID, leader.GetState(), isolatedID, isolatedTerm)
+		t.Fatalf("REGRESSION ('disruptive server'): healthy leader Node %d stepped down to %s; expected to remain Leader",
+			leader.ID, leader.GetState())
+	}
+	if leader.Status().Term != initialTerm {
+		t.Fatalf("expected leader term to remain %d, got %d", initialTerm, leader.Status().Term)
+	}
+}
+
+// TestDisruptiveServer_WithoutPreVote_StepsDown verifies why standard Raft Figure 2 suffers from
+// the disruptive server vulnerability when Pre-Vote is not active.
+func TestDisruptiveServer_WithoutPreVote_StepsDown(t *testing.T) {
+	cluster, leader, initialTerm := setupDisruptiveCluster(t, false)
+	isolatedID := raft.NodeID(3)
+
+	cluster.Partition([]raft.NodeID{1, 2}, []raft.NodeID{isolatedID})
+	cluster.Advance(600 * time.Millisecond)
+
+	isolatedNode := cluster.GetNode(isolatedID)
+	isolatedTerm := isolatedNode.Status().Term
+	if isolatedTerm <= initialTerm+1 {
+		t.Fatalf("expected isolated follower to inflate term without Pre-Vote, got %d", isolatedTerm)
+	}
+
+	cluster.Heal()
+	cluster.Advance(100 * time.Millisecond)
+
+	// Without Pre-Vote, higher term on isolated node forces healthy leader to step down
+	if leader.GetState() == raft.Leader && leader.Status().Term == initialTerm {
+		t.Fatalf("without Pre-Vote, expected leader to be disrupted by inflated term %d", isolatedTerm)
 	}
 }
