@@ -405,8 +405,12 @@ type clusterOptions struct {
 	heartbeatInterval   time.Duration
 	rpcTimeout          time.Duration
 	checkQuorum         bool
+	hasCheckQuorum      bool
 	checkQuorumInterval time.Duration
 	preVote             bool
+	hasPreVote          bool
+	stickiness          bool
+	hasStickiness       bool
 	autoStart           bool
 	clock               raft.Clock
 	simNetwork          *SimNetwork
@@ -486,6 +490,7 @@ func WithRPCTimeout(timeout time.Duration) ClusterOption {
 func WithCheckQuorum(enabled bool) ClusterOption {
 	return func(o *clusterOptions) {
 		o.checkQuorum = enabled
+		o.hasCheckQuorum = true
 	}
 }
 
@@ -500,7 +505,21 @@ func WithCheckQuorumInterval(interval time.Duration) ClusterOption {
 func WithPreVote(enabled bool) ClusterOption {
 	return func(o *clusterOptions) {
 		o.preVote = enabled
+		o.hasPreVote = true
 	}
+}
+
+// WithStickiness enables or disables leader stickiness / disruptive server protection (§9.6).
+func WithStickiness(enabled bool) ClusterOption {
+	return func(o *clusterOptions) {
+		o.stickiness = enabled
+		o.hasStickiness = true
+	}
+}
+
+// WithLeaderStickiness is an alias for WithStickiness.
+func WithLeaderStickiness(enabled bool) ClusterOption {
+	return WithStickiness(enabled)
 }
 
 // WithAutoStart controls whether event loops are automatically launched.
@@ -551,9 +570,14 @@ func configureServerOptions(srv *Server, options clusterOptions) {
 		if options.checkQuorumInterval > 0 {
 			srv.SetCheckQuorumInterval(options.checkQuorumInterval)
 		}
+	} else if options.hasCheckQuorum {
+		srv.SetCheckQuorum(false)
 	}
-	if options.preVote {
-		srv.SetPreVote(true)
+	if options.hasPreVote {
+		srv.SetPreVote(options.preVote)
+	}
+	if options.hasStickiness {
+		srv.SetStickiness(options.stickiness)
 	}
 }
 
@@ -1074,5 +1098,14 @@ func (c *Cluster) SetPreVote(enabled bool) {
 	defer c.mu.RUnlock()
 	for _, srv := range c.servers {
 		srv.SetPreVote(enabled)
+	}
+}
+
+// SetStickiness enables or disables leader stickiness for all nodes in the cluster.
+func (c *Cluster) SetStickiness(enabled bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, srv := range c.servers {
+		srv.SetStickiness(enabled)
 	}
 }

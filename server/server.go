@@ -157,7 +157,8 @@ type Server struct {
 	// Logger is the structured logger for this node with [Node <ID>] prefix on every line.
 	Logger *slog.Logger `json:"-"`
 
-	lastHeartbeat time.Time
+	lastHeartbeat       time.Time
+	lastLeaderHeartbeat time.Time
 
 	// Concurrency channels for the single event loop goroutine:
 	stopCh            chan struct{}
@@ -213,6 +214,9 @@ type Server struct {
 	// preVote controls (§9.6): candidates gather majority pre-votes before incrementing term
 	preVote          bool
 	preVotesReceived map[raft.NodeID]bool
+
+	// stickiness controls (§9.6): followers reject (pre)votes if heard from current leader within minTimeout
+	stickiness bool
 }
 
 // NewServer creates and initializes a new Raft Server.
@@ -273,6 +277,7 @@ func NewServer(
 		Logger:            nodeLogger,
 		lastHeartbeat:     clk.Now(),
 		heartbeatInterval: raft.DefaultHeartbeatInterval,
+		stickiness:        true,
 		votesReceived:     make(map[raft.NodeID]bool),
 		preVotesReceived:  make(map[raft.NodeID]bool),
 		stopCh:            stopCh,
@@ -793,6 +798,20 @@ func (s *Server) PreVote() bool {
 	return s.preVote
 }
 
+// SetStickiness enables or disables leader stickiness / disruptive server protection (§9.6).
+func (s *Server) SetStickiness(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stickiness = enabled
+}
+
+// Stickiness returns whether leader stickiness (§9.6) is enabled.
+func (s *Server) Stickiness() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.stickiness
+}
+
 // PreVotesReceived returns a copy of recorded pre-votes.
 func (s *Server) PreVotesReceived() map[raft.NodeID]bool {
 	s.mu.RLock()
@@ -805,14 +824,17 @@ func (s *Server) PreVotesReceived() map[raft.NodeID]bool {
 }
 
 func (s *Server) hasActiveLeaderLocked() bool {
+	if !s.stickiness {
+		return false
+	}
 	if s.State != raft.Follower {
 		return false
 	}
-	if s.heartbeatsReceived == 0 || s.ElectionTimer == nil {
+	if s.heartbeatsReceived == 0 || s.ElectionTimer == nil || s.lastLeaderHeartbeat.IsZero() {
 		return false
 	}
 	minTimeout, _ := s.ElectionTimer.Range()
-	return s.getClockLocked().Now().Sub(s.lastHeartbeat) < minTimeout
+	return s.getClockLocked().Now().Sub(s.lastLeaderHeartbeat) < minTimeout
 }
 
 // ResetElectionTimeout resets the election timer with a newly selected
@@ -902,6 +924,7 @@ func (s *Server) handleHeartbeatDirectLocked(leaderID raft.NodeID, term raft.Ter
 
 	s.heartbeatsReceived++
 	s.lastHeartbeat = s.getClockLocked().Now()
+	s.lastLeaderHeartbeat = s.lastHeartbeat
 	var newTimeout time.Duration
 	if s.ElectionTimer != nil {
 		newTimeout = s.ElectionTimer.Reset()
@@ -1757,7 +1780,6 @@ func (s *Server) recordVoteGrantOrDenyLocked(req *raftpb.RequestVoteArgs, curren
 		})
 		if steppedDown {
 			_ = s.persistLocked()
-			s.lastHeartbeat = s.getClockLocked().Now()
 			if s.ElectionTimer != nil {
 				s.ElectionTimer.Reset()
 			}
@@ -1893,16 +1915,18 @@ func (s *Server) applyAppendEntriesRoleAndTimer(req *raftpb.AppendEntriesArgs, c
 		}
 	} else if s.State == raft.Candidate || s.State == raft.PreCandidate {
 		s.becomeFollowerLocked(raft.Term(req.Term))
-	} else {
-		s.lastHeartbeat = s.getClockLocked().Now()
-		if s.ElectionTimer != nil {
-			newTimeout := s.ElectionTimer.Reset()
-			s.GetLogger().Debug("reset election timer on valid heartbeat/AppendEntries",
-				"leader_id", req.LeaderId,
-				"term", req.Term,
-				"timeout_ms", newTimeout.Milliseconds(),
-			)
-		}
+	}
+
+	now := s.getClockLocked().Now()
+	s.lastHeartbeat = now
+	s.lastLeaderHeartbeat = now
+	if s.ElectionTimer != nil {
+		newTimeout := s.ElectionTimer.Reset()
+		s.GetLogger().Debug("reset election timer on valid heartbeat/AppendEntries",
+			"leader_id", req.LeaderId,
+			"term", req.Term,
+			"timeout_ms", newTimeout.Milliseconds(),
+		)
 	}
 
 	if len(req.Entries) == 0 {
@@ -2010,7 +2034,6 @@ func (s *Server) becomeFollowerLocked(term raft.Term) {
 
 	s.stopHeartbeatTickerLocked()
 
-	s.lastHeartbeat = s.getClockLocked().Now()
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.Reset()
 	}

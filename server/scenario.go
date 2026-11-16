@@ -122,12 +122,66 @@ func CheckLeaderInvariant(cluster *Cluster, termLeaderHistory map[raft.Term]raft
 	return nil
 }
 
+// FeatureConfig configures the 3 Raft election and safety extensions.
+type FeatureConfig struct {
+	PreVote     bool
+	Stickiness  bool
+	CheckQuorum bool
+}
+
+// DefaultFeatureConfig defines safe production defaults (§6.2, §9.6):
+// - PreVote=true: prevents term inflation and unnecessary election disruption
+// - Stickiness=true: prevents stale nodes from deposing healthy leaders
+// - CheckQuorum=true: ensures partitioned leaders step down promptly
+var DefaultFeatureConfig = FeatureConfig{
+	PreVote:     true,
+	Stickiness:  true,
+	CheckQuorum: true,
+}
+
+// AllFeatureCombinations returns all 8 combinations of (PreVote, Stickiness, CheckQuorum).
+func AllFeatureCombinations() []FeatureConfig {
+	combs := make([]FeatureConfig, 0, 8)
+	for _, pv := range []bool{false, true} {
+		for _, st := range []bool{false, true} {
+			for _, cq := range []bool{false, true} {
+				combs = append(combs, FeatureConfig{
+					PreVote:     pv,
+					Stickiness:  st,
+					CheckQuorum: cq,
+				})
+			}
+		}
+	}
+	return combs
+}
+
+func (fc FeatureConfig) String() string {
+	return fmt.Sprintf("PreVote=%t,Stickiness=%t,CheckQuorum=%t", fc.PreVote, fc.Stickiness, fc.CheckQuorum)
+}
+
+func (fc FeatureConfig) ClusterOptions() []ClusterOption {
+	opts := []ClusterOption{
+		WithPreVote(fc.PreVote),
+		WithStickiness(fc.Stickiness),
+		WithCheckQuorum(fc.CheckQuorum),
+	}
+	if fc.CheckQuorum {
+		opts = append(opts, WithCheckQuorumInterval(100*time.Millisecond))
+	}
+	return opts
+}
+
 func newSimCluster(seed int64, n int) (*Cluster, *raft.FakeClock) {
+	return newSimClusterWithFeatures(seed, n, DefaultFeatureConfig)
+}
+
+func newSimClusterWithFeatures(seed int64, n int, fc FeatureConfig) (*Cluster, *raft.FakeClock) {
 	clk := raft.NewFakeClock()
 	simNet := NewSimNetwork(seed)
 	simNet.SetClock(clk)
 
-	cluster := NewCluster(nil, n,
+	opts := []ClusterOption{
 		WithClock(clk),
 		WithSimNetwork(simNet),
 		WithRandSeed(seed),
@@ -136,7 +190,10 @@ func newSimCluster(seed int64, n int) (*Cluster, *raft.FakeClock) {
 		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
 		WithHeartbeatInterval(20*time.Millisecond),
 		WithRPCTimeout(40*time.Millisecond),
-	)
+	}
+	opts = append(opts, fc.ClusterOptions()...)
+
+	cluster := NewCluster(nil, n, opts...)
 	return cluster, clk
 }
 
@@ -173,9 +230,9 @@ func verifyStability(clk *raft.FakeClock, cluster *Cluster, steps int, hist map[
 	return nil
 }
 
-// RunBasicElectionScenario runs a 3-node election under FakeClock + SimNetwork driven by seed.
-func RunBasicElectionScenario(ctx context.Context, seed int64) (*Cluster, error) {
-	cluster, clk := newSimCluster(seed, 3)
+// RunBasicElectionScenarioWithFeatures runs a 3-node election under FakeClock + SimNetwork driven by seed and features.
+func RunBasicElectionScenarioWithFeatures(ctx context.Context, seed int64, fc FeatureConfig) (*Cluster, error) {
+	cluster, clk := newSimClusterWithFeatures(seed, 3, fc)
 	termHistory := make(map[raft.Term]raft.NodeID)
 
 	leader, err := advanceUntilLeader(ctx, clk, cluster, 4*time.Second, termHistory)
@@ -191,9 +248,14 @@ func RunBasicElectionScenario(ctx context.Context, seed int64) (*Cluster, error)
 	return cluster, nil
 }
 
-// RunCrashScenario runs leader election, crashes the leader, and asserts a surviving node becomes leader.
-func RunCrashScenario(ctx context.Context, seed int64) (*Cluster, error) {
-	cluster, err := RunBasicElectionScenario(ctx, seed)
+// RunBasicElectionScenario runs a 3-node election under safe defaults.
+func RunBasicElectionScenario(ctx context.Context, seed int64) (*Cluster, error) {
+	return RunBasicElectionScenarioWithFeatures(ctx, seed, DefaultFeatureConfig)
+}
+
+// RunCrashScenarioWithFeatures runs leader election, crashes leader, and asserts surviving node becomes leader under features.
+func RunCrashScenarioWithFeatures(ctx context.Context, seed int64, fc FeatureConfig) (*Cluster, error) {
+	cluster, err := RunBasicElectionScenarioWithFeatures(ctx, seed, fc)
 	if err != nil {
 		return cluster, fmt.Errorf("initial election failed: %w", err)
 	}
@@ -223,13 +285,18 @@ func RunCrashScenario(ctx context.Context, seed int64) (*Cluster, error) {
 	return cluster, fmt.Errorf("no new leader elected after crashing node %d", leader.ID)
 }
 
-// RunPartitionScenario runs an election, partitions into minority/majority, and verifies failover.
-func RunPartitionScenario(ctx context.Context, seed int64) (*Cluster, error) {
+// RunCrashScenario runs leader election, crashes the leader, and asserts a surviving node becomes leader.
+func RunCrashScenario(ctx context.Context, seed int64) (*Cluster, error) {
+	return RunCrashScenarioWithFeatures(ctx, seed, DefaultFeatureConfig)
+}
+
+// RunPartitionScenarioWithFeatures runs an election, partitions into minority/majority, verifies failover, heals, and verifies stability under features.
+func RunPartitionScenarioWithFeatures(ctx context.Context, seed int64, fc FeatureConfig) (*Cluster, error) {
 	clk := raft.NewFakeClock()
 	simNet := NewSimNetwork(seed)
 	simNet.SetClock(clk)
 
-	cluster := NewCluster(nil, 5,
+	opts := []ClusterOption{
 		WithClock(clk),
 		WithSimNetwork(simNet),
 		WithRandSeed(seed),
@@ -238,9 +305,10 @@ func RunPartitionScenario(ctx context.Context, seed int64) (*Cluster, error) {
 		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
 		WithHeartbeatInterval(20*time.Millisecond),
 		WithRPCTimeout(40*time.Millisecond),
-		WithCheckQuorum(true),
-		WithCheckQuorumInterval(100*time.Millisecond),
-	)
+	}
+	opts = append(opts, fc.ClusterOptions()...)
+
+	cluster := NewCluster(nil, 5, opts...)
 
 	termHistory := make(map[raft.Term]raft.NodeID)
 	leader, err := advanceUntilLeader(ctx, clk, cluster, 4*time.Second, termHistory)
@@ -253,17 +321,35 @@ func RunPartitionScenario(ctx context.Context, seed int64) (*Cluster, error) {
 	cluster.Partition(minority, majority)
 
 	step := 5 * time.Millisecond
+	newLeaderElected := false
 	for elapsed := time.Duration(0); elapsed < 4*time.Second; elapsed += step {
 		for _, id := range majority {
 			node := cluster.GetNode(id)
 			if node.GetState() == raft.Leader && node.Status().Term > initialTerm {
-				cluster.Heal()
-				return cluster, nil
+				newLeaderElected = true
+				break
 			}
+		}
+		if newLeaderElected {
+			break
 		}
 		advanceClockStep(clk, step)
 	}
-	return cluster, fmt.Errorf("majority partition failed to elect new leader")
+	if !newLeaderElected {
+		return cluster, fmt.Errorf("majority partition failed to elect new leader")
+	}
+
+	// Heal partition and assert cluster stabilizes on a leader without deadlock
+	cluster.Heal()
+	if _, err := advanceUntilLeader(ctx, clk, cluster, 4*time.Second, termHistory); err != nil {
+		return cluster, fmt.Errorf("cluster failed to stabilize after partition heal (%s): %w", fc, err)
+	}
+	return cluster, nil
+}
+
+// RunPartitionScenario runs an election, partitions into minority/majority, and verifies failover under safe defaults.
+func RunPartitionScenario(ctx context.Context, seed int64) (*Cluster, error) {
+	return RunPartitionScenarioWithFeatures(ctx, seed, DefaultFeatureConfig)
 }
 
 func partitionMinorityMajority(cluster *Cluster, leader *Server) ([]raft.NodeID, []raft.NodeID) {
@@ -324,14 +410,13 @@ func verifyElectionRestriction(cluster *Cluster, leader *Server) error {
 	return nil
 }
 
-// RunVariedLogsElectionScenario runs an election on a cluster seeded with varied log lengths and terms.
-// It verifies Raft election safety (§5.2) and election restriction (§5.4.1).
-func RunVariedLogsElectionScenario(ctx context.Context, seed int64) (*Cluster, error) {
+// RunVariedLogsElectionScenarioWithFeatures runs varied logs election scenario under specific feature configuration.
+func RunVariedLogsElectionScenarioWithFeatures(ctx context.Context, seed int64, fc FeatureConfig) (*Cluster, error) {
 	clk := raft.NewFakeClock()
 	simNet := NewSimNetwork(seed)
 	simNet.SetClock(clk)
 
-	cluster := NewCluster(nil, 3,
+	opts := []ClusterOption{
 		WithClock(clk),
 		WithSimNetwork(simNet),
 		WithRandSeed(seed),
@@ -341,7 +426,10 @@ func RunVariedLogsElectionScenario(ctx context.Context, seed int64) (*Cluster, e
 		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
 		WithHeartbeatInterval(20*time.Millisecond),
 		WithRPCTimeout(40*time.Millisecond),
-	)
+	}
+	opts = append(opts, fc.ClusterOptions()...)
+
+	cluster := NewCluster(nil, 3, opts...)
 
 	SeedTestLogs(cluster, seed)
 	cluster.Start()
@@ -358,6 +446,12 @@ func RunVariedLogsElectionScenario(ctx context.Context, seed int64) (*Cluster, e
 		return cluster, err
 	}
 	return cluster, nil
+}
+
+// RunVariedLogsElectionScenario runs an election on a cluster seeded with varied log lengths and terms.
+// It verifies Raft election safety (§5.2) and election restriction (§5.4.1).
+func RunVariedLogsElectionScenario(ctx context.Context, seed int64) (*Cluster, error) {
+	return RunVariedLogsElectionScenarioWithFeatures(ctx, seed, DefaultFeatureConfig)
 }
 
 func verifyVotedForInvariantAcrossNodes(cluster *Cluster) error {
@@ -394,9 +488,8 @@ func extractCandidateIDFromEvent(ev Event) int64 {
 	return -1
 }
 
-// RunDuplicationReorderScenario runs an election simulation under 30% message duplication
-// and heavy network reordering, asserting election safety (§5.2) and the votedFor invariant.
-func RunDuplicationReorderScenario(ctx context.Context, seed int64) (*Cluster, error) {
+// RunDuplicationReorderScenarioWithFeatures runs an election simulation under message duplication and reordering with custom features.
+func RunDuplicationReorderScenarioWithFeatures(ctx context.Context, seed int64, fc FeatureConfig) (*Cluster, error) {
 	clk := raft.NewFakeClock()
 	simNet := NewSimNetwork(seed)
 	simNet.SetClock(clk)
@@ -405,7 +498,7 @@ func RunDuplicationReorderScenario(ctx context.Context, seed int64) (*Cluster, e
 	simNet.SetDelayRange(5*time.Millisecond, 25*time.Millisecond)
 	simNet.SetReorderDelayRange(20*time.Millisecond, 70*time.Millisecond)
 
-	cluster := NewCluster(nil, 3,
+	opts := []ClusterOption{
 		WithClock(clk),
 		WithSimNetwork(simNet),
 		WithRandSeed(seed),
@@ -414,7 +507,10 @@ func RunDuplicationReorderScenario(ctx context.Context, seed int64) (*Cluster, e
 		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
 		WithHeartbeatInterval(20*time.Millisecond),
 		WithRPCTimeout(40*time.Millisecond),
-	)
+	}
+	opts = append(opts, fc.ClusterOptions()...)
+
+	cluster := NewCluster(nil, 3, opts...)
 
 	termHistory := make(map[raft.Term]raft.NodeID)
 	leader, err := advanceUntilLeader(ctx, clk, cluster, 4*time.Second, termHistory)
@@ -433,6 +529,12 @@ func RunDuplicationReorderScenario(ctx context.Context, seed int64) (*Cluster, e
 	return cluster, nil
 }
 
+// RunDuplicationReorderScenario runs an election simulation under 30% message duplication
+// and heavy network reordering, asserting election safety (§5.2) and the votedFor invariant.
+func RunDuplicationReorderScenario(ctx context.Context, seed int64) (*Cluster, error) {
+	return RunDuplicationReorderScenarioWithFeatures(ctx, seed, DefaultFeatureConfig)
+}
+
 // Scenarios maps scenario names to their execution functions.
 var Scenarios = map[string]func(ctx context.Context, seed int64) (*Cluster, error){
 	"election":    RunBasicElectionScenario,
@@ -440,6 +542,39 @@ var Scenarios = map[string]func(ctx context.Context, seed int64) (*Cluster, erro
 	"partition":   RunPartitionScenario,
 	"varied_logs": RunVariedLogsElectionScenario,
 	"duplication": RunDuplicationReorderScenario,
+}
+
+// ScenariosWithFeatures maps scenario names to their execution functions with custom FeatureConfig.
+var ScenariosWithFeatures = map[string]func(ctx context.Context, seed int64, fc FeatureConfig) (*Cluster, error){
+	"election":    RunBasicElectionScenarioWithFeatures,
+	"crash":       RunCrashScenarioWithFeatures,
+	"partition":   RunPartitionScenarioWithFeatures,
+	"varied_logs": RunVariedLogsElectionScenarioWithFeatures,
+	"duplication": RunDuplicationReorderScenarioWithFeatures,
+}
+
+// RunScenarioWithFeatures executes a scenario by name with the given seed and feature configuration.
+func RunScenarioWithFeatures(ctx context.Context, name string, seed int64, fc FeatureConfig, traceDir string) (*ScenarioTrace, error) {
+	fn, ok := ScenariosWithFeatures[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown scenario %q", name)
+	}
+
+	start := time.Now()
+	cluster, runErr := fn(ctx, seed, fc)
+	dur := time.Since(start)
+
+	trace := buildTrace(cluster, name, seed, dur, runErr)
+	if cluster != nil {
+		cluster.Stop()
+	}
+
+	if runErr != nil && traceDir != "" {
+		if path, err := trace.Save(traceDir); err == nil {
+			trace.ReplayCmd = fmt.Sprintf("go run ./cmd/simrunner -scenario %s -seed %d (trace: %s)", name, seed, path)
+		}
+	}
+	return trace, runErr
 }
 
 // RunScenario executes a scenario by name with the given seed, returning the trace and any error.
