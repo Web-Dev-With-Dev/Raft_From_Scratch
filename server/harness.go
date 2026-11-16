@@ -386,13 +386,15 @@ func (c *inMemoryPeerClient) AppendEntries(ctx context.Context, in *raftpb.Appen
 
 // Cluster manages a group of N in-process Raft nodes interconnected by an in-memory Network.
 type Cluster struct {
-	t          testing.TB
-	Network    *Network
-	SimNetwork *SimNetwork
-	servers    map[raft.NodeID]*Server
-	nodeIDs    []raft.NodeID
-	options    clusterOptions
-	mu         sync.RWMutex
+	t             testing.TB
+	Network       *Network
+	SimNetwork    *SimNetwork
+	servers       map[raft.NodeID]*Server
+	nodeIDs       []raft.NodeID
+	options       clusterOptions
+	globalChecker *GlobalChecker
+	checkerErr    error
+	mu            sync.RWMutex
 }
 
 type clusterOptions struct {
@@ -407,6 +409,7 @@ type clusterOptions struct {
 	simNetwork          *SimNetwork
 	randSeed            int64
 	quiet               bool
+	globalChecker       *GlobalChecker
 }
 
 // ClusterOption configures test cluster parameters.
@@ -430,6 +433,20 @@ func WithRandSeed(seed int64) ClusterOption {
 func WithSimNetwork(simNet *SimNetwork) ClusterOption {
 	return func(o *clusterOptions) {
 		o.simNetwork = simNet
+	}
+}
+
+// WithGlobalChecker attaches an invariant GlobalChecker to run after every simulated step.
+func WithGlobalChecker(gc *GlobalChecker) ClusterOption {
+	return func(o *clusterOptions) {
+		o.globalChecker = gc
+	}
+}
+
+// WithDefaultGlobalChecker creates and attaches an invariant GlobalChecker.
+func WithDefaultGlobalChecker() ClusterOption {
+	return func(o *clusterOptions) {
+		o.globalChecker = NewGlobalChecker()
 	}
 }
 
@@ -621,12 +638,13 @@ func NewCluster(t testing.TB, n int, opts ...ClusterOption) *Cluster {
 	servers := initClusterNodes(net, options.simNetwork, nodeIDs, options)
 
 	c := &Cluster{
-		t:          t,
-		Network:    net,
-		SimNetwork: options.simNetwork,
-		servers:    servers,
-		nodeIDs:    nodeIDs,
-		options:    options,
+		t:             t,
+		Network:       net,
+		SimNetwork:    options.simNetwork,
+		servers:       servers,
+		nodeIDs:       nodeIDs,
+		options:       options,
+		globalChecker: options.globalChecker,
 	}
 
 	if t != nil {
@@ -676,6 +694,67 @@ func (c *Cluster) Nodes() []*Server {
 		list = append(list, c.servers[id])
 	}
 	return list
+}
+
+// NodeStatuses returns current status snapshots of all cluster servers in ID order.
+func (c *Cluster) NodeStatuses() []NodeStatus {
+	nodes := c.Nodes()
+	res := make([]NodeStatus, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil {
+			res = append(res, n.Status())
+		}
+	}
+	return res
+}
+
+// GlobalChecker returns the attached GlobalChecker, or nil.
+func (c *Cluster) GlobalChecker() *GlobalChecker {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.globalChecker
+}
+
+// SetGlobalChecker attaches or replaces the GlobalChecker.
+func (c *Cluster) SetGlobalChecker(gc *GlobalChecker) {
+	c.mu.Lock()
+	c.globalChecker = gc
+	c.mu.Unlock()
+}
+
+// EnableGlobalChecker initializes and returns a GlobalChecker if none is attached.
+func (c *Cluster) EnableGlobalChecker() *GlobalChecker {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.globalChecker == nil {
+		c.globalChecker = NewGlobalChecker()
+	}
+	return c.globalChecker
+}
+
+// CheckerError returns the last error recorded by the global checker.
+func (c *Cluster) CheckerError() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.checkerErr
+}
+
+func (c *Cluster) runGlobalChecker() {
+	c.mu.RLock()
+	checker := c.globalChecker
+	t := c.t
+	c.mu.RUnlock()
+	if checker == nil {
+		return
+	}
+	if err := checker.Check(c); err != nil {
+		c.mu.Lock()
+		c.checkerErr = err
+		c.mu.Unlock()
+		if t != nil {
+			t.Fatalf("global checker invariant failure: %v", err)
+		}
+	}
 }
 
 // NodeIDs returns a copy of all node IDs in the cluster.
@@ -837,22 +916,32 @@ func (c *Cluster) FakeClock() *raft.FakeClock {
 	return nil
 }
 
-// Advance advances the cluster's fake clock by duration d and yields to event loops.
+// Advance advances the cluster's fake clock by duration d in steps and checks invariants.
 func (c *Cluster) Advance(d time.Duration) time.Time {
 	fc := c.FakeClock()
 	if fc == nil {
 		return time.Now()
 	}
-	now := fc.Advance(d)
-	for i := 0; i < 5; i++ {
-		runtime.Gosched()
+	step := 5 * time.Millisecond
+	for rem := d; rem > 0; {
+		cur := rem
+		if cur > step {
+			cur = step
+		}
+		fc.Advance(cur)
+		rem -= cur
+		for i := 0; i < 5; i++ {
+			runtime.Gosched()
+		}
+		c.runGlobalChecker()
 	}
-	return now
+	return fc.Now()
 }
 
-// AdvanceUntil advances the cluster's fake clock until condition returns true or budget is exhausted.
+// AdvanceUntil advances the fake clock until condition returns true, checking invariants after each step.
 func (c *Cluster) AdvanceUntil(budget time.Duration, condition func() bool) bool {
 	if condition() {
+		c.runGlobalChecker()
 		return true
 	}
 	fc := c.FakeClock()
@@ -867,11 +956,17 @@ func (c *Cluster) AdvanceUntil(budget time.Duration, condition func() bool) bool
 		elapsed += step
 		for i := 0; i < 5; i++ {
 			if condition() {
+				c.runGlobalChecker()
 				return true
 			}
 			runtime.Gosched()
 		}
+		c.runGlobalChecker()
+		if c.CheckerError() != nil {
+			return false
+		}
 	}
+	c.runGlobalChecker()
 	return condition()
 }
 

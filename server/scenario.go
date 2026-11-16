@@ -96,6 +96,11 @@ func buildTrace(cluster *Cluster, scenario string, seed int64, dur time.Duration
 
 // CheckLeaderInvariant verifies Raft Election Safety (§5.2): at most one leader per term across all nodes.
 func CheckLeaderInvariant(cluster *Cluster, termLeaderHistory map[raft.Term]raft.NodeID) error {
+	if cluster != nil && cluster.GlobalChecker() != nil {
+		if err := cluster.GlobalChecker().Check(cluster); err != nil {
+			return err
+		}
+	}
 	leaders := cluster.Leaders()
 	for i := 0; i < len(leaders); i++ {
 		for j := i + 1; j < len(leaders); j++ {
@@ -126,6 +131,7 @@ func newSimCluster(seed int64, n int) (*Cluster, *raft.FakeClock) {
 		WithClock(clk),
 		WithSimNetwork(simNet),
 		WithRandSeed(seed),
+		WithDefaultGlobalChecker(),
 		WithQuiet(true),
 		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
 		WithHeartbeatInterval(20*time.Millisecond),
@@ -227,6 +233,7 @@ func RunPartitionScenario(ctx context.Context, seed int64) (*Cluster, error) {
 		WithClock(clk),
 		WithSimNetwork(simNet),
 		WithRandSeed(seed),
+		WithDefaultGlobalChecker(),
 		WithQuiet(true),
 		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
 		WithHeartbeatInterval(20*time.Millisecond),
@@ -328,6 +335,7 @@ func RunVariedLogsElectionScenario(ctx context.Context, seed int64) (*Cluster, e
 		WithClock(clk),
 		WithSimNetwork(simNet),
 		WithRandSeed(seed),
+		WithDefaultGlobalChecker(),
 		WithQuiet(true),
 		WithAutoStart(false),
 		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
@@ -401,6 +409,7 @@ func RunDuplicationReorderScenario(ctx context.Context, seed int64) (*Cluster, e
 		WithClock(clk),
 		WithSimNetwork(simNet),
 		WithRandSeed(seed),
+		WithDefaultGlobalChecker(),
 		WithQuiet(true),
 		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
 		WithHeartbeatInterval(20*time.Millisecond),

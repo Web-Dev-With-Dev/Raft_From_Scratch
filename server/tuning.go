@@ -59,6 +59,7 @@ func runSingleTuningRun(cfg TuningConfig, seed int64) seedMeasurement {
 		WithClock(clk),
 		WithSimNetwork(simNet),
 		WithRandSeed(seed),
+		WithDefaultGlobalChecker(),
 		WithQuiet(true),
 		WithElectionTimeout(cfg.MinTimeout, cfg.MaxTimeout),
 		WithHeartbeatInterval(cfg.HeartbeatInterval),
