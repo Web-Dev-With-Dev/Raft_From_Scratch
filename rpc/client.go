@@ -47,11 +47,12 @@ func ToProtoRequestVoteArgs(args *RequestVoteArgs) *raftpb.RequestVoteArgs {
 		return nil
 	}
 	return &raftpb.RequestVoteArgs{
-		Term:         uint64(args.Term),
-		CandidateId:  int64(args.CandidateID),
-		LastLogIndex: uint64(args.LastLogIndex),
-		LastLogTerm:  uint64(args.LastLogTerm),
-		PreVote:      args.PreVote,
+		Term:               uint64(args.Term),
+		CandidateId:        int64(args.CandidateID),
+		LastLogIndex:       uint64(args.LastLogIndex),
+		LastLogTerm:        uint64(args.LastLogTerm),
+		PreVote:            args.PreVote,
+		LeadershipTransfer: args.LeadershipTransfer,
 	}
 }
 
@@ -61,11 +62,12 @@ func FromProtoRequestVoteArgs(pb *raftpb.RequestVoteArgs) *RequestVoteArgs {
 		return nil
 	}
 	return &RequestVoteArgs{
-		Term:         raft.Term(pb.Term),
-		CandidateID:  raft.NodeID(pb.CandidateId),
-		LastLogIndex: raft.LogIndex(pb.LastLogIndex),
-		LastLogTerm:  raft.Term(pb.LastLogTerm),
-		PreVote:      pb.PreVote,
+		Term:               raft.Term(pb.Term),
+		CandidateID:        raft.NodeID(pb.CandidateId),
+		LastLogIndex:       raft.LogIndex(pb.LastLogIndex),
+		LastLogTerm:        raft.Term(pb.LastLogTerm),
+		PreVote:            pb.PreVote,
+		LeadershipTransfer: pb.LeadershipTransfer,
 	}
 }
 

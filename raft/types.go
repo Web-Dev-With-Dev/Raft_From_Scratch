@@ -89,11 +89,12 @@ func (s RaftState) String() string {
 }
 
 type RequestVoteArgs struct {
-	Term         Term     `json:"term"`
-	CandidateID  NodeID   `json:"candidate_id"`
-	LastLogIndex LogIndex `json:"last_log_index"`
-	LastLogTerm  Term     `json:"last_log_term"`
-	PreVote      bool     `json:"pre_vote"`
+	Term               Term     `json:"term"`
+	CandidateID        NodeID   `json:"candidate_id"`
+	LastLogIndex       LogIndex `json:"last_log_index"`
+	LastLogTerm        Term     `json:"last_log_term"`
+	PreVote            bool     `json:"pre_vote"`
+	LeadershipTransfer bool     `json:"leadership_transfer"`
 }
 
 type RequestVoteReply struct {

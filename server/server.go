@@ -773,8 +773,8 @@ func (s *Server) PreVotesReceived() map[raft.NodeID]bool {
 }
 
 func (s *Server) hasActiveLeaderLocked() bool {
-	if s.State == raft.Leader {
-		return true
+	if s.State != raft.Follower {
+		return false
 	}
 	if s.heartbeatsReceived == 0 || s.ElectionTimer == nil {
 		return false
@@ -1779,7 +1779,7 @@ func (s *Server) processPreVoteLocked(req *raftpb.RequestVoteArgs) *raftpb.Reque
 		return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
 	}
 
-	if req.Term < currentTerm || s.hasActiveLeaderLocked() {
+	if req.Term < currentTerm || (!req.GetLeadershipTransfer() && (s.State == raft.Leader || s.hasActiveLeaderLocked())) {
 		s.votesDenied.Add(1)
 		return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
 	}
@@ -1800,6 +1800,22 @@ func (s *Server) processPreVoteLocked(req *raftpb.RequestVoteArgs) *raftpb.Reque
 	return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: true}
 }
 
+func (s *Server) denyVoteActiveLeaderLeaseLocked(req *raftpb.RequestVoteArgs, currentTerm uint64) *raftpb.RequestVoteReply {
+	s.votesDenied.Add(1)
+	s.recordEventLocked(EventVoteDenied, fmt.Sprintf("denied vote to candidate %d for term %d (active leader lease)", req.CandidateId, req.Term), map[string]interface{}{
+		"candidate_id": req.CandidateId,
+		"term":         req.Term,
+		"current_term": currentTerm,
+		"reason":       "active_leader_lease",
+	})
+	s.GetLogger().Info("denied vote: receiver has an active leader within minimum election timeout (§9.6)",
+		"candidate_id", req.CandidateId,
+		"req_term", req.Term,
+		"current_term", currentTerm,
+	)
+	return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
+}
+
 // processRequestVote evaluates an incoming RequestVote RPC exactly per Raft paper Figure 2 rules 1-2.
 func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.RequestVoteReply {
 	if req.GetPreVote() {
@@ -1816,6 +1832,12 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 	currentTerm, votedFor, ok, earlyReply := s.validateRequestVote(req)
 	if !ok {
 		return earlyReply
+	}
+
+	// Followers reject votes if they heard from a current leader within the minimum election
+	// timeout (§9.6), unless this is an explicit leadership-transfer request (§6.4).
+	if !req.GetLeadershipTransfer() && s.hasActiveLeaderLocked() {
+		return s.denyVoteActiveLeaderLeaseLocked(req, currentTerm)
 	}
 
 	steppedDown := false
