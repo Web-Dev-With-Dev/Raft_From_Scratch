@@ -49,6 +49,10 @@ type Log interface {
 	// Returns ErrInvalidIndex if low > high.
 	// Returns ErrIndexOutOfBounds if high > LastIndex() + 1.
 	Slice(low, high LogIndex) ([]LogEntry, error)
+
+	// IsUpToDate evaluates whether a candidate's log (with candidateLastIndex, candidateLastTerm)
+	// is at least as up-to-date as this log per Raft paper §5.4.1 (Election restriction).
+	IsUpToDate(candidateLastIndex LogIndex, candidateLastTerm Term) bool
 }
 
 // MemoryLog is an in-memory thread-safe implementation of the Log interface.
@@ -164,3 +168,11 @@ func (m *MemoryLog) Slice(low, high LogIndex) ([]LogEntry, error) {
 	return res, nil
 }
 
+// IsUpToDate evaluates candidate's log freshness against this log (§5.4.1).
+func (m *MemoryLog) IsUpToDate(candidateLastIndex LogIndex, candidateLastTerm Term) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	lastEntry := m.entries[len(m.entries)-1]
+	return IsLogUpToDate(candidateLastIndex, candidateLastTerm, lastEntry.Index, lastEntry.Term)
+}

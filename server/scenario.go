@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -273,11 +274,90 @@ func partitionMinorityMajority(cluster *Cluster, leader *Server) ([]raft.NodeID,
 	return minority, majority
 }
 
+// SeedTestLogs populates the logs of nodes in cluster with varied terms and lengths
+// generated deterministically from seed, ensuring valid monotonic log structure.
+func SeedTestLogs(cluster *Cluster, seed int64) {
+	rnd := rand.New(rand.NewSource(seed))
+	for _, node := range cluster.Nodes() {
+		logLen := rnd.Intn(6)
+		curTerm := raft.Term(rnd.Intn(3) + 1)
+		for idx := 1; idx <= logLen; idx++ {
+			if rnd.Float64() < 0.35 {
+				curTerm++
+			}
+			_ = node.Log.Append(raft.LogEntry{
+				Index:   raft.LogIndex(idx),
+				Term:    curTerm,
+				Command: fmt.Sprintf("cmd-s%d-n%d-i%d", seed, node.ID, idx),
+			})
+		}
+		if node.PersistentState != nil {
+			node.PersistentState.CurrentTerm = node.Log.LastTerm()
+			node.PersistentState.VotedFor = raft.NoneNodeID
+		}
+		_ = node.Persist()
+	}
+}
+
+func verifyElectionRestriction(cluster *Cluster, leader *Server) error {
+	leaderLastIdx, leaderLastTerm := leader.Log.LastIndex(), leader.Log.LastTerm()
+	votesGranted := 0
+	for _, node := range cluster.Nodes() {
+		if node.Status().VotedFor == leader.ID || node.ID == leader.ID {
+			votesGranted++
+			if !raft.IsLogUpToDate(leaderLastIdx, leaderLastTerm, node.Log.LastIndex(), node.Log.LastTerm()) {
+				return fmt.Errorf("election restriction violated (§5.4.1): leader %d [idx=%d, term=%d] stale vs voter %d [idx=%d, term=%d]",
+					leader.ID, leaderLastIdx, leaderLastTerm, node.ID, node.Log.LastIndex(), node.Log.LastTerm())
+			}
+		}
+	}
+	if votesGranted < (len(cluster.Nodes())/2)+1 {
+		return fmt.Errorf("leader %d elected without majority votes (%d/%d)", leader.ID, votesGranted, len(cluster.Nodes()))
+	}
+	return nil
+}
+
+// RunVariedLogsElectionScenario runs an election on a cluster seeded with varied log lengths and terms.
+// It verifies Raft election safety (§5.2) and election restriction (§5.4.1).
+func RunVariedLogsElectionScenario(ctx context.Context, seed int64) (*Cluster, error) {
+	clk := raft.NewFakeClock()
+	simNet := NewSimNetwork(seed)
+	simNet.SetClock(clk)
+
+	cluster := NewCluster(nil, 3,
+		WithClock(clk),
+		WithSimNetwork(simNet),
+		WithRandSeed(seed),
+		WithQuiet(true),
+		WithAutoStart(false),
+		WithElectionTimeout(100*time.Millisecond, 200*time.Millisecond),
+		WithHeartbeatInterval(20*time.Millisecond),
+		WithRPCTimeout(40*time.Millisecond),
+	)
+
+	SeedTestLogs(cluster, seed)
+	cluster.Start()
+
+	termHistory := make(map[raft.Term]raft.NodeID)
+	leader, err := advanceUntilLeader(ctx, clk, cluster, 4*time.Second, termHistory)
+	if err != nil {
+		return cluster, err
+	}
+	if err := verifyElectionRestriction(cluster, leader); err != nil {
+		return cluster, err
+	}
+	if err := verifyStability(clk, cluster, 20, termHistory); err != nil {
+		return cluster, err
+	}
+	return cluster, nil
+}
+
 // Scenarios maps scenario names to their execution functions.
 var Scenarios = map[string]func(ctx context.Context, seed int64) (*Cluster, error){
-	"election":  RunBasicElectionScenario,
-	"crash":     RunCrashScenario,
-	"partition": RunPartitionScenario,
+	"election":    RunBasicElectionScenario,
+	"crash":       RunCrashScenario,
+	"partition":   RunPartitionScenario,
+	"varied_logs": RunVariedLogsElectionScenario,
 }
 
 // RunScenario executes a scenario by name with the given seed, returning the trace and any error.

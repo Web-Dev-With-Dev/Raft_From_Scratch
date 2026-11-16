@@ -151,3 +151,33 @@ func TestScenario_FailureSavesTraceAndReplays(t *testing.T) {
 		t.Fatalf("trace file not found on disk at %s: %v", tracePaths[0], err)
 	}
 }
+
+func TestScenario_VariedLogs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	trace, err := RunScenario(ctx, "varied_logs", 303, "")
+	if err != nil {
+		t.Fatalf("varied_logs scenario failed: %v", err)
+	}
+	if trace.Status != "PASS" {
+		t.Fatalf("expected status PASS, got %s", trace.Status)
+	}
+}
+
+func TestScenario_VariedLogs_Batch(t *testing.T) {
+	cfg := BatchConfig{
+		Scenario:  "varied_logs",
+		StartSeed: 1,
+		EndSeed:   25,
+		Workers:   4,
+	}
+
+	res, err := RunBatch(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("unexpected batch error: %v", err)
+	}
+	if res.Failed > 0 {
+		t.Fatalf("expected 0 failures across 25 seeds, got %d failing seeds: %v", res.Failed, res.FailingSeeds)
+	}
+}

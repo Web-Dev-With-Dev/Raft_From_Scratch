@@ -121,6 +121,9 @@ type Server struct {
 	// PersistentState holds the persistent consensus state (currentTerm, votedFor, log entries).
 	PersistentState *raft.PersistentState `json:"persistent_state"`
 
+	// Log abstracts the replicated consensus log (1-based indexing, sentinel at index 0).
+	Log raft.Log `json:"-"`
+
 	// Storage provides persistence for Raft state (currentTerm, votedFor, log).
 	// Currently initialized with an in-memory Storage implementation, to be replaced in Month 4.
 	Storage store.Storage `json:"-"`
@@ -244,12 +247,18 @@ func NewServer(
 		_ = memStorage.Persist(persistentState)
 	}
 
+	raftLog := raft.NewMemoryLog()
+	if persistentState != nil && len(persistentState.Log) > 0 {
+		_ = raftLog.Append(persistentState.Log...)
+	}
+
 	clk := raft.NewRealClock()
 	srv := &Server{
 		ID:                id,
 		clock:             clk,
 		Peers:             peers,
 		PersistentState:   persistentState,
+		Log:               raftLog,
 		Storage:           memStorage,
 		State:             raft.Follower,
 		VolatileState:     &raft.VolatileState{CommitIndex: 0, LastApplied: 0},
@@ -1422,10 +1431,30 @@ func (s *Server) LastLogInfo() (raft.LogIndex, raft.Term) {
 }
 
 func (s *Server) lastLogInfoLocked() (raft.LogIndex, raft.Term) {
+	if s.Log != nil {
+		if s.PersistentState != nil && len(s.PersistentState.Log) > 0 && s.Log.LastIndex() == 0 {
+			_ = s.Log.Append(s.PersistentState.Log...)
+		}
+		return s.Log.LastIndex(), s.Log.LastTerm()
+	}
 	if s.PersistentState != nil {
 		return s.PersistentState.LastLogInfo()
 	}
 	return 0, 0
+}
+
+// GetLog returns the server's consensus log.
+func (s *Server) GetLog() raft.Log {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Log
+}
+
+// SetLog configures a custom consensus log for the server.
+func (s *Server) SetLog(l raft.Log) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Log = l
 }
 
 // IsLogUpToDate checks whether a candidate's log is at least as up-to-date as this receiver's log (§5.4).
@@ -1445,12 +1474,17 @@ func (s *Server) isLogUpToDateLocked(lastLogIndex uint64, lastLogTerm uint64) bo
 
 func (s *Server) isLogUpToDate(lastLogIndex uint64, lastLogTerm uint64) bool {
 	myLastIndex, myLastTerm := s.lastLogInfoLocked()
-	upToDate := raft.IsLogUpToDate(
-		raft.LogIndex(lastLogIndex),
-		raft.Term(lastLogTerm),
-		myLastIndex,
-		myLastTerm,
-	)
+	var upToDate bool
+	if s.Log != nil {
+		upToDate = s.Log.IsUpToDate(raft.LogIndex(lastLogIndex), raft.Term(lastLogTerm))
+	} else {
+		upToDate = raft.IsLogUpToDate(
+			raft.LogIndex(lastLogIndex),
+			raft.Term(lastLogTerm),
+			myLastIndex,
+			myLastTerm,
+		)
+	}
 	s.GetLogger().Debug("evaluated candidate log up-to-date rule",
 		"candidate_last_index", lastLogIndex,
 		"candidate_last_term", lastLogTerm,
