@@ -1105,7 +1105,18 @@ func (c *Cluster) Drop(src, dst raft.NodeID) {
 
 // SetDelay configures latency delay between src and dst.
 func (c *Cluster) SetDelay(src, dst raft.NodeID, delay time.Duration) {
-	c.Network.SetDelay(src, dst, delay)
+	if c.Network != nil {
+		c.Network.SetDelay(src, dst, delay)
+	}
+	if c.SimNetwork != nil {
+		c.SimNetwork.SetLinkDelayRange(src, dst, delay, delay)
+	}
+}
+
+// SetDelayBidirectional configures latency delay between n1 and n2 in both directions.
+func (c *Cluster) SetDelayBidirectional(n1, n2 raft.NodeID, delay time.Duration) {
+	c.SetDelay(n1, n2, delay)
+	c.SetDelay(n2, n1, delay)
 }
 
 // SetCheckQuorum enables or disables the check-quorum mechanism for all nodes in the cluster.
