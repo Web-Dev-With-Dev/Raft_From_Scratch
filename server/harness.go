@@ -933,6 +933,7 @@ func (c *Cluster) Advance(d time.Duration) time.Time {
 		for i := 0; i < 5; i++ {
 			runtime.Gosched()
 		}
+		time.Sleep(50 * time.Microsecond)
 		c.runGlobalChecker()
 	}
 	return fc.Now()
@@ -961,6 +962,7 @@ func (c *Cluster) AdvanceUntil(budget time.Duration, condition func() bool) bool
 			}
 			runtime.Gosched()
 		}
+		time.Sleep(50 * time.Microsecond)
 		c.runGlobalChecker()
 		if c.CheckerError() != nil {
 			return false

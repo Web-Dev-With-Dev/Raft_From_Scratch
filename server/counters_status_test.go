@@ -309,15 +309,16 @@ func TestHarness_Cluster_CountersAndEventLogs(t *testing.T) {
 		t.Fatalf("leader Node %d should have heartbeatsSent > 0, got %d", leaderID, leaderNode.HeartbeatsSent())
 	}
 
-	// Verify peer nodes granted votes to leader
+	// Verify peer nodes granted votes for majority quorum
+	var totalPeerVotesGranted uint64
 	for id := raft.NodeID(1); id <= 3; id++ {
 		if id == leaderID {
 			continue
 		}
-		peerNode := cluster.GetNode(id)
-		if peerNode.VotesGranted() == 0 {
-			t.Errorf("peer Node %d should have votesGranted > 0, got %d", id, peerNode.VotesGranted())
-		}
+		totalPeerVotesGranted += cluster.GetNode(id).VotesGranted()
+	}
+	if totalPeerVotesGranted == 0 {
+		t.Errorf("expected at least one peer to have votesGranted > 0, got 0")
 	}
 
 	// Post-Mortem Debugging: Kill current leader and inspect its event log
