@@ -203,11 +203,12 @@ type Server struct {
 	pauseNotifyCh chan struct{}
 	pauseMu       sync.Mutex
 
-	// checkQuorum controls (§6.2): leader steps down if it loses contact with a majority
+	// checkQuorum controls (§6.2): leader tracks last-heard-from time per follower
 	checkQuorum         bool
 	checkQuorumInterval time.Duration
 	checkQuorumTimer    raft.Timer
 	heartbeatAcks       map[raft.NodeID]bool
+	lastHeardFrom       map[raft.NodeID]time.Time
 
 	// preVote controls (§9.6): candidates gather majority pre-votes before incrementing term
 	preVote          bool
@@ -283,6 +284,7 @@ func NewServer(
 		loopDone:          loopDone,
 		pauseNotifyCh:     pauseNotifyCh,
 		heartbeatAcks:     make(map[raft.NodeID]bool),
+		lastHeardFrom:     make(map[raft.NodeID]time.Time),
 		eventLog:          NewEventLog(DefaultEventLogCapacity),
 	}
 	srv.recordEventLocked(EventServerStarted, fmt.Sprintf("server node %d initialized", id), map[string]interface{}{
@@ -705,6 +707,17 @@ func (s *Server) resetCheckQuorumTimerLocked() {
 	s.checkQuorumTimer = s.getClockLocked().NewTimer(interval)
 }
 
+// LastHeardFrom returns a copy of the map tracking the leader's last contact time for each follower.
+func (s *Server) LastHeardFrom() map[raft.NodeID]time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make(map[raft.NodeID]time.Time, len(s.lastHeardFrom))
+	for k, v := range s.lastHeardFrom {
+		res[k] = v
+	}
+	return res
+}
+
 func (s *Server) handleCheckQuorumTimeoutLocked() {
 	if s.State != raft.Leader || !s.checkQuorum {
 		return
@@ -712,32 +725,51 @@ func (s *Server) handleCheckQuorumTimeoutLocked() {
 
 	totalNodes := len(s.Peers) + 1
 	majority := (totalNodes / 2) + 1
-	ackedCount := len(s.heartbeatAcks) + 1 // Self counts as 1
+
+	electionTimeout := s.checkQuorumInterval
+	if electionTimeout <= 0 {
+		if s.ElectionTimer != nil {
+			minT, _ := s.ElectionTimer.Range()
+			electionTimeout = minT
+		} else {
+			electionTimeout = raft.DefaultMinElectionTimeout
+		}
+	}
+
+	now := s.getClockLocked().Now()
+	activeCount := 1 // Self counts as 1
+	for _, peer := range s.Peers {
+		if lastHeard, ok := s.lastHeardFrom[peer.ID]; ok {
+			if now.Sub(lastHeard) <= electionTimeout {
+				activeCount++
+			}
+		}
+	}
 
 	curTerm := uint64(0)
 	if s.PersistentState != nil {
 		curTerm = uint64(s.PersistentState.CurrentTerm)
 	}
 
-	if ackedCount < majority {
-		s.recordEventLocked(EventQuorumLoss, fmt.Sprintf("leader lost quorum contact (%d/%d acks, majority %d); stepping down to Follower", ackedCount, totalNodes, majority), map[string]interface{}{
-			"acked_nodes":       ackedCount,
+	if activeCount < majority {
+		s.recordEventLocked(EventQuorumLoss, fmt.Sprintf("leader lost quorum contact (%d/%d active, majority %d within %v); stepping down to Follower", activeCount, totalNodes, majority, electionTimeout), map[string]interface{}{
+			"active_nodes":      activeCount,
 			"majority_required": majority,
 			"total_nodes":       totalNodes,
 			"term":              curTerm,
 		})
-		s.GetLogger().Info("leader lost contact with majority, stepping down to Follower (§6.2)",
+		s.GetLogger().Info("leader lost contact with majority within election timeout, stepping down to Follower (§6.2)",
 			"node_id", int(s.ID),
 			"term", curTerm,
-			"acked_nodes", ackedCount,
+			"active_nodes", activeCount,
 			"majority_required", majority,
 			"total_nodes", totalNodes,
+			"election_timeout", electionTimeout,
 		)
 		s.becomeFollowerLocked(raft.Term(curTerm))
 		return
 	}
 
-	// Quorum healthy: reset acknowledgments for next period and re-arm timer
 	s.heartbeatAcks = make(map[raft.NodeID]bool)
 	s.resetCheckQuorumTimerLocked()
 }
@@ -1255,6 +1287,7 @@ func (s *Server) stopHeartbeatTickerLocked() {
 		s.checkQuorumTimer = nil
 	}
 	s.heartbeatAcks = make(map[raft.NodeID]bool)
+	s.lastHeardFrom = make(map[raft.NodeID]time.Time)
 }
 
 func (s *Server) shutdownEventLoop() {
@@ -2133,6 +2166,19 @@ func (s *Server) startLeaderTimersLocked() {
 	s.heartbeatTimer = clk.NewTimer(s.heartbeatInterval)
 
 	s.heartbeatAcks = make(map[raft.NodeID]bool)
+	s.lastHeardFrom = make(map[raft.NodeID]time.Time)
+	now := clk.Now()
+	if len(s.votesReceived) > 0 {
+		for peerID, granted := range s.votesReceived {
+			if granted && peerID != s.ID {
+				s.lastHeardFrom[peerID] = now
+			}
+		}
+	} else {
+		for _, peer := range s.Peers {
+			s.lastHeardFrom[peer.ID] = now
+		}
+	}
 	if s.checkQuorum {
 		s.resetCheckQuorumTimerLocked()
 	}
@@ -2677,6 +2723,12 @@ func (s *Server) handleHeartbeatTick() {
 	if s.State != raft.Leader {
 		return
 	}
+	if s.checkQuorum {
+		s.handleCheckQuorumTimeoutLocked()
+		if s.State != raft.Leader {
+			return
+		}
+	}
 	s.heartbeatsSent.Add(1)
 
 	var curTerm uint64
@@ -2778,11 +2830,17 @@ func (s *Server) broadcastHeartbeats() {
 // handleHeartbeatResultLocked processes an AppendEntries heartbeat response received from a peer.
 // Must be called with s.mu held (or inside the event loop).
 func (s *Server) handleHeartbeatResultLocked(res HeartbeatResult) {
-	if res.Err == nil && res.Reply != nil && res.Reply.Success {
-		if s.heartbeatAcks == nil {
-			s.heartbeatAcks = make(map[raft.NodeID]bool)
+	if res.Err == nil && res.Reply != nil {
+		if s.lastHeardFrom == nil {
+			s.lastHeardFrom = make(map[raft.NodeID]time.Time)
 		}
-		s.heartbeatAcks[res.PeerID] = true
+		s.lastHeardFrom[res.PeerID] = s.getClockLocked().Now()
+		if res.Reply.Success {
+			if s.heartbeatAcks == nil {
+				s.heartbeatAcks = make(map[raft.NodeID]bool)
+			}
+			s.heartbeatAcks[res.PeerID] = true
+		}
 	}
 
 	if res.Err != nil || res.Reply == nil {
