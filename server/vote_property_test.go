@@ -88,4 +88,3 @@ func TestProperty_VoteGranted_Iff_CandidateLogUpToDate(t *testing.T) {
 		}
 	})
 }
-

@@ -819,6 +819,7 @@ func (s *Server) handleHeartbeatDirectLocked(leaderID raft.NodeID, term raft.Ter
 
 	if s.State == raft.Candidate {
 		s.State = raft.Follower
+		s.votesReceived = make(map[raft.NodeID]bool)
 		s.GetLogger().Info("reverted from Candidate to Follower upon valid heartbeat",
 			"leader_id", int(leaderID),
 			"term", uint64(term),
@@ -2273,6 +2274,9 @@ func (s *Server) checkHigherTermInVoteReply(replyTerm raft.Term, peerID raft.Nod
 }
 
 func (s *Server) recordVoteAndCheckMajorityLocked(peerID raft.NodeID, currentTerm uint64) {
+	if s.State != raft.Candidate {
+		return
+	}
 	if s.votesReceived == nil {
 		s.votesReceived = make(map[raft.NodeID]bool)
 		s.votesReceived[s.ID] = true
@@ -2305,14 +2309,15 @@ func (s *Server) recordVoteAndCheckMajorityLocked(peerID raft.NodeID, currentTer
 
 // handleVoteResultLocked processes an incoming vote result from a peer.
 // In Raft (§5.1 & §5.2):
-// - If reply contains higher term: step down to Follower immediately
-// - If vote granted: count vote; on majority, transition to Leader
+//   - If reply contains higher term: step down to Follower immediately
+//   - Ignore reply if its term differs from currentTerm, if ElectionTerm != currentTerm,
+//     or if the server is no longer in Candidate state
+//   - If vote granted: count vote; on majority, transition to Leader
 func (s *Server) handleVoteResultLocked(res RequestVoteResult) {
-	if res.Err != nil {
-		s.GetLogger().Debug("RequestVote RPC to peer failed or timed out", "peer_id", int(res.PeerID), "error", res.Err)
-		return
-	}
-	if res.Reply == nil {
+	if res.Err != nil || res.Reply == nil {
+		if res.Err != nil {
+			s.GetLogger().Debug("RequestVote RPC to peer failed or timed out", "peer_id", int(res.PeerID), "error", res.Err)
+		}
 		return
 	}
 
@@ -2325,7 +2330,15 @@ func (s *Server) handleVoteResultLocked(res RequestVoteResult) {
 		return
 	}
 
-	if s.State != raft.Candidate || res.ElectionTerm != raft.Term(currentTerm) {
+	if res.Reply.Term != raft.Term(currentTerm) || res.ElectionTerm != raft.Term(currentTerm) || s.State != raft.Candidate {
+		s.GetLogger().Debug("ignored stale or mismatched RequestVote reply",
+			"node_id", int(s.ID),
+			"peer_id", int(res.PeerID),
+			"state", s.State.String(),
+			"current_term", currentTerm,
+			"election_term", res.ElectionTerm,
+			"reply_term", res.Reply.Term,
+		)
 		return
 	}
 
