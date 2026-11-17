@@ -17,12 +17,13 @@ import (
 
 // NodeTraceState records the post-run state and consensus events of a single node.
 type NodeTraceState struct {
-	ID       raft.NodeID `json:"id"`
-	State    string      `json:"state"`
-	Term     raft.Term   `json:"term"`
-	VotedFor raft.NodeID `json:"voted_for"`
-	IsKilled bool        `json:"is_killed"`
-	Events   []Event     `json:"events"`
+	ID       raft.NodeID         `json:"id"`
+	State    string              `json:"state"`
+	Term     raft.Term           `json:"term"`
+	VotedFor raft.NodeID         `json:"voted_for"`
+	IsKilled bool                `json:"is_killed"`
+	Metrics  *NodeMetricsSummary `json:"metrics,omitempty"`
+	Events   []Event             `json:"events"`
 }
 
 // ScenarioTrace stores the complete record of a simulation run for deterministic replay and debugging.
@@ -71,12 +72,14 @@ func buildTrace(cluster *Cluster, scenario string, seed int64, dur time.Duration
 			if srv.EventLog() != nil {
 				events = srv.EventLog().Entries()
 			}
+			metrics := srv.MetricsSummary()
 			nodesTrace[srv.ID] = NodeTraceState{
 				ID:       srv.ID,
 				State:    srv.GetState().String(),
 				Term:     srv.Status().Term,
 				VotedFor: srv.Status().VotedFor,
 				IsKilled: srv.IsKilled(),
+				Metrics:  &metrics,
 				Events:   events,
 			}
 		}
@@ -462,6 +465,9 @@ func verifyVotedForInvariantAcrossNodes(cluster *Cluster) error {
 		grantsByTerm := make(map[raft.Term]int64)
 		for _, ev := range node.EventLog().Entries() {
 			if ev.Type != EventVoteGranted {
+				continue
+			}
+			if pv, ok := ev.Details["pre_vote"].(bool); ok && pv {
 				continue
 			}
 			candID := extractCandidateIDFromEvent(ev)

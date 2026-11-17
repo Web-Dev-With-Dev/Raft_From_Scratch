@@ -34,32 +34,42 @@ type MemoryStorage = store.MemoryStorage
 
 // ServerCounters holds runtime consensus event counters for a Raft node.
 type ServerCounters struct {
-	ElectionsStarted uint64 `json:"electionsStarted"`
-	VotesGranted     uint64 `json:"votesGranted"`
-	VotesDenied      uint64 `json:"votesDenied"`
-	HeartbeatsSent   uint64 `json:"heartbeatsSent"`
+	ElectionsStarted   uint64          `json:"electionsStarted"`
+	VotesGranted       uint64          `json:"votesGranted"`
+	VotesDenied        uint64          `json:"votesDenied"`
+	HeartbeatsSent     uint64          `json:"heartbeatsSent"`
+	PreVotesStarted    uint64          `json:"preVotesStarted,omitempty"`
+	PreVotesWon        uint64          `json:"preVotesWon,omitempty"`
+	PreVoteSuccessRate float64         `json:"preVoteSuccessRate,omitempty"`
+	ElectionsPerHour   float64         `json:"electionsPerHour,omitempty"`
+	StepDownReasons    StepDownReasons `json:"stepDownReasons,omitempty"`
 }
 
 // NodeStatus represents the runtime status of a Raft node exposed via the debug HTTP endpoint (/status).
 type NodeStatus struct {
-	ID                  raft.NodeID    `json:"id"`
-	Term                raft.Term      `json:"term"`
-	State               string         `json:"state"`
-	VotedFor            raft.NodeID    `json:"votedFor"`
-	VotedForAlt         raft.NodeID    `json:"voted_for"`
-	CommitIndex         raft.LogIndex  `json:"commitIndex"`
-	LastApplied         raft.LogIndex  `json:"lastApplied"`
-	LogLength           int            `json:"logLength"`
-	ElectionsStarted    uint64         `json:"electionsStarted"`
-	ElectionsStartedAlt uint64         `json:"elections_started"`
-	VotesGranted        uint64         `json:"votesGranted"`
-	VotesGrantedAlt     uint64         `json:"votes_granted"`
-	VotesDenied         uint64         `json:"votesDenied"`
-	VotesDeniedAlt      uint64         `json:"votes_denied"`
-	HeartbeatsSent      uint64         `json:"heartbeatsSent"`
-	HeartbeatsSentAlt   uint64         `json:"heartbeats_sent"`
-	Counters            ServerCounters `json:"counters"`
-	RecentEvents        []Event        `json:"recentEvents,omitempty"`
+	ID                  raft.NodeID     `json:"id"`
+	Term                raft.Term       `json:"term"`
+	State               string          `json:"state"`
+	VotedFor            raft.NodeID     `json:"votedFor"`
+	VotedForAlt         raft.NodeID     `json:"voted_for"`
+	CommitIndex         raft.LogIndex   `json:"commitIndex"`
+	LastApplied         raft.LogIndex   `json:"lastApplied"`
+	LogLength           int             `json:"logLength"`
+	ElectionsStarted    uint64          `json:"electionsStarted"`
+	ElectionsStartedAlt uint64          `json:"elections_started"`
+	VotesGranted        uint64          `json:"votesGranted"`
+	VotesGrantedAlt     uint64          `json:"votes_granted"`
+	VotesDenied         uint64          `json:"votesDenied"`
+	VotesDeniedAlt      uint64          `json:"votes_denied"`
+	HeartbeatsSent      uint64          `json:"heartbeatsSent"`
+	HeartbeatsSentAlt   uint64          `json:"heartbeats_sent"`
+	PreVotesStarted     uint64          `json:"preVotesStarted,omitempty"`
+	PreVotesWon         uint64          `json:"preVotesWon,omitempty"`
+	PreVoteSuccessRate  float64         `json:"preVoteSuccessRate,omitempty"`
+	ElectionsPerHour    float64         `json:"electionsPerHour,omitempty"`
+	StepDownReasons     StepDownReasons `json:"stepDownReasons,omitempty"`
+	Counters            ServerCounters  `json:"counters"`
+	RecentEvents        []Event         `json:"recentEvents,omitempty"`
 }
 
 const (
@@ -224,6 +234,12 @@ type Server struct {
 
 	// stickiness controls (§9.6): followers reject (pre)votes if heard from current leader within minTimeout
 	stickiness bool
+
+	// metrics tracking
+	startTime       time.Time
+	preVotesStarted atomic.Uint64
+	preVotesWon     atomic.Uint64
+	stepDowns       stepDownTracker
 }
 
 // NewServer creates and initializes a new Raft Server.
@@ -300,6 +316,7 @@ func NewServer(
 		heartbeatAcks:     make(map[raft.NodeID]bool),
 		lastHeardFrom:     make(map[raft.NodeID]time.Time),
 		eventLog:          NewEventLog(DefaultEventLogCapacity),
+		startTime:         clk.Now(),
 	}
 	srv.recordEventLocked(EventServerStarted, fmt.Sprintf("server node %d initialized", id), map[string]interface{}{
 		"node_id": int(id),
@@ -505,10 +522,12 @@ func (s *Server) setCurrentTermLocked(term raft.Term) error {
 	}
 
 	if term != s.PersistentState.CurrentTerm {
+		oldTerm := s.PersistentState.CurrentTerm
 		if term > s.PersistentState.CurrentTerm {
 			s.PersistentState.VotedFor = -1
 		}
 		s.PersistentState.CurrentTerm = term
+		s.recordTermChangeLocked(oldTerm, term, "set_current_term")
 		return s.persistLocked()
 	}
 	return nil
@@ -618,6 +637,7 @@ func (s *Server) SetClock(clk raft.Clock) {
 		clk = raft.NewRealClock()
 	}
 	s.clock = clk
+	s.startTime = clk.Now()
 	s.lastHeartbeat = clk.Now()
 	if s.ElectionTimer != nil {
 		s.ElectionTimer.SetClock(clk)
@@ -780,6 +800,7 @@ func (s *Server) handleCheckQuorumTimeoutLocked() {
 			"total_nodes", totalNodes,
 			"election_timeout", electionTimeout,
 		)
+		s.recordStepDownLocked("quorum_loss", raft.Term(curTerm))
 		s.becomeFollowerLocked(raft.Term(curTerm))
 		return
 	}
@@ -1118,7 +1139,7 @@ func (s *Server) Status() NodeStatus {
 	defer s.mu.RUnlock()
 
 	term, votedFor, logLen, commitIndex, lastApplied := s.stateSnapshotLocked()
-	counters := s.Counters()
+	counters := s.countersLocked()
 	var recentEvents []Event
 	if s.eventLog != nil {
 		recentEvents = s.eventLog.Recent(20)
@@ -1141,6 +1162,11 @@ func (s *Server) Status() NodeStatus {
 		VotesDeniedAlt:      counters.VotesDenied,
 		HeartbeatsSent:      counters.HeartbeatsSent,
 		HeartbeatsSentAlt:   counters.HeartbeatsSent,
+		PreVotesStarted:     counters.PreVotesStarted,
+		PreVotesWon:         counters.PreVotesWon,
+		PreVoteSuccessRate:  counters.PreVoteSuccessRate,
+		ElectionsPerHour:    counters.ElectionsPerHour,
+		StepDownReasons:     counters.StepDownReasons,
 		Counters:            counters,
 		RecentEvents:        recentEvents,
 	}
@@ -1664,14 +1690,42 @@ func (s *Server) VotesDenied() uint64 {
 	return s.votesDenied.Load()
 }
 
+func (s *Server) countersLocked() ServerCounters {
+	uptime := s.uptimeLocked()
+	if uptime < time.Millisecond {
+		uptime = time.Millisecond
+	}
+	hours := uptime.Hours()
+	electionsPerHour := 0.0
+	if hours > 0 {
+		electionsPerHour = float64(s.electionsStarted.Load()) / hours
+	}
+
+	preVotesStarted := s.preVotesStarted.Load()
+	preVotesWon := s.preVotesWon.Load()
+	preVoteSuccessRate := 0.0
+	if preVotesStarted > 0 {
+		preVoteSuccessRate = float64(preVotesWon) / float64(preVotesStarted)
+	}
+
+	return ServerCounters{
+		ElectionsStarted:   s.electionsStarted.Load(),
+		VotesGranted:       s.votesGranted.Load(),
+		VotesDenied:        s.votesDenied.Load(),
+		HeartbeatsSent:     s.heartbeatsSent.Load(),
+		PreVotesStarted:    preVotesStarted,
+		PreVotesWon:        preVotesWon,
+		PreVoteSuccessRate: preVoteSuccessRate,
+		ElectionsPerHour:   electionsPerHour,
+		StepDownReasons:    s.StepDownReasons(),
+	}
+}
+
 // Counters returns a snapshot of all Raft consensus event counters.
 func (s *Server) Counters() ServerCounters {
-	return ServerCounters{
-		ElectionsStarted: s.ElectionsStarted(),
-		VotesGranted:     s.VotesGranted(),
-		VotesDenied:      s.VotesDenied(),
-		HeartbeatsSent:   s.HeartbeatsSent(),
-	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.countersLocked()
 }
 
 // EventLog returns the node's in-memory event log ring buffer for post-mortem debugging.
@@ -1724,6 +1778,13 @@ func (s *Server) resetElectionTimerOnGrantingVoteLocked(candidateID int64, term 
 	var newTimeout time.Duration
 	if s.ElectionTimer != nil {
 		newTimeout = s.ElectionTimer.Reset()
+		s.recordEventLocked(EventTimerReset, fmt.Sprintf("election timer reset (granted vote to %d for term %d)", candidateID, term), map[string]interface{}{
+			"timer":        "election",
+			"reason":       "vote_granted",
+			"candidate_id": candidateID,
+			"term":         term,
+			"timeout_ms":   newTimeout.Milliseconds(),
+		})
 		s.GetLogger().Info("reset election timer on granting vote (§5.2)",
 			"candidate_id", candidateID,
 			"term", term,
@@ -1766,7 +1827,51 @@ func (s *Server) validateRequestVote(req *raftpb.RequestVoteArgs) (uint64, raft.
 	return currentTerm, votedFor, true, nil
 }
 
+func (s *Server) recordTermChangeLocked(oldTerm, newTerm raft.Term, reason string) {
+	if oldTerm == newTerm {
+		return
+	}
+	s.recordEventLocked(EventTermChange, fmt.Sprintf("term changed from %d to %d (%s)", oldTerm, newTerm, reason), map[string]interface{}{
+		"old_term": uint64(oldTerm),
+		"new_term": uint64(newTerm),
+		"reason":   reason,
+	})
+}
+
+func (s *Server) resetElectionTimerLocked(reason string) time.Duration {
+	if s.ElectionTimer == nil {
+		return 0
+	}
+	timeout := s.ElectionTimer.Reset()
+	var curTerm uint64
+	if s.PersistentState != nil {
+		curTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+	s.recordEventLocked(EventTimerReset, fmt.Sprintf("election timer reset (%s)", reason), map[string]interface{}{
+		"timer":      "election",
+		"reason":     reason,
+		"timeout_ms": timeout.Milliseconds(),
+		"term":       curTerm,
+	})
+	return timeout
+}
+
+func (s *Server) recordStepDownLocked(reason string, term raft.Term) {
+	s.stepDowns.record(reason)
+	oldRole := s.State
+	var curTerm uint64 = uint64(term)
+	if s.PersistentState != nil && curTerm == 0 {
+		curTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+	s.recordEventLocked(EventStepDown, fmt.Sprintf("stepping down to Follower: %s (term %d)", reason, curTerm), map[string]interface{}{
+		"reason":         reason,
+		"previous_state": oldRole.String(),
+		"term":           curTerm,
+	})
+}
+
 func (s *Server) stepDownOnHigherTermLocked(term uint64) (uint64, raft.NodeID, bool) {
+	s.recordStepDownLocked("higher_term_request", raft.Term(term))
 	oldRole := s.State
 	s.State = raft.Follower
 	s.stopHeartbeatTickerLocked()
@@ -1774,16 +1879,15 @@ func (s *Server) stepDownOnHigherTermLocked(term uint64) (uint64, raft.NodeID, b
 
 	var currentTerm uint64
 	var votedFor raft.NodeID = -1
+	var oldTerm raft.Term
 	if s.PersistentState != nil {
+		oldTerm = s.PersistentState.CurrentTerm
 		s.PersistentState.CurrentTerm = raft.Term(term)
 		s.PersistentState.VotedFor = -1
 		currentTerm = uint64(s.PersistentState.CurrentTerm)
+		s.recordTermChangeLocked(oldTerm, raft.Term(term), "higher_term_request")
 	}
 
-	s.recordEventLocked(EventStepDown, fmt.Sprintf("discovered higher term %d; transitioned to Follower", term), map[string]interface{}{
-		"previous_state": oldRole.String(),
-		"term":           currentTerm,
-	})
 	s.GetLogger().Info("transitioned to Follower on discovering higher term",
 		"node_id", int(s.ID),
 		"previous_state", oldRole.String(),
@@ -1881,17 +1985,34 @@ func (s *Server) processPreVoteLocked(req *raftpb.RequestVoteArgs) *raftpb.Reque
 
 	if !s.isLogUpToDateLocked(req.LastLogIndex, req.LastLogTerm) {
 		s.votesDenied.Add(1)
+		s.recordEventLocked(EventPreVoteDenied, fmt.Sprintf("denied pre-vote to candidate %d for proposed term %d (stale log)", req.CandidateId, req.Term), map[string]interface{}{
+			"candidate_id": req.CandidateId,
+			"term":         req.Term,
+			"pre_vote":     true,
+			"reason":       "stale_log",
+		})
 		return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
 	}
 
 	if req.Term == currentTerm && s.PersistentState != nil {
 		if s.PersistentState.VotedFor != -1 && s.PersistentState.VotedFor != raft.NodeID(req.CandidateId) {
 			s.votesDenied.Add(1)
+			s.recordEventLocked(EventPreVoteDenied, fmt.Sprintf("denied pre-vote to candidate %d for proposed term %d (already voted for %d)", req.CandidateId, req.Term, s.PersistentState.VotedFor), map[string]interface{}{
+				"candidate_id": req.CandidateId,
+				"term":         req.Term,
+				"pre_vote":     true,
+				"reason":       "already_voted_other",
+			})
 			return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: false}
 		}
 	}
 
 	s.votesGranted.Add(1)
+	s.recordEventLocked(EventPreVoteGranted, fmt.Sprintf("granted pre-vote to candidate %d for proposed term %d", req.CandidateId, req.Term), map[string]interface{}{
+		"candidate_id": req.CandidateId,
+		"term":         req.Term,
+		"pre_vote":     true,
+	})
 	return &raftpb.RequestVoteReply{Term: currentTerm, VoteGranted: true}
 }
 
@@ -1949,25 +2070,25 @@ func (s *Server) processRequestVote(req *raftpb.RequestVoteArgs) *raftpb.Request
 
 func (s *Server) applyAppendEntriesRoleAndTimer(req *raftpb.AppendEntriesArgs, currentTerm uint64) uint64 {
 	if req.Term > currentTerm {
+		s.recordStepDownLocked("higher_term_request", raft.Term(req.Term))
 		s.becomeFollowerLocked(raft.Term(req.Term))
 		if s.PersistentState != nil {
 			currentTerm = uint64(s.PersistentState.CurrentTerm)
 		}
 	} else if s.State == raft.Candidate || s.State == raft.PreCandidate {
+		s.recordStepDownLocked("leader_heartbeat", raft.Term(req.Term))
 		s.becomeFollowerLocked(raft.Term(req.Term))
 	}
 
 	now := s.getClockLocked().Now()
 	s.lastHeartbeat = now
 	s.lastLeaderHeartbeat = now
-	if s.ElectionTimer != nil {
-		newTimeout := s.ElectionTimer.Reset()
-		s.GetLogger().Debug("reset election timer on valid heartbeat/AppendEntries",
-			"leader_id", req.LeaderId,
-			"term", req.Term,
-			"timeout_ms", newTimeout.Milliseconds(),
-		)
-	}
+	newTimeout := s.resetElectionTimerLocked("heartbeat_received")
+	s.GetLogger().Debug("reset election timer on valid heartbeat/AppendEntries",
+		"leader_id", req.LeaderId,
+		"term", req.Term,
+		"timeout_ms", newTimeout.Milliseconds(),
+	)
 
 	if len(req.Entries) == 0 {
 		s.heartbeatsReceived++
@@ -2067,16 +2188,15 @@ func (s *Server) becomeFollowerLocked(term raft.Term) {
 	s.State = raft.Follower
 
 	if s.PersistentState != nil && term > s.PersistentState.CurrentTerm {
+		oldTerm := s.PersistentState.CurrentTerm
 		s.PersistentState.CurrentTerm = term
 		s.PersistentState.VotedFor = -1
 		_ = s.persistLocked()
+		s.recordTermChangeLocked(oldTerm, term, "become_follower")
 	}
 
 	s.stopHeartbeatTickerLocked()
-
-	if s.ElectionTimer != nil {
-		s.ElectionTimer.Reset()
-	}
+	s.resetElectionTimerLocked("become_follower")
 
 	s.votesReceived = make(map[raft.NodeID]bool)
 
@@ -2140,25 +2260,28 @@ func (s *Server) becomeCandidateLocked() {
 	s.State = raft.Candidate
 	s.electionsStarted.Add(1)
 
+	var oldTerm raft.Term
+	var curTerm uint64
 	if s.PersistentState != nil {
+		oldTerm = s.PersistentState.CurrentTerm
 		s.PersistentState.CurrentTerm++
 		s.PersistentState.VotedFor = s.ID
 		_ = s.persistLocked()
+		curTerm = uint64(s.PersistentState.CurrentTerm)
+		s.recordTermChangeLocked(oldTerm, s.PersistentState.CurrentTerm, "start_election")
 	}
 
 	s.stopHeartbeatTickerLocked()
-
-	if s.ElectionTimer != nil {
-		s.ElectionTimer.Reset()
-	}
+	s.resetElectionTimerLocked("start_election")
 
 	s.votesReceived = make(map[raft.NodeID]bool)
 	s.votesReceived[s.ID] = true
 
-	var curTerm uint64
-	if s.PersistentState != nil {
-		curTerm = uint64(s.PersistentState.CurrentTerm)
-	}
+	s.recordEventLocked(EventVoteGranted, fmt.Sprintf("voted for self (%d) for term %d", s.ID, curTerm), map[string]interface{}{
+		"candidate_id": int(s.ID),
+		"term":         curTerm,
+		"self_vote":    true,
+	})
 
 	s.recordEventLocked(EventElectionStarted, fmt.Sprintf("started election for term %d", curTerm), map[string]interface{}{
 		"term":              curTerm,
@@ -2293,6 +2416,16 @@ func (s *Server) becomeLeaderLocked() {
 func (s *Server) handleElectionTimeout(t time.Time) {
 	s.GetLogger().Info("election timeout fired", "node_id", int(s.ID), "state", s.State.String(), "time", t)
 
+	var curTerm uint64
+	if s.PersistentState != nil {
+		curTerm = uint64(s.PersistentState.CurrentTerm)
+	}
+	s.recordEventLocked(EventTimerTimeout, fmt.Sprintf("election timer fired in state %s", s.State.String()), map[string]interface{}{
+		"timer": "election",
+		"state": s.State.String(),
+		"term":  curTerm,
+	})
+
 	if s.State == raft.Leader {
 		return
 	}
@@ -2377,11 +2510,9 @@ func (s *Server) startPreVoteLocked() {
 func (s *Server) becomePreCandidateLocked() {
 	oldRole := s.State
 	s.State = raft.PreCandidate
+	s.preVotesStarted.Add(1)
 	s.stopHeartbeatTickerLocked()
-
-	if s.ElectionTimer != nil {
-		s.ElectionTimer.Reset()
-	}
+	s.resetElectionTimerLocked("start_prevote")
 
 	s.preVotesReceived = make(map[raft.NodeID]bool)
 	s.preVotesReceived[s.ID] = true
@@ -2408,6 +2539,7 @@ func (s *Server) becomePreCandidateLocked() {
 	totalNodes := len(s.Peers) + 1
 	majority := (totalNodes / 2) + 1
 	if len(s.preVotesReceived) >= majority {
+		s.preVotesWon.Add(1)
 		s.startElectionLocked()
 	}
 }
@@ -2702,6 +2834,7 @@ func (s *Server) HandleVoteResult(res RequestVoteResult) {
 
 func (s *Server) checkHigherTermInVoteReply(replyTerm raft.Term, peerID raft.NodeID, currentTerm uint64) bool {
 	if uint64(replyTerm) > currentTerm {
+		s.recordStepDownLocked("higher_term_reply", replyTerm)
 		s.GetLogger().Info("discovered higher term in RequestVote reply, stepping down to follower",
 			"node_id", int(s.ID),
 			"reply_term", uint64(replyTerm),
@@ -2818,6 +2951,7 @@ func (s *Server) handlePreVoteResultLocked(res RequestVoteResult, currentTerm ui
 	totalNodes := len(s.Peers) + 1
 	majority := (totalNodes / 2) + 1
 	if len(s.preVotesReceived) >= majority {
+		s.preVotesWon.Add(1)
 		s.GetLogger().Info("achieved majority pre-votes; initiating real election (§9.6)",
 			"node_id", int(s.ID),
 			"speculative_term", currentTerm+1,
@@ -2966,6 +3100,7 @@ func (s *Server) handleHeartbeatResultLocked(res HeartbeatResult) {
 
 	// Figure 2: If RPC response contains term T > currentTerm, convert to follower (§5.1)
 	if uint64(res.Reply.Term) > currentTerm {
+		s.recordStepDownLocked("higher_term_reply", res.Reply.Term)
 		s.GetLogger().Info("discovered higher term in AppendEntries heartbeat reply, stepping down to follower",
 			"node_id", int(s.ID),
 			"reply_term", uint64(res.Reply.Term),

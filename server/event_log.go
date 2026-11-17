@@ -15,10 +15,15 @@ const (
 	EventElectionStarted   EventType = "election_started"
 	EventVoteGranted       EventType = "vote_granted"
 	EventVoteDenied        EventType = "vote_denied"
+	EventPreVoteGranted    EventType = "pre_vote_granted"
+	EventPreVoteDenied     EventType = "pre_vote_denied"
 	EventHeartbeatSent     EventType = "heartbeat_sent"
 	EventHeartbeatReceived EventType = "heartbeat_received"
 	EventStepDown          EventType = "step_down"
 	EventQuorumLoss        EventType = "quorum_loss"
+	EventTermChange        EventType = "term_change"
+	EventTimerReset        EventType = "timer_reset"
+	EventTimerTimeout      EventType = "timer_timeout"
 	EventServerStarted     EventType = "server_started"
 	EventServerStopped     EventType = "server_stopped"
 )
@@ -34,7 +39,7 @@ type Event struct {
 }
 
 // DefaultEventLogCapacity is the default maximum capacity of the in-memory ring buffer.
-const DefaultEventLogCapacity = 128
+const DefaultEventLogCapacity = 1024
 
 // EventLog is a thread-safe, fixed-size circular buffer of consensus events
 // designed for post-mortem debugging and real-time observability.
