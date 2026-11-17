@@ -447,10 +447,15 @@ go test -v -run TestReproduce_Seed472 ./server
 | **Randomized Election Timers** | Raft §5.2 | Implemented | 150ms-300ms randomized bounds |
 | **Leader Election and Quorum** | Raft §5.2 | Implemented | Majority vote collection and step-down |
 | **Heartbeat Broadcasting** | Raft §5.2 | Implemented | Automatic periodic ticker on election |
+| **Pre-Vote Protocol** | Ongaro §9.6 | Implemented | Prevents disruptive rejoining node terms |
+| **Leader Stickiness / Lease** | Ongaro §9.6 | Implemented | Shields active leader from stale split votes |
+| **CheckQuorum Step-Down** | Raft §6.2 | Implemented | Automatic step-down on minority quorum loss |
+| **Leadership Transfer** | Raft §6.4 | Implemented | `TimeoutNow` RPC bypassing follower stickiness |
+| **Deterministic Simulation** | Testing Engine | Implemented | `FakeClock`, `SimNetwork`, 10k fault seeds |
 | **State Persistence** | Raft §5.2, §5.6 | Implemented | Invoked on `currentTerm` and `votedFor` changes |
-| **HTTP Debug State Surface** | Operational | Implemented | `/status` endpoint on all active nodes |
+| **HTTP Debug & Event Tracing** | Operational | Implemented | `/status`, `/events`, per-node JSON export |
 | **Log Replication Engine** | Raft §5.3 | In Progress | Consistency checks and log matching |
-| **Commit Index and State Machine** | Raft §5.3, §5.4 | In Progress | Linearizable state machine application |
+| **Commit Index & Figure 8** | Raft §5.4.2 | In Progress | Safe previous-term commit rule |
 | **Persistent Disk Storage Engine** | Raft §5.6 | Planned | WAL / append-only file storage implementation |
 | **Log Compaction and Snapshots** | Raft §7 | Planned | State snapshots and `InstallSnapshot` RPC |
 | **Cluster Membership Changes** | Raft §6 | Planned | Joint consensus configuration transitions |

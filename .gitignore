@@ -1,2 +1,6 @@
 bin/
 *.exe
+*~
+*.exe~
+traces/
+.vscode/
