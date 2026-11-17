@@ -265,3 +265,4 @@ Node   | Final State  | Term  | Elections/hr   | PreVote Win Rate | Step-Downs (
    - ReadIndex / LeaseRead implementation to prevent stale reads without writing dummy log entries.
 4. **Full Leadership Transfer**:
    - Complete log catch-up step prior to sending `TimeoutNow` during administrative handover.
+
