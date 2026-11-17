@@ -2,9 +2,11 @@ package server
 
 import (
 	"fmt"
+	"io"
 	"testing"
 
 	"pgregory.net/rapid"
+	"raft/logger"
 	"raft/proto"
 	"raft/raft"
 )
@@ -72,6 +74,7 @@ func TestProperty_VoteGranted_Iff_CandidateLogUpToDate(t *testing.T) {
 			CurrentTerm: recvTerm,
 			VotedFor:    votedFor,
 		}, nil)
+		srv.SetLogger(logger.NewNodeLogger(recvID, io.Discard, nil))
 		srv.SetLog(recvLog)
 
 		reply := srv.processRequestVote(&raftpb.RequestVoteArgs{

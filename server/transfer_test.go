@@ -35,9 +35,9 @@ func TestTimeoutNow_StartsElectionAndBypassesStickiness(t *testing.T) {
 		t.Fatalf("expected reply term %d, got %d", initialTerm+1, reply.Term)
 	}
 
-	// Target 2 must have immediately transitioned to Candidate at term initialTerm + 1
-	if f2.GetState() != raft.Candidate {
-		t.Fatalf("expected Node 2 to become Candidate, got %s", f2.GetState())
+	// Target 2 must have immediately transitioned to Candidate (or already won and became Leader) at term initialTerm + 1
+	if state := f2.GetState(); state != raft.Candidate && state != raft.Leader {
+		t.Fatalf("expected Node 2 to become Candidate or Leader, got %s", state)
 	}
 	if f2.Status().Term != initialTerm+1 {
 		t.Fatalf("expected Node 2 term %d, got %d", initialTerm+1, f2.Status().Term)
